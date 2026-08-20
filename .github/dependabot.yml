@@ -1,0 +1,35 @@
+version: 2
+updates:
+  - package-ecosystem: maven
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore"
+    groups:
+      jakarta:
+        patterns:
+          - 'jakarta.*'
+      quarkus:
+        patterns:
+          - 'io.quarkus:*'
+      grpc:
+        patterns:
+          - 'io.grpc:*'
+      maven-plugins:
+        patterns:
+          - 'org.apache.maven.plugins:*'
+      testing:
+        patterns:
+          - 'org.junit.*'
+          - 'org.mockito:*'
+          - 'org.testcontainers:*'
+          - 'io.rest-assured:*'
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore"

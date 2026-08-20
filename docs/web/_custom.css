@@ -1,0 +1,224 @@
+/* Theme customization: https://iamroq.dev/theme/default/#css-customization */
+/* Color palette inspired by https://a2a-protocol.org (Material for MkDocs, indigo/white) */
+
+@theme inline {
+    /* Primary accent: Material Design Indigo */
+    --color-accent-50: #e8eaf6;
+    --color-accent-100: #c5cae9;
+    --color-accent-200: #9fa8da;
+    --color-accent-300: #7986cb;
+    --color-accent-400: #5c6bc0;
+    --color-accent-500: #3f51b5;
+    --color-accent-600: #3949ab;
+    --color-accent-700: #303f9f;
+    --color-accent-800: #283593;
+    --color-accent-900: #1a237e;
+    --color-accent-950: #0d1257;
+
+    /* Pop color: same indigo family for buttons, links, and interactive elements */
+    --color-pop-50: #e8eaf6;
+    --color-pop-100: #c5cae9;
+    --color-pop-200: #9fa8da;
+    --color-pop-300: #7986cb;
+    --color-pop-400: #5c6bc0;
+    --color-pop-500: #3f51b5;
+    --color-pop-600: #3949ab;
+    --color-pop-700: #303f9f;
+    --color-pop-800: #283593;
+    --color-pop-900: #1a237e;
+    --color-pop-950: #0d1257;
+
+    /* Typography: Roboto matches Material Design (used by a2a-protocol.org) */
+    --font-body: 'Roboto', ui-sans-serif, system-ui, sans-serif;
+    --font-heading: 'Roboto', ui-sans-serif, system-ui, sans-serif;
+}
+
+/* Sidebar: deep indigo gradient matching a2a-protocol.org dark navigation */
+:root {
+    --sidebar-bg: linear-gradient(180deg, #303f9f 0%, #1a237e 100%);
+}
+
+/* Hero logo sizing — a2a-java-sdk.png is square (2048x2048) */
+.roq-hero-logo {
+    @apply w-[200px];
+}
+
+/* ── Version dropdown ────────────────────────────────────────────────────── */
+
+.version-dropdown {
+    position: relative;
+    margin: 0.75rem 1rem;
+}
+
+.version-dropdown-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 0.375rem;
+    color: inherit;
+    font-size: 0.875rem;
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.version-dropdown-toggle:hover {
+    background: rgba(255, 255, 255, 0.15);
+}
+
+.version-dropdown-chevron {
+    font-size: 0.65rem;
+    transition: transform 0.2s ease;
+    margin-left: 0.5rem;
+}
+
+.version-dropdown-menu {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    margin-top: 0.25rem;
+    padding: 0.25rem 0;
+    background: var(--color-accent-800);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 0.375rem;
+    list-style: none;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.version-dropdown-menu.version-dropdown-open {
+    display: block;
+}
+
+.version-dropdown-menu li {
+    padding: 0.4rem 0.75rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: background 0.1s ease;
+}
+
+.version-dropdown-menu li:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.version-badge {
+    display: inline-block;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.35rem;
+    border-radius: 0.25rem;
+    background: rgba(255, 255, 255, 0.2);
+    margin-left: 0.35rem;
+    vertical-align: middle;
+}
+
+.version-badge-dev {
+    background: rgba(255, 193, 7, 0.3);
+    color: #ffd54f;
+}
+
+/* ── Dev banner ──────────────────────────────────────────────────────────── */
+
+.dev-banner {
+    margin: 0.5rem 1rem;
+    padding: 0.5rem 0.75rem;
+    background: rgba(255, 193, 7, 0.15);
+    border: 1px solid rgba(255, 193, 7, 0.3);
+    border-radius: 0.375rem;
+    font-size: 0.8rem;
+    color: #ffd54f;
+}
+
+.dev-banner a {
+    color: #fff;
+    text-decoration: underline;
+}
+
+.dev-banner i {
+    margin-right: 0.35rem;
+}
+
+/* ── Search version toggle ──────────────────────────────────────────────── */
+
+.search-version-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    opacity: 0.8;
+}
+
+.search-version-toggle input[type="checkbox"] {
+    accent-color: #5c6bc0;
+}
+
+/* The search overlay is inside .sidebar.main which is position:fixed on    */
+/* desktop — fixed elements always form stacking contexts (z-index:auto).   */
+/* Main content paints after the sidebar in DOM order and covers it.        */
+/* Lift the sidebar above main content when search is active.               */
+
+@media (width >= 48rem) {
+    .sidebar.main:has(.search-overlay.active) {
+        z-index: 10000;
+    }
+}
+
+.hljs-copy-wrapper {
+    transform: none;
+}
+
+/* ── Content column width ─────────────────────────────────────────────────── */
+
+.page-content .content-main {
+    max-width: var(--container-5xl);
+}
+
+/* ── Tables ──────────────────────────────────────────────────────────────── */
+
+.page-content table,
+.roq-section table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1.5rem 0;
+}
+
+.page-content th,
+.page-content td,
+.roq-section th,
+.roq-section td {
+    padding: 0.6rem 1rem;
+    text-align: left;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.page-content th,
+.roq-section th {
+    font-weight: 600;
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.page-content tr:nth-child(even),
+.roq-section tr:nth-child(even) {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+/* ── Quick Install section ────────────────────────────────────────────────── */
+
+.roq-section pre {
+    text-align: left;
+}
+
+/* ── Syntax Highlighting (highlight.js) ───────────────────────────────────── */
+
+/* Match the site's monospace font (Roboto Mono) */
+.hljs,
+pre code.hljs {
+    font-family: 'Roboto Mono', ui-monospace, monospace;
+    font-size: 0.875rem;
+    line-height: 1.6;
+}

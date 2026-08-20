@@ -1,0 +1,115 @@
+package org.a2aproject.sdk.spec;
+
+import java.util.Map;
+
+import org.a2aproject.sdk.util.Assert;
+import org.a2aproject.sdk.spec.util.CollectionCopies;
+import org.a2aproject.sdk.spec.util.Utils;
+import org.jspecify.annotations.Nullable;
+
+/**
+ * Parameters for cancelling a task.
+ * <p>
+ * Carries the task identifier and optional tenant and metadata for cancel-specific context,
+ * such as a cancellation reason or source system.
+ *
+ * @param id the unique task identifier (required)
+ * @param tenant optional tenant, provided as a path parameter
+ * @param metadata optional arbitrary key-value metadata (e.g. cancellation reason)
+ * @see <a href="https://a2a-protocol.org/latest/">A2A Protocol Specification</a>
+ */
+public record CancelTaskParams(String id, @Nullable String tenant, Map<String, Object> metadata) {
+
+    /**
+     * Compact constructor for validation.
+     * Validates that required parameters are not null.
+     *
+     * @param id the task identifier
+     * @param tenant the tenant identifier
+     */
+    public CancelTaskParams {
+        Assert.checkNotNullParam("id", id);
+        Utils.validateTenant(tenant);
+        metadata = CollectionCopies.unmodifiableShallowMap(metadata);
+    }
+
+    /**
+     * Convenience constructor with default tenant.
+     *
+     * @param id the task identifier (required)
+     */
+    public CancelTaskParams(String id) {
+        this(id, null, Map.of());
+    }
+
+    /**
+     * Create a new Builder
+     *
+     * @return the builder
+     */
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    /**
+     * Builder for constructing instances.
+     */
+    public static class Builder {
+        private @Nullable String id;
+        private @Nullable String tenant;
+        private Map<String, Object> metadata = Map.of();
+
+        /**
+         * Creates a new Builder with all fields unset.
+         */
+        private Builder() {
+        }
+
+        /**
+         * Sets the id.
+         *
+         * @param id the task identifier (required)
+         * @return this builder for method chaining
+         */
+        public Builder id(String id) {
+            this.id = id;
+            return this;
+        }
+
+        /**
+         * Sets the tenant.
+         *
+         * @param tenant the tenant identifier
+         * @return this builder for method chaining
+         */
+        public Builder tenant(@Nullable String tenant) {
+            this.tenant = tenant;
+            return this;
+        }
+
+        /**
+         * Sets optional metadata for the request.
+         *
+         * @param metadata arbitrary key-value metadata
+         * @return this builder
+         */
+        public Builder metadata(Map<String, Object> metadata) {
+            this.metadata = CollectionCopies.unmodifiableShallowMap(metadata);
+            return this;
+        }
+
+        /**
+         * Builds the TaskIdParams.
+         *
+         * @return a new TaskIdParams instance
+         * @throws IllegalArgumentException if id is null
+         */
+        public CancelTaskParams build() {
+            return new CancelTaskParams(
+                Assert.checkNotNullParam("id", id),
+                tenant,
+                metadata
+            );
+        }
+    }
+}

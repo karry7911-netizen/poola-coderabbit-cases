@@ -1,0 +1,123 @@
+# AGENTS.md
+
+## Project Overview
+
+Java SDK for the [Agent2Agent (A2A) Protocol](https://a2a-protocol.org/). Multi-module Maven project (`org.a2aproject.sdk` group) providing client and server libraries for A2A agent communication over JSON-RPC, gRPC, and REST transports.
+
+## Build
+
+Requires Java 17+.
+Tests output is redirected to files by default.
+
+```bash
+mvn clean install
+```
+
+
+## Project Structure
+
+- `spec/` — A2A specification types (Java records for the protocol)
+- `spec-grpc/` — gRPC protobuf definitions and generated classes
+- `common/` — Shared utilities used across modules
+- `client/` — Client SDK
+  - `base/` — Core client API
+  - `transport/spi/` — Transport SPI
+  - `transport/jsonrpc/`, `transport/grpc/`, `transport/rest/` — Transport implementations
+- `server-common/` — Server-side core (AgentExecutor, TaskStore, QueueManager)
+- `transport/` — Server transport layer (jsonrpc, grpc, rest)
+- `http-client/` — HTTP client abstraction
+- `jsonrpc-common/` — Shared JSON-RPC utilities
+- `reference/` — Reference server implementations built on Quarkus
+  - `common/`, `jsonrpc/`, `grpc/`, `rest/`
+  - `multiversion-jsonrpc/`, `multiversion-rest/` — Multi-version dispatching (v1.0 + v0.3)
+- `tck/` — Technology Compatibility Kit (protocol conformance tests)
+- `tests/` — Integration and server-common tests
+  - `server-common/` — Server-common integration tests
+  - `multiversion/` — Multi-version integration tests (jsonrpc, rest, grpc)
+- `extras/` — Optional add-ons
+  - `common/` — Shared classes across extras modules
+  - `opentelemetry/` — OpenTelemetry integration
+  - `task-store-database-jpa/` — JPA-backed task store
+  - `push-notification-config-store-database-jpa/` — JPA-backed push notification config store
+  - `queue-manager-replicated/` — Kafka-based replicated queue manager
+  - `http-client-vertx/` — Vert.x HTTP client
+  - `http-client-android/` — Android HTTP client
+- `compat-0.3/` — Backward compatibility layer for A2A protocol v0.3
+- `integrations/` — Runtime integrations (e.g., MicroProfile Config)
+- `test-utils-docker/` — Test utilities for conditional Docker-based test execution
+- `boms/` — Bill of Materials POMs (sdk, extras, reference, test-utils)
+- `examples/` — Sample applications (helloworld, cloud-deployment)
+
+## Key Conventions
+
+- Package root: `org.a2aproject.sdk`
+- Serialization: Gson (see `gson.version` in parent POM)
+- Null safety: NullAway + JSpecify annotations enforced via Error Prone
+- Reference server runtime: Quarkus
+- Testing: JUnit 5, Mockito, REST Assured, Testcontainers
+
+### Code Style
+
+- Import statements are sorted
+- Remove any unused import statements
+- Do not use "star" imports (eg `import java.util.*`)
+- Use Java `record` for immutable data types
+- Use `@Nullable` (from org.jspecify.annotations) for optional fields
+- Use `org.a2aproject.sdk.util.Assert.checkNotNullParam()` in the compact constructor to validate required fields
+- Use `List.copyOf()` and `Map.copyOf()` for defensive copying of collections
+- Apply the Builder pattern for records with many fields (see `AgentCard.java` as reference)
+- Do not split Java packages across Maven modules in production code (each package must belong to exactly one module). Test code may share a package with production code to access package-private members.
+
+### Code generation
+
+- Be concise
+- Try to use existing code instead of generating new similar code
+- Use the same code convention than existing code. If the existing convention seems incorrect, make suggestion before doing any changes
+
+### Documentation Site
+
+The docs site (`docs/`) is built with [Roq](https://docs.quarkiverse.io/quarkus-roq/dev/index.html) (a Quarkus-based static site generator). Content is organized into versioned folders under `docs/content/<version>/` (e.g. `docs/content/1_1_0_Final/`, `docs/content/dev/`). Version directory names use underscores instead of dots to work around a Roq bug where dots in path components break GitHub Pages serving.
+
+**Editing rules:**
+- Only edit pages under `docs/content/dev/` — released version folders are frozen snapshots and must not be modified
+- New versioned folders are created at release time (see RELEASE.md step 9)
+
+**Version metadata:** Each version has a YAML file in `docs/data/versions/` (e.g. `dev.yml`, `1.1.0.Final.yml`) that defines the label, URL path, sort order, default/dev flags, and sidebar menu. When adding or removing a documentation page, update the `menu` list in `docs/data/versions/dev.yml` accordingly.
+
+**Running the docs site locally:**
+```bash
+cd docs
+mvn quarkus:dev
+```
+
+### PR instructions
+- Follow the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/#summary) for the commit title and message
+- Always ask if the commit is related to a GitHub issue. If that's the case, add a `This fixes #{issue_number}` at the end of the commit message
+
+### Skills
+
+- [update-a2a-proto](.agents/skills/update-a2a-proto/SKILL.md) — Update the gRPC proto file `a2a.proto` from upstream and regenerate Java sources
+- [fix-tck-issue](.agents/skills/fix-tck-issue/SKILL.md) — Analyze and fix A2A TCK compatibility issues across transports
+- [release-a2a](.agents/skills/release-a2a/SKILL.md) — Guide the full release process: version bump, CI, tagging, Maven Central deploy, docs, SNAPSHOT bump
+
+### Commands
+
+- `mvn clean install` — Clean build of the project
+
+## Architecture Deep Dives
+
+For detailed architectural documentation:
+
+- **EventQueue & Event Processing**: `.claude/architecture/EVENTQUEUE.md`
+  - Quick reference with architecture diagram and core components
+  - **[Queue Lifecycle](.claude/architecture/eventqueue/LIFECYCLE.md)**: Two-level protection, fire-and-forget, late reconnections
+  - **[Request Flows](.claude/architecture/eventqueue/FLOWS.md)**: Non-streaming vs streaming, cleanup patterns
+  - **[Usage Scenarios](.claude/architecture/eventqueue/SCENARIOS.md)**: Real-world patterns and common pitfalls
+- **Compatibility with previous protocol versions**:
+  - 0.3 protocol compatibility layer: `.claude/architecture/compatibility_0.3.md`
+
+> 💡 Deep-dive docs are loaded on-demand when working in related areas.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Fork the repo, create a branch per issue, submit PRs against `main`.
