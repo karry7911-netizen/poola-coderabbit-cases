@@ -1,0 +1,22 @@
+authentication: "noAuthentication"
+configurationProperties: "otel.exporter.otlp.protocol=grpc"
+disabledResourceProviders: "io.opentelemetry.instrumentation.resources.ProcessResourceProvider"
+endpoint: "http://otel-collector-contrib:4317"
+exportOtelConfigurationAsEnvironmentVariables: false
+ignoredSteps: "dir,echo,isUnix,pwd,properties"
+observabilityBackends:
+- elastic:
+    kibanaBaseUrl: "http://localhost:5601"
+    name: "My Elastic"
+- jaeger:
+    jaegerBaseUrl: "http://localhost:16686"
+    name: "My Jaeger"
+- customObservabilityBackend:
+    metricsVisualizationUrlTemplate: "foo"
+    name: "My Custom"
+    traceVisualisationUrlTemplate: "http://example.com"
+- zipkin:
+    name: "My Zipkin"
+    zipkinBaseUrl: "http://localhost:9411/"
+serviceName: "my-jenkins"
+serviceNamespace: "ci"

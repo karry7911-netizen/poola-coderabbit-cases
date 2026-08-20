@@ -1,0 +1,24 @@
+credentials:
+  system:
+    domainCredentials:
+    - credentials:
+      - string:
+          description: "Elastic APM Server Token"
+          id: "apm-server-token"
+          scope: GLOBAL
+          secret: "password"
+
+unclassified:
+  openTelemetry:
+    authentication:
+      bearerTokenAuthentication:
+        tokenId: "apm-server-token"
+    endpoint: "https://my-deployment.otel.example.com"
+    configurationProperties: "otel.exporter.otlp.protocol=grpc"
+    exportOtelConfigurationAsEnvironmentVariables: false
+    observabilityBackends:
+      - elastic:
+          name: "My Elastic"
+          kibanaBaseUrl: "https://my-deployment.es.example.com"
+    serviceName: "my-jenkins"
+    serviceNamespace: "ci"

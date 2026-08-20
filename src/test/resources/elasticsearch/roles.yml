@@ -1,0 +1,4 @@
+jenkins_logs:
+  indices:
+    - names: ['logs-*']
+      privileges: ['read', 'view_index_metadata']

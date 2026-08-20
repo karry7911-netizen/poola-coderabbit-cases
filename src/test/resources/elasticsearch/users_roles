@@ -1,0 +1,3 @@
+jenkins_logs:jenkins_logs_user
+kibana_system:kibana_system_user
+superuser:admin

@@ -1,0 +1,103 @@
+---
+services:
+  jenkins:
+    extends:
+      file: docker-compose-elastic.yml
+      service: jenkins
+    environment:
+      ELASTICSEARCH_HOST: ${ELASTICSEARCH_HOST:-http://elasticsearch:9200}
+      ELASTICSEARCH_USERNAME: ${ELASTICSEARCH_USERNAME:-jenkins_logs_user}
+      ELASTICSEARCH_PASSWORD: ${ELASTICSEARCH_PASSWORD:-changeme}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+    networks:
+      - jenkins
+
+  jenkins-inbound-agent:
+    extends:
+      file: services.yml
+      service: jenkins-inbound-agent
+    networks:
+      - jenkins
+
+  api-key:
+    extends:
+      file: ../src/test/resources/elastic-stack.yml
+      service: api-key
+    networks:
+      - jenkins
+    depends_on:
+      kibana:
+        condition: service_healthy
+  edot:
+    extends:
+      file: ../src/test/resources/elastic-stack.yml
+      service: edot
+    networks:
+      - jenkins
+    depends_on:
+      api-key:
+        condition: service_completed_successfully
+
+  elasticsearch:
+    extends:
+      file: ../src/test/resources/elastic-stack.yml
+      service: elasticsearch
+    networks:
+      - jenkins
+
+  kibana:
+    extends:
+      file: ../src/test/resources/elastic-stack.yml
+      service: kibana
+    networks:
+      - jenkins
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  prometheus:
+    extends:
+      file: services.yml
+      service: prometheus
+    networks:
+      - jenkins
+
+  jaeger-all-in-one:
+    extends:
+      file: services.yml
+      service: jaeger-all-in-one
+    networks:
+      - jenkins
+
+  zipkin-all-in-one:
+    extends:
+      file: services.yml
+      service: zipkin-all-in-one
+    networks:
+      - jenkins
+
+  otel-collector:
+    extends:
+      file: services.yml
+      service: otel-collector
+    volumes:
+      - ./config/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    networks:
+      - jenkins
+    depends_on:
+      - jaeger-all-in-one
+      - zipkin-all-in-one
+      - prometheus
+      - edot
+
+volumes:
+  jenkins:
+    driver: local
+  esdata:
+    driver: local
+  edot-config:
+    driver: local
+
+networks:
+  jenkins:
+    driver: bridge

@@ -1,0 +1,14 @@
+authentication:
+  bearerTokenAuthentication:
+    tokenId: "apm-server-token"
+configurationProperties: "otel.exporter.otlp.protocol=grpc"
+disabledResourceProviders: "io.opentelemetry.instrumentation.resources.ProcessResourceProvider"
+endpoint: "https://my-deployment.otel.example.com"
+exportOtelConfigurationAsEnvironmentVariables: false
+ignoredSteps: "dir,echo,isUnix,pwd,properties"
+observabilityBackends:
+- elastic:
+    kibanaBaseUrl: "https://my-deployment.es.example.com"
+    name: "My Elastic"
+serviceName: "my-jenkins"
+serviceNamespace: "ci"

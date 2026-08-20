@@ -1,0 +1,21 @@
+---
+server.name: kibana
+server.host: "0.0.0.0"
+
+telemetry.enabled: false
+
+logging:
+  root:
+    level: error
+
+elasticsearch.hosts: "${ELASTICSEARCH_HOSTS}"
+elasticsearch.username: "${ELASTICSEARCH_USERNAME}"
+elasticsearch.password: "${ELASTICSEARCH_PASSWORD}"
+
+xpack.security.loginAssistanceMessage: "login admin:changeme"
+xpack.encryptedSavedObjects.encryptionKey: "12345678901234567890123456789012"
+xpack.security.encryptionKey: "12345678901234567890123456789012"
+
+xpack.security.authc.providers:
+    basic.basic1:
+        order: 1

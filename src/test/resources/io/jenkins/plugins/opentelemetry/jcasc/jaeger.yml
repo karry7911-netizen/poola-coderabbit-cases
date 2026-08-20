@@ -1,0 +1,11 @@
+unclassified:
+  openTelemetry:
+    configurationProperties: "otel.exporter.otlp.protocol=grpc"
+    endpoint: "http://otel-collector-contrib:4317"
+    exportOtelConfigurationAsEnvironmentVariables: false
+    observabilityBackends:
+      - jaeger:
+          jaegerBaseUrl: "http://my-jaeger.acme.com:16686"
+          name: "My Jaeger"
+    serviceName: "my-jenkins"
+    serviceNamespace: "ci"

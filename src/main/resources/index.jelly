@@ -1,0 +1,4 @@
+<?jelly escape-by-default='true'?>
+<div>
+    Publish Jenkins metrics to an OpenTelemetry endpoint, including distributed traces of job executions and health metrics of the controller.
+</div>

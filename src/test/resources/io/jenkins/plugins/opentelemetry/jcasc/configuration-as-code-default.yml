@@ -1,0 +1,7 @@
+unclassified:
+  openTelemetry:
+    endpoint: "http://otel-collector-contrib:4317"
+    observabilityBackends:
+      - customObservabilityBackend:
+          metricsVisualizationUrlTemplate: "foo"
+          traceVisualisationUrlTemplate: "http://example.com"

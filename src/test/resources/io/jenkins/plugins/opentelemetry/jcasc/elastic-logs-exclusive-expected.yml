@@ -1,0 +1,12 @@
+authentication: "noAuthentication"
+disabledResourceProviders: "io.opentelemetry.instrumentation.resources.ProcessResourceProvider"
+endpoint: "http://otel-collector-contrib:4317"
+exportOtelConfigurationAsEnvironmentVariables: false
+ignoredSteps: "dir,echo,isUnix,pwd,properties"
+observabilityBackends:
+- elastic:
+    elasticLogsBackend: "elasticLogsBackendWithoutJenkinsVisualization"
+    kibanaBaseUrl: "https://kibana.es.example.com"
+    name: "My Elastic"
+serviceName: "jenkins"
+serviceNamespace: "jenkins"
