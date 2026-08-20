@@ -1,0 +1,167 @@
+package workerdeployment
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	commonpb "go.temporal.io/api/common/v1"
+	deploymentpb "go.temporal.io/api/deployment/v1"
+	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/workflow"
+	deploymentspb "go.temporal.io/server/api/deployment/v1"
+	"go.temporal.io/server/common/sdk"
+	"go.temporal.io/server/common/searchattribute/sadefs"
+	"go.temporal.io/server/common/worker_versioning"
+)
+
+const (
+	// Workflow types
+	WorkerDeploymentVersionWorkflowType = "temporal-sys-worker-deployment-version-workflow"
+	WorkerDeploymentWorkflowType        = "temporal-sys-worker-deployment-workflow"
+
+	// Namespace division
+	WorkerDeploymentNamespaceDivision = "TemporalWorkerDeployment"
+
+	// Updates
+	RegisterWorkerInDeploymentVersion = "register-task-queue-worker"       // for Worker Deployment Version wf
+	SyncVersionState                  = "sync-version-state"               // for Worker Deployment Version wfs
+	UpdateVersionMetadata             = "update-version-metadata"          // for Worker Deployment Version wfs
+	RegisterWorkerInWorkerDeployment  = "register-worker-in-deployment"    // for Worker Deployment wfs
+	SetCurrentVersion                 = "set-current-version"              // for Worker Deployment wfs
+	SetRampingVersion                 = "set-ramping-version"              // for Worker Deployment wfs
+	AddVersionToWorkerDeployment      = "add-version-to-worker-deployment" // for Worker Deployment wfs
+	DeleteVersion                     = "delete-version"                   // for WorkerDeployment wfs
+	DeleteDeployment                  = "delete-deployment"                // for WorkerDeployment wfs
+	SetManagerIdentity                = "set-manager-identity"             // for WorkerDeployment wfs
+	serverDeleteVersionIdentity       = "try-delete-for-add-version"       // identity of the worker-deployment workflow when it tries to delete a version on the event that the addition
+	// of a version exceeds the max number of versions allowed in a worker-deployment (defaultMaxVersions)
+
+	// Signals
+	ForceCANSignalName        = "force-continue-as-new" // for Worker Deployment Version _and_ Worker Deployment wfs
+	SyncDrainageSignalName    = "sync-drainage-status"
+	TerminateDrainageSignal   = "terminate-drainage"
+	SyncVersionSummarySignal  = "sync-version-summary"
+	PropagationCompleteSignal = "propagation-complete"
+
+	// Queries
+	QueryDescribeVersion    = "describe-version"    // for Worker Deployment Version wf
+	QueryDescribeDeployment = "describe-deployment" // for Worker Deployment wf
+
+	// Memos
+	WorkerDeploymentMemoField = "WorkerDeploymentMemo" // for Worker Deployment wf
+
+	// Application error names for rejected updates
+	errNoChangeType               = "errNoChange"
+	errTooManyVersions            = "errTooManyVersions"
+	errTooManyDeployments         = "errTooManyDeployments"
+	errVersionAlreadyExistsType   = "errVersionAlreadyExists"
+	errMaxTaskQueuesInVersionType = "errMaxTaskQueuesInVersion"
+	errVersionNotFound            = "Version not found in deployment"
+	errDeploymentDeleted          = "worker deployment deleted"         // returned in the race condition that the deployment is deleted but the workflow is not yet closed.
+	errVersionDeleted             = "worker deployment version deleted" // returned in the race condition that the deployment version is deleted but the workflow is not yet closed.
+
+	errFailedPrecondition = "FailedPrecondition"
+
+	errVersionIsDrainingSuffix   = "cannot be deleted since it is draining"
+	ErrVersionIsDraining         = "version '%s' " + errVersionIsDrainingSuffix
+	errVersionHasPollersSuffix   = "cannot be deleted since it has active pollers"
+	ErrVersionHasPollers         = "version '%s' " + errVersionHasPollersSuffix
+	ErrVersionIsCurrentOrRamping = "version '%s' cannot be deleted since it is current or ramping"
+
+	ErrRampingVersionDoesNotHaveAllTaskQueues = "proposed ramping version '%s' is missing active task queues from the current version; these would become unversioned if it is set as the ramping version"
+	ErrCurrentVersionDoesNotHaveAllTaskQueues = "proposed current version '%s' is missing active task queues from the current version; these would become unversioned if it is set as the current version"
+	ErrManagerIdentityMismatch                = "ManagerIdentity '%s' is set and does not match user identity '%s'; to proceed, set your own identity as the ManagerIdentity, remove the ManagerIdentity, or wait for the other client to do so"
+	ErrWorkerDeploymentNotFound               = "no Worker Deployment found with name '%s'; does your Worker Deployment have pollers?"
+	ErrWorkerDeploymentVersionNotFound        = "build ID '%s' not found in Worker Deployment '%s'"
+)
+
+var (
+	WorkerDeploymentVisibilityBaseListQuery = fmt.Sprintf(
+		"%s = '%s' AND %s = '%s' AND %s = '%s'",
+		sadefs.WorkflowType,
+		WorkerDeploymentWorkflowType,
+		sadefs.TemporalNamespaceDivision,
+		WorkerDeploymentNamespaceDivision,
+		sadefs.ExecutionStatus,
+		enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING.String(),
+	)
+)
+
+var (
+	defaultActivityOptions = workflow.ActivityOptions{
+		StartToCloseTimeout: 1 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval: 100 * time.Millisecond,
+			MaximumAttempts: 5,
+		},
+	}
+	propagationActivityOptions = workflow.ActivityOptions{
+		StartToCloseTimeout: 1 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval: 100 * time.Millisecond,
+			// unlimited attempts
+		},
+	}
+)
+
+// validateVersionWfParams is a helper that verifies if the fields used for generating
+// Worker Deployment Version related workflowID's are valid
+func validateVersionWfParams(fieldName string, field string, maxIDLengthLimit int) error {
+	return worker_versioning.ValidateDeploymentVersionFields(fieldName, field, maxIDLengthLimit)
+}
+
+// GenerateDeploymentWorkflowID is a helper that generates a system accepted
+// workflowID which are used in our Worker Deployment workflows
+func GenerateDeploymentWorkflowID(deploymentName string) string {
+	return worker_versioning.WorkerDeploymentWorkflowIDPrefix + worker_versioning.WorkerDeploymentVersionWorkflowIDDelimeter + deploymentName
+}
+
+func GetDeploymentNameFromWorkflowID(workflowID string) string {
+	_, deploymentName, _ := strings.Cut(workflowID, worker_versioning.WorkerDeploymentVersionWorkflowIDDelimeter)
+	return deploymentName
+}
+
+// GenerateVersionWorkflowID is a helper that generates a system accepted
+// workflowID which are used in our Worker Deployment Version workflows
+func GenerateVersionWorkflowID(deploymentName string, buildID string) string {
+	versionString := worker_versioning.ExternalWorkerDeploymentVersionToString(&deploymentpb.WorkerDeploymentVersion{
+		DeploymentName: deploymentName,
+		BuildId:        buildID,
+	})
+	return worker_versioning.WorkerDeploymentVersionWorkflowIDPrefix + worker_versioning.WorkerDeploymentVersionWorkflowIDDelimeter + versionString
+}
+
+func DecodeWorkerDeploymentMemo(memo *commonpb.Memo) *deploymentspb.WorkerDeploymentWorkflowMemo {
+	var workerDeploymentWorkflowMemo deploymentspb.WorkerDeploymentWorkflowMemo
+	err := sdk.PreferProtoDataConverter.FromPayload(memo.Fields[WorkerDeploymentMemoField], &workerDeploymentWorkflowMemo)
+	if err != nil {
+		return nil
+	}
+	return &workerDeploymentWorkflowMemo
+}
+
+func getSafeDurationConfig(ctx workflow.Context, id string, unsafeGetter func() time.Duration, defaultValue time.Duration) (time.Duration, error) {
+	get := func(_ workflow.Context) interface{} {
+		return unsafeGetter()
+	}
+	var value time.Duration
+	if err := workflow.MutableSideEffect(ctx, id, get, durationEq).Get(&value); err != nil {
+		return defaultValue, err
+	}
+	return value, nil
+}
+
+func durationEq(a, b any) bool {
+	return a == b
+}
+
+// isFailedPrecondition checks if the error is a FailedPrecondition error. It also checks if the FailedPrecondition error is wrapped in an ApplicationError.
+func isFailedPrecondition(err error) bool {
+	var failedPreconditionError *serviceerror.FailedPrecondition
+	var applicationError *temporal.ApplicationError
+	return errors.As(err, &failedPreconditionError) || (errors.As(err, &applicationError) && applicationError.Type() == errFailedPrecondition)
+}
