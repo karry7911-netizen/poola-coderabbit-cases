@@ -242,6 +242,13 @@ public class BlazeMeterPerformanceBuilderDescriptor extends BuildStepDescriptor<
     @RequirePOST
     public ListBoxModel doFillWorkspaceIdItems(@QueryParameter("credentialsId") String credentialsId,
                                                @QueryParameter("workspaceId") String workspaceId) throws FormValidation {
+        Item item = Stapler.getCurrentRequest().findAncestorObject(Item.class);
+        if (item != null) {
+            item.checkPermission(Item.READ);
+        } else {
+            Jenkins.get().checkPermission(Jenkins.READ);
+        }
+
         ListBoxModel items = new ListBoxModel();
 
         try {
@@ -295,10 +302,16 @@ public class BlazeMeterPerformanceBuilderDescriptor extends BuildStepDescriptor<
 
     @RequirePOST
     public ListBoxModel doFillCredentialsIdItems(@QueryParameter("credentialsId") String credentialsId) {
+
+        Item item = Stapler.getCurrentRequest().findAncestorObject(Item.class);
+        if (item != null) {
+            item.checkPermission(Item.CONFIGURE);
+        } else {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
+        }
+
         ListBoxModel items = new ListBoxModel();
         try {
-
-            Item item = Stapler.getCurrentRequest().findAncestorObject(Item.class);
             List<BlazemeterCredentialsBAImpl> credentials =
                     CredentialsProvider.lookupCredentials(
                             BlazemeterCredentialsBAImpl.class,
