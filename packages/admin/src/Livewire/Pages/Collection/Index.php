@@ -1,0 +1,138 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Shopper\Livewire\Pages\Collection;
+
+use Filament\Actions\Action;
+use Filament\Actions\Concerns\InteractsWithActions;
+use Filament\Actions\Contracts\HasActions;
+use Filament\Actions\DeleteBulkAction;
+use Filament\Notifications\Notification;
+use Filament\Schemas\Concerns\InteractsWithSchemas;
+use Filament\Schemas\Contracts\HasSchemas;
+use Filament\Tables\Columns\SpatieMediaLibraryImageColumn;
+use Filament\Tables\Columns\TextColumn;
+use Filament\Tables\Concerns\InteractsWithTable;
+use Filament\Tables\Contracts\HasTable;
+use Filament\Tables\Filters\SelectFilter;
+use Filament\Tables\Table;
+use Illuminate\Contracts\View\View;
+use Illuminate\Database\Eloquent\Collection;
+use Mckenziearts\Icons\Untitledui\Enums\Untitledui;
+use Shopper\Core\Enum\CollectionType;
+use Shopper\Core\Models\Contracts\Collection as CollectionContract;
+use Shopper\Facades\Shopper;
+use Shopper\Livewire\Pages\AbstractPageComponent;
+use Shopper\Traits\HandlesAuthorizationExceptions;
+
+class Index extends AbstractPageComponent implements HasActions, HasSchemas, HasTable
+{
+    use HandlesAuthorizationExceptions;
+    use InteractsWithActions;
+    use InteractsWithSchemas;
+    use InteractsWithTable;
+
+    public function mount(): void
+    {
+        $this->authorize('browse_collections');
+    }
+
+    public function table(Table $table): Table
+    {
+        return $table
+            ->query(resolve(CollectionContract::class)::query()->with(['rules', 'zones'])->latest())
+            ->columns([
+                SpatieMediaLibraryImageColumn::make('image')
+                    ->collection(config('shopper.media.storage.thumbnail_collection'))
+                    ->circular()
+                    ->defaultImageUrl(shopper_fallback_url())
+                    ->grow(false),
+                TextColumn::make('name')
+                    ->label(__('shopper::forms.label.name'))
+                    ->searchable(),
+                TextColumn::make('type')
+                    ->label(__('shopper::forms.label.type'))
+                    ->formatStateUsing(fn (CollectionContract $record): string => $record->isAutomatic() ? __('shopper::pages/collections.automatic') : __('shopper::pages/collections.manual'))
+                    ->badge()
+                    ->searchable(),
+                TextColumn::make('id')
+                    ->label(__('shopper::pages/collections.product_conditions'))
+                    ->formatStateUsing(
+                        fn (CollectionContract $record): string => $record->rules->isNotEmpty() ? ucfirst($record->firstRule()) : 'N/A'
+                    ),
+                TextColumn::make('zones.name')
+                    ->label(__('shopper::pages/settings/zones.title'))
+                    ->badge()
+                    ->toggleable(isToggledHiddenByDefault: true),
+                TextColumn::make('updated_at')
+                    ->label(__('shopper::forms.label.updated_at'))
+                    ->date(),
+            ])
+            ->filters([
+                SelectFilter::make('type')
+                    ->label(__('shopper::pages/collections.filter_type'))
+                    ->options(CollectionType::options()),
+                SelectFilter::make('zones')
+                    ->label(__('shopper::pages/settings/zones.title'))
+                    ->relationship('zones', 'name')
+                    ->multiple()
+                    ->searchable()
+                    ->preload()
+                    ->optionsLimit(5),
+            ])
+            ->recordActions([
+                Action::make('edit')
+                    ->label(__('shopper::forms.actions.edit'))
+                    ->icon(Untitledui::Edit03)
+                    ->iconButton()
+                    ->url(
+                        fn (CollectionContract $record): string => route(
+                            name: 'shopper.collections.edit',
+                            parameters: ['collection' => $record]
+                        ),
+                    )
+                    ->extraAttributes(['wire:navigate' => true])
+                    ->authorize('edit_collections')
+                    ->visible(Shopper::auth()->user()->can('edit_collections')),
+                Action::make('delete')
+                    ->label(__('shopper::forms.actions.delete'))
+                    ->icon(Untitledui::Trash03)
+                    ->iconButton()
+                    ->modalIcon(Untitledui::Trash03)
+                    ->color('danger')
+                    ->requiresConfirmation()
+                    ->action(fn (CollectionContract $record) => $record->delete())
+                    ->authorize('delete_collections')
+                    ->visible(Shopper::auth()->user()->can('delete_collections')),
+            ])
+            ->groupedBulkActions([
+                DeleteBulkAction::make()
+                    ->label(__('shopper::forms.actions.delete'))
+                    ->icon(Untitledui::Trash03)
+                    ->requiresConfirmation()
+                    ->action(function (Collection $records): void {
+                        $records->each->delete();
+
+                        Notification::make()
+                            ->title(
+                                __('shopper::notifications.delete', [
+                                    'item' => __('shopper::pages/collections.single'),
+                                ])
+                            )
+                            ->success()
+                            ->send();
+                    })
+                    ->authorize('delete_collections')
+                    ->visible(Shopper::auth()->user()->can('delete_collections'))
+                    ->deselectRecordsAfterCompletion(),
+            ])
+            ->emptyState(view('shopper::livewire.tables.empty-states.collections'));
+    }
+
+    public function render(): View
+    {
+        return view('shopper::livewire.pages.collections.browse')
+            ->title(__('shopper::pages/collections.menu'));
+    }
+}

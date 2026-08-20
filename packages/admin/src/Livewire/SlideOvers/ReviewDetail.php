@@ -1,0 +1,58 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Shopper\Livewire\SlideOvers;
+
+use Filament\Actions\Action;
+use Filament\Actions\Concerns\InteractsWithActions;
+use Filament\Actions\Contracts\HasActions;
+use Filament\Notifications\Notification;
+use Filament\Schemas\Concerns\InteractsWithSchemas;
+use Filament\Schemas\Contracts\HasSchemas;
+use Filament\Support\Enums\Size;
+use Illuminate\Contracts\View\View;
+use Laravelcm\LivewireSlideOvers\SlideOverComponent;
+use Livewire\Attributes\Locked;
+use Shopper\Core\Models\Review;
+use Shopper\Traits\HandlesAuthorizationExceptions;
+
+class ReviewDetail extends SlideOverComponent implements HasActions, HasSchemas
+{
+    use HandlesAuthorizationExceptions;
+    use InteractsWithActions;
+    use InteractsWithSchemas;
+
+    #[Locked]
+    public Review $review;
+
+    public function mount(): void
+    {
+        $this->authorize('browse_reviews');
+
+        $this->review->load('author', 'reviewrateable');
+    }
+
+    public function approvedAction(): Action
+    {
+        return Action::make('approved')
+            ->label(__('shopper::forms.actions.update'))
+            ->size(Size::Small)
+            ->authorize('edit_reviews')
+            ->action(function (): void {
+                $this->review->updatedApproved(! $this->review->approved);
+
+                Notification::make()
+                    ->title(__('shopper::pages/products.reviews.approved_message'))
+                    ->success()
+                    ->send();
+
+                $this->redirectRoute(name: 'shopper.reviews.index', navigate: true);
+            });
+    }
+
+    public function render(): View
+    {
+        return view('shopper::livewire.slide-overs.review-detail');
+    }
+}

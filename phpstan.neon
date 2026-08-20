@@ -1,0 +1,53 @@
+includes:
+    - phpstan-baseline.neon
+    - vendor/larastan/larastan/extension.neon
+
+parameters:
+    level: 5
+
+    paths:
+        - packages
+
+    excludePaths:
+        - packages/admin/src/Events
+        - packages/admin/src/Traits
+        - packages/sidebar
+
+    ignoreErrors:
+        - message: '#Method.*getLabel\(\) should return string but returns array\|string\|null#'
+        - message: '#Call to an undefined method Spatie\\Image\\Drivers\\ImageDriver::keepOriginalImageFormat\(\)#'
+        -
+            message: '#^Called ''env'' outside of the config directory which returns null when the config is cached, use ''config''\.$#'
+            identifier: larastan.noEnvCallsOutsideOfConfig
+        -
+            message: '#Access to an undefined property (Illuminate\\Database\\Eloquent\\Model&)?Shopper\\(Core\\)?Models\\Contracts\\[a-zA-Z]+::\$[a-zA-Z_]+#'
+            identifier: property.notFound
+        -
+            message: '#Call to an undefined method (Illuminate\\Database\\Eloquent\\Model&)?Shopper\\(Core\\)?Models\\Contracts\\[a-zA-Z]+::[a-zA-Z_]+\(\)#'
+            identifier: method.notFound
+        -
+            message: '#Call to an undefined static method Shopper\\(Core\\)?Models\\Contracts\\[a-zA-Z]+::[a-zA-Z_]+\(\)#'
+            identifier: staticMethod.notFound
+        -
+            message: '#expects view-string(\|null)?, string given#'
+            identifier: argument.type
+        -
+            message: '#\(view-string\) does not accept default value of type string#'
+            identifier: property.defaultValue
+        -
+            identifier: generics.notSubtype
+        -
+            message: '#Method Shopper\\.*\\Models\\.*should return .* but returns#'
+            identifier: return.type
+            path: packages/*/src/Models/*
+        -
+            message: '#Call to an undefined method Filament\\Forms\\Components\\TextInput::currencyMask\(\)#'
+            identifier: method.notFound
+        -
+            message: '#Call to an undefined method Illuminate\\Database\\Eloquent\\Builder<.*>::withTrashed\(\)#'
+            identifier: method.notFound
+        -
+            message: '#Call to an undefined method Staudenmeir\\LaravelAdjacencyList\\Eloquent\\Builder<.*>::withTrashed\(\)#'
+            identifier: method.notFound
+
+    reportUnmatchedIgnoredErrors: false

@@ -1,0 +1,108 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Shopper\Core\Models;
+
+use Carbon\CarbonInterface;
+use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Shopper\Core\Database\Factories\AddressFactory;
+use Shopper\Core\Enum\AddressType;
+use Shopper\Core\Models\Contracts\Address as AddressContract;
+use Shopper\Core\Models\Contracts\ShopperUser;
+use Shopper\Core\Traits\HasModelContract;
+
+/**
+ * @property-read int $id
+ * @property-read string $last_name
+ * @property-read ?string $first_name
+ * @property-read string $full_name
+ * @property-read ?string $company_name
+ * @property-read string $street_address
+ * @property-read ?string $street_address_plus
+ * @property-read string $postal_code
+ * @property-read string $city
+ * @property-read ?string $state
+ * @property-read AddressType $type
+ * @property-read ?string $phone_number
+ * @property-read array<string, mixed>|null $metadata
+ * @property-read bool $shipping_default
+ * @property-read bool $billing_default
+ * @property-read int $user_id
+ * @property-read int $country_id
+ * @property-read Country $country
+ * @property-read Model&ShopperUser $user
+ * @property-read CarbonInterface $created_at
+ * @property-read CarbonInterface $updated_at
+ */
+class Address extends Model implements AddressContract
+{
+    /** @use HasFactory<AddressFactory> */
+    use HasFactory;
+
+    use HasModelContract;
+
+    protected $guarded = [];
+
+    public static function configuredClass(): string
+    {
+        return config('shopper.models.address', static::class);
+    }
+
+    public function getTable(): string
+    {
+        return shopper_table('user_addresses');
+    }
+
+    public function isShippingDefault(): bool
+    {
+        return $this->shipping_default === true;
+    }
+
+    public function isBillingDefault(): bool
+    {
+        return $this->billing_default === true;
+    }
+
+    /**
+     * @return BelongsTo<Model&ShopperUser, $this>
+     */
+    public function user(): BelongsTo
+    {
+        return $this->belongsTo(config('auth.providers.users.model'), 'user_id');
+    }
+
+    /**
+     * @return BelongsTo<Country, $this>
+     */
+    public function country(): BelongsTo
+    {
+        return $this->belongsTo(Country::class, 'country_id');
+    }
+
+    protected static function newFactory(): AddressFactory
+    {
+        return AddressFactory::new();
+    }
+
+    protected function casts(): array
+    {
+        return [
+            'billing_default' => 'boolean',
+            'shipping_default' => 'boolean',
+            'type' => AddressType::class,
+        ];
+    }
+
+    protected function fullName(): Attribute
+    {
+        return Attribute::make(
+            get: fn (): string => $this->first_name
+                ? implode(' ', [$this->first_name, $this->last_name])
+                : $this->last_name
+        );
+    }
+}
