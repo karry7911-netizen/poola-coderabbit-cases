@@ -1,0 +1,5 @@
+User = "deluan"
+Password = "wordpass"
+DbPath = "file::memory:?cache=shared"
+DataFolder = "data/tests"
+ScanSchedule="0"
