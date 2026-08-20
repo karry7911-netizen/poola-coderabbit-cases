@@ -1,0 +1,23 @@
+name: lint_python
+on: [pull_request, push]
+jobs:
+  lint_python:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.x
+          check-latest: true
+      - run: pip install --upgrade pip setuptools wheel
+      - run: pip install codespell mypy pytest ruff safety
+      - run: ruff check --output-format=github .
+      - run: codespell --ignore-words-list="implementor,mimiced,provicers,re-use,THIRDPARTY,assertIn"  # --skip="*.css,*.js,*.lock"
+      - run: pip install -r requirements-test.txt
+      - run: pip install --editable .
+      - run: mkdir --parents --verbose .mypy_cache
+      - run: mypy --ignore-missing-imports --install-types --non-interactive . || true
+      - run: pytest
+      - run: safety check || true
