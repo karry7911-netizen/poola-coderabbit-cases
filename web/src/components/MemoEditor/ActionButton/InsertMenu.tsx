@@ -1,0 +1,168 @@
+import { LatLng } from "leaflet";
+import { uniqBy } from "lodash-es";
+import { LinkIcon, LoaderIcon, MapPinIcon, PaperclipIcon, PlusIcon } from "lucide-react";
+import { observer } from "mobx-react-lite";
+import { useContext, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Attachment } from "@/types/proto/api/v1/attachment_service";
+import { Location, MemoRelation } from "@/types/proto/api/v1/memo_service";
+import { useTranslate } from "@/utils/i18n";
+import { MemoEditorContext } from "../types";
+import { LinkMemoDialog } from "./InsertMenu/LinkMemoDialog";
+import { LocationDialog } from "./InsertMenu/LocationDialog";
+import { useFileUpload } from "./InsertMenu/useFileUpload";
+import { useLinkMemo } from "./InsertMenu/useLinkMemo";
+import { useLocation } from "./InsertMenu/useLocation";
+
+interface Props {
+  isUploading?: boolean;
+  location?: Location;
+  onLocationChange: (location?: Location) => void;
+}
+
+const InsertMenu = observer((props: Props) => {
+  const t = useTranslate();
+  const context = useContext(MemoEditorContext);
+
+  const [linkDialogOpen, setLinkDialogOpen] = useState(false);
+  const [locationDialogOpen, setLocationDialogOpen] = useState(false);
+
+  const { fileInputRef, uploadingFlag, handleFileInputChange, handleUploadClick } = useFileUpload((attachments: Attachment[]) => {
+    context.setAttachmentList([...context.attachmentList, ...attachments]);
+  });
+
+  const linkMemo = useLinkMemo({
+    isOpen: linkDialogOpen,
+    currentMemoName: context.memoName,
+    existingRelations: context.relationList,
+    onAddRelation: (relation: MemoRelation) => {
+      context.setRelationList(uniqBy([...context.relationList, relation], (r) => r.relatedMemo?.name));
+      setLinkDialogOpen(false);
+    },
+  });
+
+  const location = useLocation(props.location);
+
+  const isUploading = uploadingFlag || props.isUploading;
+
+  const handleLocationClick = () => {
+    setLocationDialogOpen(true);
+    if (!props.location && !location.locationInitialized) {
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+          (position) => {
+            location.handlePositionChange(new LatLng(position.coords.latitude, position.coords.longitude));
+          },
+          (error) => {
+            console.error("Geolocation error:", error);
+          },
+        );
+      }
+    }
+  };
+
+  const handleLocationConfirm = () => {
+    const newLocation = location.getLocation();
+    if (newLocation) {
+      props.onLocationChange(newLocation);
+      setLocationDialogOpen(false);
+    }
+  };
+
+  const handleLocationCancel = () => {
+    location.reset();
+    setLocationDialogOpen(false);
+  };
+
+  const handlePositionChange = (position: LatLng) => {
+    location.handlePositionChange(position);
+
+    fetch(`https://nominatim.openstreetmap.org/reverse?lat=${position.lat}&lon=${position.lng}&format=json`, {
+      headers: {
+        "User-Agent": "Memos/1.0 (https://github.com/usememos/memos)",
+        Accept: "application/json",
+      },
+    })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        return response.json();
+      })
+      .then((data) => {
+        if (data?.display_name) {
+          location.setPlaceholder(data.display_name);
+        } else {
+          location.setPlaceholder(`${position.lat.toFixed(6)}, ${position.lng.toFixed(6)}`);
+        }
+      })
+      .catch((error) => {
+        console.error("Failed to fetch reverse geocoding data:", error);
+        location.setPlaceholder(`${position.lat.toFixed(6)}, ${position.lng.toFixed(6)}`);
+      });
+  };
+
+  return (
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button variant="outline" size="icon" className="shadow-none" disabled={isUploading}>
+            {isUploading ? <LoaderIcon className="size-4 animate-spin" /> : <PlusIcon className="size-4" />}
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start">
+          <DropdownMenuItem onClick={handleUploadClick}>
+            <PaperclipIcon className="w-4 h-4" />
+            {t("common.upload")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={() => setLinkDialogOpen(true)}>
+            <LinkIcon className="w-4 h-4" />
+            {t("tooltip.link-memo")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={handleLocationClick}>
+            <MapPinIcon className="w-4 h-4" />
+            {t("tooltip.select-location")}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      {/* Hidden file input */}
+      <input
+        className="hidden"
+        ref={fileInputRef}
+        disabled={isUploading}
+        onChange={handleFileInputChange}
+        type="file"
+        multiple={true}
+        accept="*"
+      />
+
+      <LinkMemoDialog
+        open={linkDialogOpen}
+        onOpenChange={setLinkDialogOpen}
+        searchText={linkMemo.searchText}
+        onSearchChange={linkMemo.setSearchText}
+        filteredMemos={linkMemo.filteredMemos}
+        isFetching={linkMemo.isFetching}
+        onSelectMemo={linkMemo.addMemoRelation}
+        getHighlightedContent={linkMemo.getHighlightedContent}
+      />
+
+      <LocationDialog
+        open={locationDialogOpen}
+        onOpenChange={setLocationDialogOpen}
+        state={location.state}
+        locationInitialized={location.locationInitialized}
+        onPositionChange={handlePositionChange}
+        onLatChange={location.handleLatChange}
+        onLngChange={location.handleLngChange}
+        onPlaceholderChange={location.setPlaceholder}
+        onCancel={handleLocationCancel}
+        onConfirm={handleLocationConfirm}
+      />
+    </>
+  );
+});
+
+export default InsertMenu;
