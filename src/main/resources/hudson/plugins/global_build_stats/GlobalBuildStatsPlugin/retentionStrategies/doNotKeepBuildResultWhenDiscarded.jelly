@@ -1,0 +1,4 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core">
+  <span>${%Do not keep build results when they are discarded}</span>
+</j:jelly>

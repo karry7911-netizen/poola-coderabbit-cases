@@ -1,0 +1,306 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:d="jelly:define" xmlns:l="/lib/layout" xmlns:t="/lib/hudson" xmlns:f="/lib/form"
+         xmlns:i="jelly:fmt">
+  <l:layout title="${%Global Build Stats}" permission="${it.requiredPermission}">
+
+    <j:invoke var="FIELD_FILTER_ALL" on="${it}" method="getFieldFilterALL"/>
+    <j:invoke var="FIELD_FILTER_REGEX" on="${it}" method="getFieldFilterRegex"/>
+    <j:set var="LAUNCHER_SYSTEM_REGEX" value="${FIELD_FILTER_REGEX}(^SYSTEM$$)"/>
+    <j:set var="NODE_MASTER_REGEX" value="${FIELD_FILTER_REGEX}(^master$$)"/>
+
+    <l:side-panel sticky="true">
+      <l:tasks>
+        <l:task icon="symbol-bar-chart-outline plugin-ionicons-api" href="#" data-callback="newBuildStatConfigForm"
+                title="${%Create new chart}"/>
+        <l:task icon="icon-gear2 icon-md" href="#RetentionStrategy" title="${%Manage retention strategies}"/>
+        <l:task icon="icon-gear2 icon-md" href="#Initialize" title="${%Data Initialization}"/>
+      </l:tasks>
+    </l:side-panel>
+
+    <l:header>
+      <link rel="stylesheet" href="${rootURL}/plugin/global-build-stats/css/global-build-stats.css" type="text/css"/>
+      <script src="${rootURL}/plugin/global-build-stats/scripts/global-build-stats/standardFunctions.js"></script>
+      <script src="${rootURL}/plugin/global-build-stats/scripts/global-build-stats/chartList.js"></script>
+      <script src="${rootURL}/plugin/global-build-stats/scripts/global-build-stats/BuildStatConfigs.js"></script>
+      <script src="${rootURL}/plugin/global-build-stats/scripts/global-build-stats/BuildStatConfigForm.js"></script>
+      <script type="application/json" id="gbs-constants">
+        {
+          "CHART_LENGTH_UNITS": [
+            <j:forEach var="historicScale" items="${it.historicScales}" varStatus="status">
+              "${historicScale}" <j:if test="${!status.last}">,</j:if>
+            </j:forEach>
+          ],
+          "FIELD_FILTER_ALL": "${FIELD_FILTER_ALL}",
+          "FIELD_FILTER_REGEX": "${FIELD_FILTER_REGEX}",
+          "LAUNCHER_SYSTEM_REGEX": "${LAUNCHER_SYSTEM_REGEX}",
+          "NODE_MASTER_REGEX": "${NODE_MASTER_REGEX}"
+        }
+      </script>
+      <script src="${rootURL}/plugin/global-build-stats/scripts/global-build-stats/globalBuildStats.js"></script>
+    </l:header>
+
+
+    <l:main-panel>
+      <l:app-bar title="${%Global Build Stats}"/>
+
+      <div id="buildStatActionSpinner" class="spinner" style="display: none"/>
+      <span id="buildStatActionValidationMessage" style="color: rgb(52, 101, 0); display: none;"></span>
+      <span id="buildStatActionErrorMessage" class="error" style="display: none;"></span>
+
+      <div id="errors">
+        <j:forEach var="error" items="${requestScope['errors']}">
+          ${error.renderHtml()}
+        </j:forEach>
+      </div>
+
+      <div class="jenkins-hidden" id="jsTemplates">
+        <span id="createMessage">${%New chart was created successfully}</span>
+        <span id="updateMessage">${%Chart was updated successfully}</span>
+        <span id="updateSubmitLabel">${%Update build stat configuration}</span>
+        <span id="updatePopupTitle">${%Updating build stat configuration}</span>
+        <span id="createSubmitLabel">${%Create new chart}</span>
+        <span id="createPopupTitle">${%Adding new chart}</span>
+        <span id="overviewLabel">${%Overview}</span>
+        <span id="cancelLabel">${%Cancel}</span>
+        <span id="waitMessage">${%Loading, please wait...}</span>
+        <span id="deletionConfirmationMessage">${%Are you sure to delete this build stat configuration ?}</span>
+        <div id="buildStatConfigWithoutContainerTemplate">
+          <a name="buildStat_#{id}"/>
+          #{buildStatImage}
+          <div class="gbs-chart-buttons" data-id="#{id}">
+            <button id="edit_#{id}"
+                    class="jenkins-button jenkins-button--tertiary gbs-edit-chart">
+              <l:icon src="symbol-settings-outline plugin-ionicons-api" class="icon-lg"/>
+            </button>
+            <button id="moveUp_#{id}" class="jenkins-button jenkins-button--tertiary gbs-chart-up">
+              <l:icon src="symbol-arrow-up-outline plugin-ionicons-api" class="icon-lg"/>
+            </button>
+            <button id="moveDown_#{id}" class="jenkins-button jenkins-button--tertiary gbs-chart-down">
+              <l:icon src="symbol-arrow-down-outline plugin-ionicons-api" class="icon-lg"/>
+            </button>
+            <button class="jenkins-button jenkins-button--tertiary gbs-delete-chart">
+              <l:icon src="symbol-trash-outline plugin-ionicons-api" class="icon-lg"/>
+            </button>
+          </div>
+        </div>
+        <div id="regenerateIdBlockTemplate">
+          <div class="gbs-form-row">
+            <span>${%Identifier}:</span>
+            <div class="jenkins-radio">
+              <input type="radio" id="#{buildStatId}_regenerateId_no" class="jenkins-radio__input" name="regenerateId"
+                     value="false" checked="checked"/>
+              <label for="#{buildStatId}_regenerateId_no" class="jenkins-radio__label">#{buildStatId}</label>
+            </div>
+            <div class="jenkins-radio">
+              <input type="radio" id="#{buildStatId}_regenerateId_yes" class="jenkins-radio__input" name="regenerateId"
+                     value="true"/>
+              <label for="#{buildStatId}_regenerateId_yes" class="jenkins-radio__label">${%Regenerate a new identifier}</label>
+            </div>
+          </div>
+        </div>
+        <div id="formBlockTemplate">
+          <form name="createBuildStat_#{buildStatId}" action="#{formAction}" method="post" class="globalBuildStatsForm"
+                id="createBuildStat_#{buildStatId}">
+            <div class="gbs-chart-config">
+              #{regenerateIdBlock}
+              <div class="gbs-form-row">
+                <span>${%Title}:</span>
+                <input type="text" id="#{buildStatId}_title" name="title" data-checks="blur,change"
+                       value="#{buildStatTitle}" class="jenkins-input gbs-check"
+                       checkUrl="${rootURL}/plugin/global-build-stats/checkTitle"
+                />
+                <span class="validation-error-area" data-id="#{buildStatId}_title" style="display:inline-block;"></span>
+              </div>
+              <div class="gbs-form-row">
+                <span>${%Chart Width * Height}:</span>
+                <input type="number" id="#{buildStatId}_buildStatWidth" name="buildStatWidth" data-checks="blur,change"
+                       size="3" value="#{buildStatWidth}" class="jenkins-input gbs-check" min="100"
+                       checkUrl="${rootURL}/plugin/global-build-stats/checkBuildStatWidth"
+                />
+                <div>
+                  <span class="width-validation-error-area" data-id="#{buildStatId}_buildStatWidth" style="display:inline-block;"></span>*
+                </div>
+                <input type="number" id="#{buildStatId}_buildStatHeight" name="buildStatHeight" data-checks="blur,change"
+                       size="3" value="#{buildStatHeight}" class="jenkins-input gbs-check" min="100"
+                       checkUrl="${rootURL}/plugin/global-build-stats/checkBuildStatHeight"
+                />
+                <span class="height-validation-error-area" data-id="#{buildStatId}_buildStatHeight" style="display:inline-block;"></span>
+              </div>
+              <div class="gbs-form-row">
+                <span>${%Chart time scale}:</span>
+                <div class="jenkins-select gbs-select">
+                  <select id="#{buildStatId}_historicScale" class="jenkins-select__input gbs-check-historicScale"
+                          name="historicScale" checkUrl="${rootURL}/plugin/global-build-stats/checkHistoricScale">
+                    <j:forEach var="historicScale" items="${it.historicScales}" varStatus="status">
+                      <option value="${historicScale}">${historicScale.label}</option>
+                    </j:forEach>
+                  </select>
+                </div>
+                <span class="validation-error-area" data-id="#{buildStatId}_historicScale" style="display:inline-block;"></span>
+                <span>${%Chart time length}:</span>
+                <input type="number" id="#{buildStatId}_historicLength" name="historicLength" data-checks="blur,change"
+                       size="3" value="#{historicLength}" class="jenkins-input gbs-check"
+                       checkUrl="${rootURL}/plugin/global-build-stats/checkHistoricLength"
+                />
+                <j:forEach var="historicScale" items="${it.historicScales}" varStatus="status">
+                  <span id="#{buildStatId}_${historicScale}" style="display:none">${historicScale.unitLabel}</span>
+                </j:forEach>
+                <span class="validation-error-area" data-id="#{buildStatId}_historicLength" style="display:inline-block;"></span>
+              </div>
+              <div class="gbs-form-row">${%Filters}:</div>
+              <div class="gbs-sub-config">
+                <div class="gbs-form-row">
+                  <span>${%Job filtering}:</span>
+                  <div class="jenkins-radio">
+                    <input type="radio" id="#{buildStatId}_jobFilteringType_ALL" checked="checked" name="jobFilteringType"
+                           value="${FIELD_FILTER_ALL}" class="jenkins-radio__input gbs-fieldFilter" data-regex-field="#{buildStatId}_jobNameRegex"
+                           data-hidden-field="#{buildStatId}_jobFilter"/>
+                    <label for="#{buildStatId}_jobFilteringType_ALL" class="jenkins-radio__label">${%ALL Jobs}</label>
+                  </div>
+                  <div class="jenkins-radio">
+                    <input type="radio" id="#{buildStatId}_jobFilteringType_REGEX" name="jobFilteringType"
+                           value="${FIELD_FILTER_REGEX}" class="jenkins-radio__input gbs-fieldFilter" data-regex-field="#{buildStatId}_jobNameRegex"
+                           data-hidden-field="#{buildStatId}_jobFilter"/>
+                    <label for="#{buildStatId}_jobFilteringType_REGEX" class="jenkins-radio__label">${%Job name regex}:</label>
+                  </div>
+                  <input type="text" id="#{buildStatId}_jobNameRegex" class="jenkins-input gbs-regex-blur"
+                         disabled="true" name="jobNameRegex" size="10" data-id="#{buildStatId}_jobFilter"/>
+                  <input id="#{buildStatId}_jobFilter" type="hidden" name="jobFilter" value="#{jobFilter}"/>
+                </div>
+                <div class="gbs-form-row">
+                  <span>${%Node filtering}:</span>
+                  <div class="jenkins-radio">
+                    <input type="radio" id="#{buildStatId}_nodeFilteringType_ALL" checked="checked" name="nodeFilteringType"
+                           value="${FIELD_FILTER_ALL}" class="jenkins-radio__input gbs-fieldFilter" data-regex-field="#{buildStatId}_nodeNameRegex"
+                           data-hidden-field="#{buildStatId}_nodeFilter"/>
+                    <label for="#{buildStatId}_nodeFilteringType_ALL" class="jenkins-radio__label">${%ALL Nodes}</label>
+                  </div>
+                  <div class="jenkins-radio">
+                    <input type="radio" id="#{buildStatId}_nodeFilteringType_REGEXMASTER" name="nodeFilteringType"
+                           value="${NODE_MASTER_REGEX}" class="jenkins-radio__input gbs-fieldFilter" data-regex-field="#{buildStatId}_nodeNameRegex"
+                           data-hidden-field="#{buildStatId}_nodeFilter"/>
+                    <label for="#{buildStatId}_nodeFilteringType_REGEXMASTER" class="jenkins-radio__label">${%Master only}</label>
+                  </div>
+                  <div class="jenkins-radio">
+                    <input type="radio" id="#{buildStatId}_nodeFilteringType_REGEX" name="nodeFilteringType"
+                           value="${FIELD_FILTER_REGEX}" class="jenkins-radio__input gbs-fieldFilter" data-regex-field="#{buildStatId}_nodeNameRegex"
+                           data-hidden-field="#{buildStatId}_nodeFilter"/>
+                    <label for="#{buildStatId}_nodeFilteringType_REGEX" class="jenkins-radio__label">${%Node name regex}:</label>
+                  </div>
+                  <input type="text" id="#{buildStatId}_nodeNameRegex" class="jenkins-input gbs-regex-blur"
+                         disabled="true" name="nodeNameRegex" size="10" data-id="#{buildStatId}_nodeFilter"/>
+                  <input id="#{buildStatId}_nodeFilter" type="hidden" name="nodeFilter" value="#{nodeFilter}"/>
+                </div>
+                <div class="gbs-form-row">
+                  <span>${%Launcher filtering}:</span>
+                  <div class="jenkins-radio">
+                    <input type="radio" id="#{buildStatId}_launcherFilteringType_ALL" checked="checked" name="launcherFilteringType"
+                           value="${FIELD_FILTER_ALL}" class="jenkins-radio__input gbs-fieldFilter" data-regex-field="#{buildStatId}_launcherNameRegex"
+                           data-hidden-field="#{buildStatId}_launcherFilter"/>
+                    <label for="#{buildStatId}_launcherFilteringType_ALL" class="jenkins-radio__label">${%ALL Users}</label>
+                  </div>
+                  <div class="jenkins-radio">
+                    <input type="radio" id="#{buildStatId}_launcherFilteringType_REGEXSYSTEM" name="launcherFilteringType"
+                           value="${LAUNCHER_SYSTEM_REGEX}" class="jenkins-radio__input gbs-fieldFilter" data-regex-field="#{buildStatId}_launcherNameRegex"
+                           data-hidden-field="#{buildStatId}_launcherFilter"/>
+                    <label for="#{buildStatId}_launcherFilteringType_REGEXSYSTEM" class="jenkins-radio__label">${%System only}</label>
+                  </div>
+                  <div class="jenkins-radio">
+                    <input type="radio" id="#{buildStatId}_launcherFilteringType_REGEX" name="launcherFilteringType"
+                           value="${FIELD_FILTER_REGEX}" class="jenkins-radio__input gbs-fieldFilter" data-regex-field="#{buildStatId}_launcherNameRegex"
+                           data-hidden-field="#{buildStatId}_launcherFilter"/>
+                    <label for="#{buildStatId}_launcherFilteringType_REGEX" class="jenkins-radio__label">${%Username regex}:</label>
+                  </div>
+                  <input type="text" id="#{buildStatId}_launcherNameRegex" class="jenkins-input gbs-regex-blur"
+                         disabled="true" name="launcherNameRegex" size="10" data-id="#{buildStatId}_launcherFilter"/>
+                  <input id="#{buildStatId}_launcherFilter" type="hidden" name="launcherFilter" value="#{launcherFilter}"/>
+                </div>
+                <div class="gbs-form-row">
+                  <span>${%Statuses taken into account}:</span>
+                  <f:checkbox value="true" id="#{buildStatId}_successShown" name="successShown" checked="true" title="${%Success}"/>
+                  <f:checkbox value="true" id="#{buildStatId}_failuresShown" name="failuresShown" checked="true" title="${%Failures}"/>
+                  <f:checkbox value="true" id="#{buildStatId}_unstablesShown" name="unstablesShown" checked="true" title="${%Unstables}"/>
+                  <f:checkbox value="true" id="#{buildStatId}_abortedShown" name="abortedShown" checked="true" title="${%Aborted}"/>
+                  <f:checkbox value="true" id="#{buildStatId}_notBuildsShown" name="notBuildsShown" title="${%Not Build}"/>
+                </div>
+              </div>
+              <div class="gbs-form-row">${%Elements displayed on chart}:</div>
+              <div class="gbs-sub-config">
+                <div class="gbs-form-row ">
+                  <f:checkbox value="true" id="#{buildStatId}_buildStatusesShown" name="buildStatusesShown" checked="true"
+                              title="${%Build statuses with Y Axis type}:"/>
+                  <div class="jenkins-select gbs-select">
+                    <select id="#{buildStatId}_yAxisChartType" class="jenkins-select__input gbs-check" data-checks="change"
+                            name="yAxisChartType" checkUrl="${rootURL}/plugin/global-build-stats/checkYAxisChartType">
+                      <j:forEach var="yAxisChartType" items="${it.yAxisChartTypes}" varStatus="status">
+                        <option value="${yAxisChartType}">${yAxisChartType.label}</option>
+                      </j:forEach>
+                    </select>
+                  </div>
+                  <span class="validation-error-area" data-id="#{buildStatId}_yAxisChartType" style="display:inline-block;"/>
+                </div>
+                <div class="gbs-form-row">
+                  <f:checkbox value="true" id="#{buildStatId}_totalBuildTimeShown" name="totalBuildTimeShown" title="${%Total build time}" class="jenkins-!-margin-left-2"/>
+                </div>
+                <div class="gbs-form-row">
+                  <f:checkbox value="true" id="#{buildStatId}_averageBuildTimeShown" name="averageBuildTimeShown" title="${%Average build time}" class="jenkins-!-margin-left-2"/>
+                </div>
+              </div>
+            </div>
+            <input type="hidden" name="buildStatId" value="#{buildStatId}"/>
+            <button type="button" class="jenkins-button jenkins-!-margin-top-2 gbs-preview-button">${%Preview}</button>
+          </form>
+        </div>
+      </div>
+      <strong>${%Statistics}</strong>
+      <div id="buildStatConfigsContainer">
+        <j:if test="${empty(it.buildStatConfigsArrayed)}">
+          <em>${%No chart configured for the moment ...}
+            <a href="#" class="gbs-newBuildStatConfigForm">${%Create a new chart configuration}</a>
+          </em>
+        </j:if>
+      </div>
+
+      <div style="clear:both;" class="jenkins-!-padding-top-3">
+      <a name="RetentionStrategy"/>
+      <strong>${%Build Results retention strategies}</strong>
+      <br/>
+      <br/>
+      <form id="retentionStrategiesForm" action="updateRetentionStrategies" class="gbs-chart-config jenkins-!-margin-bottom-4">
+        <j:forEach var="strategy" items="${it.availableRetentionStrategies}">
+          <j:set var="strategySelected" value="${it.isStrategySelected(strategy.id)}"/>
+          <div class="gbs-form-row">
+            <f:checkbox name="retentionStrategies" id="${strategy.id}_checkbox" value="${strategy.id}" checked="${strategySelected}"/>
+            <st:include from="${it}" page="/hudson/plugins/global_build_stats/GlobalBuildStatsPlugin/retentionStrategies/${strategy.configPage}"/>
+          </div>
+        </j:forEach>
+        <div>
+        <button id="updateRetentionStrategies" type="button" class="jenkins-button jenkins-!-margin-top-2"
+                data-message="${%Retention strategies updated successfully !}">${%Update retention strategies}
+        </button>
+        </div>
+      </form>
+
+      <a name="Initialize"/>
+      <strong>${%Data Initialization}</strong>
+      <br/>
+      <br/>
+      <em>
+        ${%Click button below to initialize build statistics}
+        <br/>
+        ${%Job results read will be merged with already recorded job results.}
+        <br/>
+      </em>
+      <span id="initializeStatsMessage" style="color: rgb(52, 101, 0); display: none;">
+        <strong>${%Data successfully initialized !}</strong>&#160;
+        <j:if test="${!empty(it.buildStatConfigsArrayed)}">
+          <a href="#" class="gbs-refresh-stats">${%Refresh page}</a>
+        </j:if>
+        <br/>
+      </span>
+      <button type="button" class="jenkins-button gbs-initializeStats">${%Initialize stats}</button>
+      <div id="initializeStatsSpinner" class="spinner" style="display: none"/>
+      </div>
+    </l:main-panel>
+  </l:layout>
+</j:jelly>
