@@ -1,0 +1,468 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.activemq.transport.ws;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
+
+import java.io.IOException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.activemq.transport.stomp.Stomp;
+import org.apache.activemq.transport.stomp.StompFrame;
+import org.apache.activemq.util.Wait;
+import org.apache.activemq.util.Wait.Condition;
+import org.eclipse.jetty.client.HttpClient;
+import org.eclipse.jetty.client.dynamic.HttpClientTransportDynamic;
+import org.eclipse.jetty.io.ClientConnector;
+import org.eclipse.jetty.util.ssl.SslContextFactory;
+import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
+import org.eclipse.jetty.websocket.client.WebSocketClient;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Test STOMP over WebSockets functionality.
+ */
+public class StompWSTransportTest extends WSTransportTestSupport {
+
+    private static final Logger LOG = LoggerFactory.getLogger(StompWSTransportTest.class);
+
+    protected WebSocketClient wsClient;
+    protected StompWSConnection wsStompConnection;
+
+    @Override
+    @Before
+    public void setUp() throws Exception {
+        super.setUp();
+        wsStompConnection = new StompWSConnection();
+
+        ClientUpgradeRequest request = new ClientUpgradeRequest();
+        request.setSubProtocols("v11.stomp");
+
+        SslContextFactory.Client sslContextFactory = new SslContextFactory.Client();
+        sslContextFactory.setTrustAll(true);
+        ClientConnector clientConnector = new ClientConnector();
+        clientConnector.setSslContextFactory(sslContextFactory);
+
+        HttpClient httpClient = new HttpClient(new HttpClientTransportDynamic(clientConnector));
+        wsClient = new WebSocketClient(httpClient);
+        wsClient.start();
+
+        wsClient.connect(wsStompConnection, wsConnectUri, request);
+        if (!wsStompConnection.awaitConnection(30, TimeUnit.SECONDS)) {
+            throw new IOException("Could not connect to STOMP WS endpoint");
+        }
+    }
+
+    @Override
+    @After
+    public void tearDown() throws Exception {
+        if (wsStompConnection != null) {
+            wsStompConnection.close();
+            wsStompConnection = null;
+            wsClient = null;
+        }
+
+        super.tearDown();
+    }
+
+    @Test(timeout = 60000)
+    public void testConnect() throws Exception {
+        String connectFrame = "STOMP\n" +
+                              "login:system\n" +
+                              "passcode:manager\n" +
+                              "accept-version:1.2\n" +
+                              "host:localhost\n" +
+                              "\n" + Stomp.NULL;
+
+        wsStompConnection.sendRawFrame(connectFrame);
+
+        String incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+        assertNotNull(incoming);
+        assertTrue(incoming.startsWith("CONNECTED"));
+        assertEquals("v11.stomp", wsStompConnection.getConnection().getUpgradeResponse().getAcceptedSubProtocol());
+
+        assertTrue("Connection should close", Wait.waitFor(new Wait.Condition() {
+
+            @Override
+            public boolean isSatisified() throws Exception {
+                return getProxyToBroker().getCurrentConnectionsCount() == 1;
+            }
+        }));
+
+        wsStompConnection.sendFrame(new StompFrame(Stomp.Commands.DISCONNECT));
+        wsStompConnection.close();
+
+        assertTrue("Connection should close", Wait.waitFor(new Wait.Condition() {
+
+            @Override
+            public boolean isSatisified() throws Exception {
+                return getProxyToBroker().getCurrentConnectionsCount() == 0;
+            }
+        }));
+    }
+
+    @Test(timeout = 60000)
+    public void testMissingStompConnect() throws Exception {
+        // Send a frame without first sending a CONNECT frame, which is a protocol violation
+        String message = "SEND\n" + "destination:/queue/" + getTestName() + "\n\n" + "Hello World" + Stomp.NULL;
+        wsStompConnection.sendRawFrame(message);
+
+        String incoming = wsStompConnection.receive(5, TimeUnit.SECONDS);
+        assertNotNull(incoming);
+        assertTrue(incoming.startsWith("ERROR"));
+        assertTrue(incoming.contains("StompWireFormat is configured for 'server' mode and received an"
+                + " unexpected frame before CONNECT or STOMP frame: SEND"));
+
+        assertTrue("Connection should close", Wait.waitFor(
+                (Condition) () -> wsStompConnection.isNotConnected()));
+    }
+
+    @Test(timeout = 60000)
+    public void testNegativeContentLength() throws Exception {
+        String connectFrame = "STOMP\n" +
+                "login:system\n" +
+                "passcode:manager\n" +
+                "accept-version:1.2\n" +
+                "host:localhost\n" +
+                "\n" + Stomp.NULL;
+
+        wsStompConnection.sendRawFrame(connectFrame);
+
+        String incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+        assertNotNull(incoming);
+        assertTrue(incoming.startsWith("CONNECTED"));
+
+        String message = "SEND\n" + "destination:/queue/" + getTestName() + "\ncontent-length:-1" + " \n\n" + "body" + Stomp.NULL;
+        wsStompConnection.sendRawFrame(message);
+
+        // Negative content length is a protocol error and should return
+        // an error and close the connection
+        incoming = wsStompConnection.receive(5, TimeUnit.SECONDS);
+        assertNotNull(incoming);
+        assertTrue(incoming.startsWith("ERROR"));
+        assertTrue(incoming.contains("Specified content-length may not be negative"));
+
+        assertTrue("Connection should close", Wait.waitFor(
+                (Condition) () -> wsStompConnection.isNotConnected()));
+    }
+
+    @Test(timeout = 60000)
+    public void testDuplicateConnect() throws Exception {
+        String connectFrame = "STOMP\n" +
+                "login:system\n" +
+                "passcode:manager\n" +
+                "accept-version:1.2\n" +
+                "host:localhost\n" +
+                "\n" + Stomp.NULL;
+
+        wsStompConnection.sendRawFrame(connectFrame);
+
+        String incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+        assertNotNull(incoming);
+        assertTrue(incoming.startsWith("CONNECTED"));
+
+        // Sending a second CONNECT frame is not allowed and should error
+        wsStompConnection.sendRawFrame(connectFrame);
+
+        incoming = wsStompConnection.receive(5, TimeUnit.SECONDS);
+        assertNotNull(incoming);
+        assertTrue(incoming.startsWith("ERROR"));
+        assertTrue(incoming.contains("duplicate CONNECT or STOMP frame"));
+
+        assertTrue("Connection should close", Wait.waitFor(
+                (Condition) () -> wsStompConnection.isNotConnected()));
+    }
+
+    @Test(timeout = 60000)
+    public void testInvalidServerResponseReceived() throws Exception {
+        String connectFrame = "STOMP\n" +
+                "login:system\n" +
+                "passcode:manager\n" +
+                "accept-version:1.2\n" +
+                "host:localhost\n" +
+                "\n" + Stomp.NULL;
+
+        wsStompConnection.sendRawFrame(connectFrame);
+
+        String incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+        assertNotNull(incoming);
+        assertTrue(incoming.startsWith("CONNECTED"));
+
+        // Sending a server response to the server, which is invalid
+        String invalidFrame = "RECEIPT\n" + "receipt-id:message-12345\n\n" + Stomp.NULL;
+        wsStompConnection.sendRawFrame(invalidFrame);
+        incoming = wsStompConnection.receive(5, TimeUnit.SECONDS);
+        assertNotNull(incoming);
+        assertTrue(incoming.startsWith("ERROR"));
+        assertTrue(incoming.contains("StompWireFormat is configured for 'server' mode and received a"
+                + " frame that is only expected when configured for 'client' mode: RECEIPT"));
+
+        // make sure the connection was closed by the server
+        assertTrue("Connection should close", Wait.waitFor(
+                (Condition) () -> wsStompConnection.isNotConnected()));
+    }
+
+    @Test(timeout = 60000)
+    public void testConnectWithVersionOptions() throws Exception {
+        String connectFrame = "STOMP\n" +
+                              "login:system\n" +
+                              "passcode:manager\n" +
+                              "accept-version:1.0,1.1\n" +
+                              "host:localhost\n" +
+                              "\n" + Stomp.NULL;
+        wsStompConnection.sendRawFrame(connectFrame);
+
+        String incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+
+        assertTrue(incoming.startsWith("CONNECTED"));
+        assertTrue(incoming.indexOf("version:1.1") >= 0);
+        assertTrue(incoming.indexOf("session:") >= 0);
+
+        wsStompConnection.sendFrame(new StompFrame(Stomp.Commands.DISCONNECT));
+        wsStompConnection.close();
+    }
+
+    @Test(timeout = 60000)
+    public void testRejectInvalidHeartbeats1() throws Exception {
+        String connectFrame = "STOMP\n" +
+                              "login:system\n" +
+                              "passcode:manager\n" +
+                              "accept-version:1.1\n" +
+                              "heart-beat:0\n" +
+                              "host:localhost\n" +
+                              "\n" + Stomp.NULL;
+        wsStompConnection.sendRawFrame(connectFrame);
+
+        try {
+            String incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+
+            assertTrue(incoming.startsWith("ERROR"));
+            assertTrue(incoming.indexOf("heart-beat") >= 0);
+            assertTrue(incoming.indexOf("message:") >= 0);
+        } catch (IOException ex) {
+            LOG.debug("Connection closed before Frame was read.");
+        }
+
+        assertTrue("Connection should close", Wait.waitFor(new Wait.Condition() {
+
+            @Override
+            public boolean isSatisified() throws Exception {
+                return getProxyToBroker().getCurrentConnectionsCount() == 0;
+            }
+        }));
+    }
+
+    @Test(timeout = 60000)
+    public void testRejectInvalidHeartbeats2() throws Exception {
+        String connectFrame = "STOMP\n" +
+                              "login:system\n" +
+                              "passcode:manager\n" +
+                              "accept-version:1.1\n" +
+                              "heart-beat:T,0\n" +
+                              "host:localhost\n" +
+                              "\n" + Stomp.NULL;
+        wsStompConnection.sendRawFrame(connectFrame);
+
+        try {
+            String incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+
+            assertTrue(incoming.startsWith("ERROR"));
+            assertTrue(incoming.indexOf("heart-beat") >= 0);
+            assertTrue(incoming.indexOf("message:") >= 0);
+        } catch (IOException ex) {
+            LOG.debug("Connection closed before Frame was read.");
+        }
+
+        assertTrue("Connection should close", Wait.waitFor(new Wait.Condition() {
+
+            @Override
+            public boolean isSatisified() throws Exception {
+                return getProxyToBroker().getCurrentConnectionsCount() == 0;
+            }
+        }));
+    }
+
+    @Test(timeout = 60000)
+    public void testRejectInvalidHeartbeats3() throws Exception {
+        String connectFrame = "STOMP\n" +
+                              "login:system\n" +
+                              "passcode:manager\n" +
+                              "accept-version:1.1\n" +
+                              "heart-beat:100,10,50\n" +
+                              "host:localhost\n" +
+                              "\n" + Stomp.NULL;
+        wsStompConnection.sendRawFrame(connectFrame);
+
+        try {
+            String incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+
+            assertTrue(incoming.startsWith("ERROR"));
+            assertTrue(incoming.indexOf("heart-beat") >= 0);
+            assertTrue(incoming.indexOf("message:") >= 0);
+        } catch (IOException ex) {
+            LOG.debug("Connection closed before Frame was read.");
+        }
+
+        assertTrue("Connection should close", Wait.waitFor(new Wait.Condition() {
+
+            @Override
+            public boolean isSatisified() throws Exception {
+                return getProxyToBroker().getCurrentConnectionsCount() == 0;
+            }
+        }));
+    }
+
+    @Test(timeout = 60000)
+    public void testHeartbeatsDropsIdleConnection() throws Exception {
+        String connectFrame = "STOMP\n" +
+                              "login:system\n" +
+                              "passcode:manager\n" +
+                              "accept-version:1.1\n" +
+                              "heart-beat:1000,0\n" +
+                              "host:localhost\n" +
+                              "\n" + Stomp.NULL;
+
+        wsStompConnection.sendRawFrame(connectFrame);
+        String incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+        assertTrue(incoming.startsWith("CONNECTED"));
+        assertTrue(incoming.indexOf("version:1.1") >= 0);
+        assertTrue(incoming.indexOf("heart-beat:") >= 0);
+        assertTrue(incoming.indexOf("session:") >= 0);
+
+        assertTrue("Broker should have closed WS connection:", Wait.waitFor(new Wait.Condition() {
+
+            @Override
+            public boolean isSatisified() throws Exception {
+                return !wsStompConnection.isConnected();
+            }
+        }));
+    }
+
+    @Test(timeout = 60000)
+    public void testHeartbeatsKeepsConnectionOpen() throws Exception {
+        String connectFrame = "STOMP\n" +
+                              "login:system\n" +
+                              "passcode:manager\n" +
+                              "accept-version:1.1\n" +
+                              "heart-beat:2000,0\n" +
+                              "host:localhost\n" +
+                              "\n" + Stomp.NULL;
+
+        wsStompConnection.sendRawFrame(connectFrame);
+        String incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+        assertTrue(incoming.startsWith("CONNECTED"));
+        assertTrue(incoming.indexOf("version:1.1") >= 0);
+        assertTrue(incoming.indexOf("heart-beat:") >= 0);
+        assertTrue(incoming.indexOf("session:") >= 0);
+
+        String message = "SEND\n" + "destination:/queue/" + getTestName() + "\n\n" + "Hello World" + Stomp.NULL;
+        wsStompConnection.sendRawFrame(message);
+
+        ScheduledExecutorService service = Executors.newSingleThreadScheduledExecutor();
+
+        service.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    LOG.info("Sending next KeepAlive");
+                    wsStompConnection.keepAlive();
+                } catch (Exception e) {
+                }
+            }
+        }, 1, 1, TimeUnit.SECONDS);
+
+        TimeUnit.SECONDS.sleep(15);
+
+        String frame = "SUBSCRIBE\n" + "destination:/queue/" + getTestName() + "\n" +
+                       "id:12345\n" + "ack:auto\n\n" + Stomp.NULL;
+        wsStompConnection.sendRawFrame(frame);
+
+        incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+        assertTrue(incoming.startsWith("MESSAGE"));
+
+        service.shutdownNow();
+        service.awaitTermination(5, TimeUnit.SECONDS);
+
+        try {
+            wsStompConnection.sendFrame(new StompFrame(Stomp.Commands.DISCONNECT));
+        } catch (Exception ex) {
+            LOG.info("Caught exception on write of disconnect", ex);
+        }
+    }
+
+    @Test(timeout = 60000)
+    public void testEscapedHeaders() throws Exception {
+        String connectFrame = "STOMP\n" +
+                              "login:system\n" +
+                              "passcode:manager\n" +
+                              "accept-version:1.1\n" +
+                              "heart-beat:0,0\n" +
+                              "host:localhost\n" +
+                              "\n" + Stomp.NULL;
+
+        wsStompConnection.sendRawFrame(connectFrame);
+        String incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+        assertTrue(incoming.startsWith("CONNECTED"));
+
+        String message = "SEND\n" + "destination:/queue/" + getTestName() + "\nescaped-header:one\\ntwo\\cthree\n\n" + "Hello World" + Stomp.NULL;
+        wsStompConnection.sendRawFrame(message);
+
+        String frame = "SUBSCRIBE\n" + "destination:/queue/" + getTestName() + "\n" +
+                       "id:12345\n" + "ack:auto\n\n" + Stomp.NULL;
+        wsStompConnection.sendRawFrame(frame);
+
+        incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+        assertTrue(incoming.startsWith("MESSAGE"));
+        assertTrue(incoming.indexOf("escaped-header:one\\ntwo\\cthree") >= 0);
+
+        try {
+            wsStompConnection.sendFrame(new StompFrame(Stomp.Commands.DISCONNECT));
+        } catch (Exception ex) {
+            LOG.info("Caught exception on write of disconnect", ex);
+        }
+    }
+
+    @Test(timeout = 60000)
+    public void testNoDefaultJettyWebSocketIdleTimeout() throws Exception {
+        String connectFrame = "STOMP\n" +
+                              "login:system\n" +
+                              "passcode:manager\n" +
+                              "accept-version:1.1\n" +
+                              "heart-beat:60000,0\n" +
+                              "host:localhost\n" +
+                              "\n" + Stomp.NULL;
+
+        wsStompConnection.sendRawFrame(connectFrame);
+        String incoming = wsStompConnection.receive(30, TimeUnit.SECONDS);
+        assertTrue(incoming.startsWith("CONNECTED"));
+        assertTrue(incoming.indexOf("version:1.1") >= 0);
+        assertTrue(incoming.indexOf("heart-beat:") >= 0);
+        assertTrue(incoming.indexOf("session:") >= 0);
+
+        TimeUnit.SECONDS.sleep(35);
+
+        wsStompConnection.sendFrame(new StompFrame(Stomp.Commands.DISCONNECT));
+    }
+}

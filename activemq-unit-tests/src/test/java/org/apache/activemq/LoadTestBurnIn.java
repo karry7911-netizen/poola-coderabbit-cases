@@ -1,0 +1,171 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.activemq;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import jakarta.jms.BytesMessage;
+import jakarta.jms.Connection;
+import jakarta.jms.ConnectionFactory;
+import jakarta.jms.DeliveryMode;
+import jakarta.jms.JMSException;
+import jakarta.jms.Message;
+import jakarta.jms.MessageConsumer;
+import jakarta.jms.MessageProducer;
+import jakarta.jms.Session;
+import jakarta.jms.Topic;
+
+import junit.framework.Test;
+import org.apache.activemq.broker.BrokerFactory;
+import org.apache.activemq.broker.BrokerService;
+import org.apache.activemq.broker.TransportConnector;
+import org.apache.activemq.command.ActiveMQDestination;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Small burn test moves sends a moderate amount of messages through the broker,
+ * to checking to make sure that the broker does not lock up after a while of
+ * sustained messaging.
+ * 
+ * 
+ */
+public class LoadTestBurnIn extends JmsTestSupport {
+    private static final transient Logger LOG = LoggerFactory.getLogger(LoadTestBurnIn.class);
+
+    public ActiveMQDestination destination;
+    public int deliveryMode;
+    public byte destinationType;
+    public boolean durableConsumer;
+    public int messageCount = 50000;
+    public int messageSize = 1024;
+
+    public static Test suite() {
+        return suite(LoadTestBurnIn.class);
+    }
+
+    protected void setUp() throws Exception {
+        LOG.info("Start: " + getName());
+        super.setUp();
+    }
+
+    protected void tearDown() throws Exception {
+        try {
+            super.tearDown();
+        } catch (Throwable e) {
+            e.printStackTrace(System.out);
+        } finally {
+            LOG.info("End: " + getName());
+        }
+    }
+
+    public static void main(String[] args) {
+        junit.textui.TestRunner.run(suite());
+    }
+
+    protected BrokerService createBroker() throws Exception {
+        return BrokerFactory.createBroker(new URI("broker://(tcp://localhost:0)?useJmx=true"));
+        // return BrokerFactory.createBroker(new
+        // URI("xbean:org/apache/activemq/broker/store/loadtester.xml"));
+    }
+
+    protected ConnectionFactory createConnectionFactory() throws URISyntaxException, IOException {
+        return new ActiveMQConnectionFactory(((TransportConnector)broker.getTransportConnectors().get(0))
+            .getServer().getConnectURI());
+    }
+
+    public void initCombosForTestSendReceive() {
+        addCombinationValues("deliveryMode", new Object[] {DeliveryMode.NON_PERSISTENT,
+                                                           DeliveryMode.PERSISTENT});
+        addCombinationValues("destinationType", new Object[] {ActiveMQDestination.TOPIC_TYPE});
+        addCombinationValues("durableConsumer", new Object[] {Boolean.TRUE});
+        addCombinationValues("messageSize", new Object[] {101, 102,
+                                                          103, 104,
+                                                          105, 106,
+                                                          107, 108});
+    }
+
+    public void testSendReceive() throws Exception {
+
+        // Durable consumer combination is only valid with topics
+        if (durableConsumer && destinationType != ActiveMQDestination.TOPIC_TYPE) {
+            return;
+        }
+
+        connection.setClientID(getName());
+        connection.getPrefetchPolicy().setAll(1000);
+        connection.start();
+
+        Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+        destination = createDestination(session, destinationType);
+        MessageConsumer consumer;
+        if (durableConsumer) {
+            consumer = session.createDurableSubscriber((Topic)destination, "sub1:"
+                                                                           + System.currentTimeMillis());
+        } else {
+            consumer = session.createConsumer(destination);
+        }
+        profilerPause("Ready: ");
+
+        final CountDownLatch producerDoneLatch = new CountDownLatch(1);
+
+        // Send the messages, async
+        new Thread() {
+            public void run() {
+                Connection connection2 = null;
+                try {
+                    connection2 = factory.createConnection();
+                    Session session = connection2.createSession(false, Session.AUTO_ACKNOWLEDGE);
+                    MessageProducer producer = session.createProducer(destination);
+                    producer.setDeliveryMode(deliveryMode);
+                    for (int i = 0; i < messageCount; i++) {
+                        BytesMessage m = session.createBytesMessage();
+                        m.writeBytes(new byte[messageSize]);
+                        producer.send(m);
+                    }
+                    producer.close();
+                } catch (JMSException e) {
+                    e.printStackTrace();
+                } finally {
+                    safeClose(connection2);
+                    producerDoneLatch.countDown();
+                }
+
+            }
+        }.start();
+
+        // Make sure all the messages were delivered.
+        Message message = null;
+        for (int i = 0; i < messageCount; i++) {
+            message = consumer.receive(5000);
+            assertNotNull("Did not get message: " + i, message);
+        }
+
+        profilerPause("Done: ");
+
+        assertNull(consumer.receiveNoWait());
+        message.acknowledge();
+
+        // Make sure the producer thread finishes.
+        assertTrue(producerDoneLatch.await(5, TimeUnit.SECONDS));
+    }
+
+}
