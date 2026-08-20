@@ -1,0 +1,250 @@
+package org.a2aproject.sdk.compat03.client.http;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.IOException;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
+
+import org.a2aproject.sdk.client.http.A2AHttpClient;
+import org.a2aproject.sdk.client.http.A2AHttpResponse;
+import org.a2aproject.sdk.client.http.ServerSentEvent;
+import org.a2aproject.sdk.compat03.json.JsonUtil_v0_3;
+import org.a2aproject.sdk.compat03.spec.A2AClientError_v0_3;
+import org.a2aproject.sdk.compat03.spec.A2AClientJSONError_v0_3;
+import org.a2aproject.sdk.compat03.spec.AgentCard_v0_3;
+import org.junit.jupiter.api.Test;
+
+public class A2ACardResolver_v0_3_Test {
+
+    private static final String AGENT_CARD_PATH = "/.well-known/agent-card.json";
+
+    @Test
+    public void testConstructorStripsSlashes() throws Exception {
+        TestHttpClient client = new TestHttpClient();
+        client.body = JsonMessages_v0_3.AGENT_CARD;
+
+        A2ACardResolver_v0_3 resolver = new A2ACardResolver_v0_3(client, "http://example.com/");
+        AgentCard_v0_3 card = resolver.getAgentCard();
+
+        assertEquals("http://example.com" + AGENT_CARD_PATH, client.url);
+
+
+        resolver = new A2ACardResolver_v0_3(client, "http://example.com");
+        card = resolver.getAgentCard();
+
+        assertEquals("http://example.com" + AGENT_CARD_PATH, client.url);
+
+        // baseUrl with trailing slash, agentCardParth with leading slash
+        resolver = new A2ACardResolver_v0_3(client, "http://example.com/", AGENT_CARD_PATH);
+        card = resolver.getAgentCard();
+
+        assertEquals("http://example.com" + AGENT_CARD_PATH, client.url);
+
+        // baseUrl without trailing slash, agentCardPath with leading slash
+        resolver = new A2ACardResolver_v0_3(client, "http://example.com", AGENT_CARD_PATH);
+        card = resolver.getAgentCard();
+
+        assertEquals("http://example.com" + AGENT_CARD_PATH, client.url);
+
+        // baseUrl with trailing slash, agentCardPath without leading slash
+        resolver = new A2ACardResolver_v0_3(client, "http://example.com/", AGENT_CARD_PATH.substring(1));
+        card = resolver.getAgentCard();
+
+        assertEquals("http://example.com" + AGENT_CARD_PATH, client.url);
+
+        // baseUrl without trailing slash, agentCardPath without leading slash
+        resolver = new A2ACardResolver_v0_3(client, "http://example.com", AGENT_CARD_PATH.substring(1));
+        card = resolver.getAgentCard();
+
+        assertEquals("http://example.com" + AGENT_CARD_PATH, client.url);
+
+        // baseUrl with sub-path and trailing slash — the original URI.resolve() bug silently
+        // dropped the sub-path, producing http://example.com/.well-known/agent-card.json instead
+        resolver = new A2ACardResolver_v0_3(client, "http://example.com/jsonrpc/", AGENT_CARD_PATH);
+        card = resolver.getAgentCard();
+
+        assertEquals("http://example.com/jsonrpc" + AGENT_CARD_PATH, client.url);
+
+        // baseUrl with sub-path, no trailing slash
+        resolver = new A2ACardResolver_v0_3(client, "http://example.com/jsonrpc", AGENT_CARD_PATH);
+        card = resolver.getAgentCard();
+
+        assertEquals("http://example.com/jsonrpc" + AGENT_CARD_PATH, client.url);
+    }
+
+
+    @Test
+    public void testBaseUrl_alreadyContainsWellKnownPath() throws Exception {
+        TestHttpClient client = new TestHttpClient();
+        client.body = JsonMessages_v0_3.AGENT_CARD;
+
+        String fullUrl = "https://example.com/spec03" + AGENT_CARD_PATH;
+        A2ACardResolver_v0_3 resolver = new A2ACardResolver_v0_3(client, fullUrl);
+        resolver.getAgentCard();
+
+        assertEquals(fullUrl, client.url);
+    }
+
+    @Test
+    public void testFullWellKnownUrlWithCustomAgentCardPath() throws Exception {
+        TestHttpClient client = new TestHttpClient();
+        client.body = JsonMessages_v0_3.AGENT_CARD;
+
+        A2ACardResolver_v0_3 resolver = new A2ACardResolver_v0_3(
+                client, "https://example.com/spec03" + AGENT_CARD_PATH, "/custom/card.json");
+        resolver.getAgentCard();
+
+        assertEquals("https://example.com/spec03/custom/card.json", client.url);
+    }
+
+    @Test
+    public void testGetAgentCardSuccess() throws Exception {
+        TestHttpClient client = new TestHttpClient();
+        client.body = JsonMessages_v0_3.AGENT_CARD;
+
+        A2ACardResolver_v0_3 resolver = new A2ACardResolver_v0_3(client, "http://example.com/");
+        AgentCard_v0_3 card = resolver.getAgentCard();
+
+        AgentCard_v0_3 expectedCard = JsonUtil_v0_3.fromJson(JsonMessages_v0_3.AGENT_CARD, AgentCard_v0_3.class);
+        String expected = JsonUtil_v0_3.toJson(expectedCard);
+
+        String requestCardString = JsonUtil_v0_3.toJson(card);
+        assertEquals(expected, requestCardString);
+    }
+
+    @Test
+    public void testGetAgentCardJsonDecodeError() throws Exception {
+        TestHttpClient client = new TestHttpClient();
+        client.body = "X" + JsonMessages_v0_3.AGENT_CARD;
+
+        A2ACardResolver_v0_3 resolver = new A2ACardResolver_v0_3(client, "http://example.com/");
+
+        boolean success = false;
+        try {
+            AgentCard_v0_3 card = resolver.getAgentCard();
+            success = true;
+        } catch (A2AClientJSONError_v0_3 expected) {
+        }
+        assertFalse(success);
+    }
+
+
+    @Test
+    public void testParseV1AgentCardWithUrlAndPreferredTransport() throws Exception {
+        TestHttpClient client = new TestHttpClient();
+        client.body = JsonMessages_v0_3.V1_AGENT_CARD;
+
+        A2ACardResolver_v0_3 resolver = new A2ACardResolver_v0_3(client, "http://example.com/");
+        AgentCard_v0_3 card = resolver.getAgentCard();
+
+        assertEquals("Test Agent", card.name());
+        assertEquals("A test agent", card.description());
+        assertEquals("1.0.0", card.version());
+        assertEquals("https://agent.example.com/a2a", card.url());
+        assertEquals("JSONRPC", card.preferredTransport());
+        assertTrue(card.capabilities().streaming());
+    }
+
+    @Test
+    public void testParseV1AgentCardDefaultsPreferredTransportWhenAbsent() throws Exception {
+        TestHttpClient client = new TestHttpClient();
+        client.body = JsonMessages_v0_3.V1_AGENT_CARD_NO_PREFERRED_TRANSPORT;
+
+        A2ACardResolver_v0_3 resolver = new A2ACardResolver_v0_3(client, "http://example.com/");
+        AgentCard_v0_3 card = resolver.getAgentCard();
+
+        assertEquals("Minimal Agent", card.name());
+        assertEquals("https://agent.example.com/a2a", card.url());
+        // v0.3 compact constructor defaults null preferredTransport to "JSONRPC"
+        assertEquals("JSONRPC", card.preferredTransport());
+        // v1.0-only fields such as supportedInterfaces are unknown to v0.3 and must be ignored
+        assertNull(card.additionalInterfaces());
+    }
+
+    @Test
+    public void testGetAgentCardRequestError() throws Exception {
+        TestHttpClient client = new TestHttpClient();
+        client.status = 503;
+
+        A2ACardResolver_v0_3 resolver = new A2ACardResolver_v0_3(client, "http://example.com/");
+
+        String msg = null;
+        try {
+            AgentCard_v0_3 card = resolver.getAgentCard();
+        } catch (A2AClientError_v0_3 expected) {
+            msg = expected.getMessage();
+        }
+        assertTrue(msg.contains("503"));
+    }
+
+    private static class TestHttpClient implements A2AHttpClient {
+        int status = 200;
+        String body;
+        String url;
+
+        @Override
+        public GetBuilder createGet() {
+            return new TestGetBuilder();
+        }
+
+        @Override
+        public PostBuilder createPost() {
+            return null;
+        }
+
+        @Override
+        public DeleteBuilder createDelete() {
+            return null;
+        }
+
+        class TestGetBuilder implements A2AHttpClient.GetBuilder {
+
+            @Override
+            public A2AHttpResponse get() throws IOException, InterruptedException {
+                return new A2AHttpResponse() {
+                    @Override
+                    public int status() {
+                        return status;
+                    }
+
+                    @Override
+                    public boolean success() {
+                        return status == 200;
+                    }
+
+                    @Override
+                    public String body() {
+                        return body;
+                    }
+                };
+            }
+
+            @Override
+            public CompletableFuture<Void> getAsyncSSE(Consumer<ServerSentEvent> messageConsumer, Consumer<Throwable> errorConsumer, Runnable completeRunnable) throws IOException, InterruptedException {
+                return null;
+            }
+
+            @Override
+            public GetBuilder url(String s) {
+                url = s;
+                return this;
+            }
+
+            @Override
+            public GetBuilder addHeader(String name, String value) {
+                return this;
+            }
+
+            @Override
+            public GetBuilder addHeaders(Map<String, String> headers) {
+                return this;
+            }
+        }
+    }
+
+}
