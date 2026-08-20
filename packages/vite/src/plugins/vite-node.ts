@@ -1,0 +1,768 @@
+import process from 'node:process'
+import { rm } from 'node:fs/promises'
+import type { Socket } from 'node:net'
+import net from 'node:net'
+import os from 'node:os'
+import fs from 'node:fs' // For sync operations like unlinkSync if needed during setup
+import { pathToFileURL } from 'node:url'
+import { Buffer } from 'node:buffer'
+import { randomUUID } from 'node:crypto'
+import { win32 as pathWin32 } from 'node:path'
+import { dirname, join, normalize } from 'pathe'
+import { resolvePath, setBuildOutput, tryUseNuxt, useNitro } from '@nuxt/kit'
+import { bundlerDiagnostics, useServerBuild } from '@nuxt/kit/internal'
+import type { EnvironmentModuleNode, ModuleNode, PluginContainer, ViteDevServer, Plugin as VitePlugin } from 'vite'
+import type { FetchResult } from 'vite-node'
+import { ViteNodeServer } from 'vite-node/server'
+import type { Nitro } from 'nitropack/types'
+import { normalizeViteManifest } from 'vue-bundle-renderer'
+import type { Manifest } from 'vue-bundle-renderer'
+import type { Nuxt } from '@nuxt/schema'
+import { resolveModulePath } from 'exsolve'
+
+import { toVirtualId } from '../utils/index.ts'
+import { collectDevCss } from '../utils/css.ts'
+import { isBundlerTracingEnabled, traceAsync } from '../utils/tracing.ts'
+import { resolveClientEntry, resolveServerEntry } from '../utils/config.ts'
+import type { ErrorPartial } from '../types.ts'
+import type { ViteNodeErrorData } from '../vite-node-runner.ts'
+
+/**
+ * Serialise a Vite transform failure for transport over the vite-node socket, keeping the
+ * metadata an error handler needs to render an exact location.
+ *
+ * `file` is preferred over `moduleId`, since an id such as `/app.vue` reads as an absolute
+ * path but is relative to the environment root, so an error naming it cannot be opened.
+ */
+export function serializeViteNodeError (error: any, moduleId: string, file?: string): ViteNodeErrorData {
+  const errorData: ViteNodeErrorData = {
+    code: 'VITE_ERROR',
+    id: file || moduleId,
+    stack: error.stack || '',
+    message: error.message || '',
+  }
+  if (typeof error.name === 'string' && error.name !== 'Error') { errorData.name = error.name }
+  if (error.frame) { errorData.frame = error.frame }
+  if (error.loc) { errorData.loc = { file: error.loc.file || file || error.id, line: error.loc.line, column: error.loc.column } }
+  if (error.plugin) { errorData.plugin = error.plugin }
+  if (error.pluginCode) { errorData.pluginCode = error.pluginCode }
+  return errorData
+}
+
+type ResolveIdResponse = Awaited<ReturnType<PluginContainer['resolveId']>>
+
+export interface ViteNodeRequestMap {
+  manifest: {
+    request: undefined
+    response: Manifest
+  }
+  invalidates: {
+    request: undefined
+    response: string[]
+  }
+  resolve: {
+    request: { id: string, importer?: string }
+    response: ResolveIdResponse | null
+  }
+  module: {
+    request: { moduleId: string }
+    response: FetchResult
+  }
+}
+
+type RequestOf = {
+  [K in keyof ViteNodeRequestMap]: {
+    id: number
+    type: K
+    payload: ViteNodeRequestMap[K]['request']
+  }
+}
+
+type ViteNodeRequest = RequestOf[keyof RequestOf]
+
+export interface ViteNodeFetch {
+  /**  Gets the client manifest. */
+  getManifest(): Promise<Manifest>
+  /** Gets the list of invalidated files. */
+  getInvalidates(): Promise<string[]>
+  /** Resolves a module ID. */
+  resolveId(id: string, importer?: string): Promise<ResolveIdResponse | null>
+  /** Fetches a module. */
+  fetchModule(moduleId: string): Promise<FetchResult>
+  /** Ensures the IPC socket is connected. */
+  ensureConnected(): Promise<Socket>
+}
+
+function getManifest (nuxt: Nuxt, viteServer: ViteDevServer, clientEntry: string) {
+  const ssrServer = nuxt.options.experimental.viteEnvironmentApi ? viteServer.environments.ssr : viteServer
+
+  // global CSS is included as a fallback to prevent FOUC before the ssr module
+  // graph is populated
+  const css = collectDevCss(nuxt, ssrServer.moduleGraph)
+
+  const manifest = normalizeViteManifest({
+    '@vite/client': {
+      file: '@vite/client',
+      css,
+      module: true,
+      isEntry: true,
+    },
+    ...nuxt.options.features.noScripts === 'all'
+      ? {}
+      : {
+          [clientEntry]: {
+            file: clientEntry,
+            isEntry: true,
+            module: true,
+            resourceType: 'script',
+          },
+        },
+  })
+
+  return manifest
+}
+
+export interface SocketPathInfo {
+  socketPath: string
+  /** mkdtemp directory we own; cleaned up on close. Undefined for Windows pipes. */
+  parentDir?: string
+}
+
+// only exported for tests
+export function pickSocketPath (platform: NodeJS.Platform, tmpdir: string = os.tmpdir()): SocketPathInfo {
+  const socketName = 'nuxt.sock'
+  const socketDir = `nuxt-vite-`
+
+  if (platform === 'win32') {
+    // use `node:path/win32` so the `\\.\pipe\...` separators stay as backslashes
+    // (for deno compatibility) plus enough randomness to avoid collisions and being predictable
+    return { socketPath: pathWin32.join(String.raw`\\.\pipe`, socketDir + randomUUID().slice(0, 8)) }
+  }
+
+  // creates a random suffix and avoids collisions
+  let parentDir = fs.mkdtempSync(join(tmpdir, socketDir))
+
+  // macOS's per-user $TMPDIR can be too long so fall back to /tmp when the
+  // full path exceeds the limit
+  if (Buffer.byteLength(join(parentDir, socketName)) >
+    (platform === 'linux' ? 108 : /* macOS */ 104)) {
+    parentDir = join('/tmp', socketDir + randomUUID().slice(0, 8))
+    // The socket needs its own 0700 directory to gate access on macOS/BSD.
+    // See https://github.com/advisories/GHSA-534h-c3cw-v3h9
+    fs.mkdirSync(parentDir, { mode: 0o700 })
+  }
+
+  fs.chmodSync(parentDir, 0o700)
+
+  return { socketPath: join(parentDir, socketName), parentDir }
+}
+
+function generateSocketPath (): SocketPathInfo {
+  return pickSocketPath(process.platform)
+}
+
+function useInvalidates () {
+  // Store the invalidates for the next rendering
+  const invalidates = new Set<string>()
+
+  function markInvalidate (mod: ModuleNode | EnvironmentModuleNode) {
+    if (!mod.id) { return }
+    if (invalidates.has(mod.id)) { return }
+    invalidates.add(mod.id)
+    markInvalidates(mod.importers)
+  }
+
+  function markInvalidates (mods?: (ModuleNode | EnvironmentModuleNode)[] | Set<ModuleNode | EnvironmentModuleNode>) {
+    if (!mods) { return }
+    for (const mod of mods) {
+      markInvalidate(mod)
+    }
+  }
+
+  return {
+    invalidates,
+    markInvalidate,
+    markInvalidates,
+  }
+}
+
+export function ViteNodePlugin (nuxt: Nuxt): VitePlugin | undefined {
+  if (!nuxt.options.dev) {
+    return
+  }
+
+  // the bridge externalises modules in the server build's own rollup pass and serves them
+  // to its runtime, so there is nothing to bridge when there is no pass of its own
+  if (!useServerBuild(nuxt).buildsSeparately) {
+    return
+  }
+
+  const nitro = useNitro() as Nitro
+
+  let socketServer: net.Server | undefined
+  const { socketPath, parentDir } = generateSocketPath()
+  const { invalidates, markInvalidate, markInvalidates } = useInvalidates()
+
+  let cleanedUp = false
+  async function cleanupSocket () {
+    if (cleanedUp) { return }
+    cleanedUp = true
+    if (socketServer && socketServer.listening) {
+      await new Promise<void>(resolveClose => socketServer!.close(() => resolveClose()))
+    }
+    if (parentDir) {
+      try {
+        await rm(parentDir, { recursive: true, force: true })
+      } catch {
+        // mkdtemp directory cleanup is best-effort
+      }
+    }
+  }
+
+  const runnerResolvedPath = resolveModulePath('#vite-node-runner', { from: import.meta.url })
+  const serverResolvedPath = resolveModulePath('#vite-node-entry', { from: import.meta.url })
+  const fetchResolvedPath = resolveModulePath('#vite-node', { from: import.meta.url })
+  const sourceMapPluginPath = resolveModulePath('#ssr-sourcemap', { from: import.meta.url })
+  const warmupPluginPath = resolveModulePath('#vite-node-warmup', { from: import.meta.url })
+
+  const externalRuntimeUrls = new Set([runnerResolvedPath, serverResolvedPath, fetchResolvedPath, sourceMapPluginPath, warmupPluginPath].map(p => pathToFileURL(p).href))
+  const rollupConfig = (nitro.options.rollupConfig ||= {} as NonNullable<typeof nitro.options.rollupConfig>)
+  const existingExternal = rollupConfig.external
+  rollupConfig.external = (id, ...args) => {
+    if (externalRuntimeUrls.has(id)) {
+      return true
+    }
+    if (typeof existingExternal === 'function') {
+      return existingExternal(id, ...args)
+    }
+    const patterns = existingExternal == null ? [] : (Array.isArray(existingExternal) ? existingExternal : [existingExternal])
+    return patterns.some(e => typeof e === 'string' ? e === id : e.test(id))
+  }
+
+  const serverEntryCode = `export { default } from ${JSON.stringify(pathToFileURL(serverResolvedPath).href)}`
+  setBuildOutput('serverEntry', () => serverEntryCode)
+  setBuildOutput('clientManifest', () => `import { viteNodeFetch } from ${JSON.stringify(pathToFileURL(fetchResolvedPath))};export default () => viteNodeFetch.getManifest()`)
+
+  nitro.options.virtual ||= {}
+  nitro.options._config.virtual ||= {}
+  const runnerCode = `export { default } from ${JSON.stringify(pathToFileURL(runnerResolvedPath).href)}`
+  nitro.options.virtual['#build/dist/server/runner.mjs'] = runnerCode
+  nitro.options._config.virtual['#build/dist/server/runner.mjs'] = runnerCode
+
+  const sourceMapPluginCode = `export { default } from ${JSON.stringify(pathToFileURL(sourceMapPluginPath).href)}`
+  nitro.options.virtual['#internal/nitro/ssr-sourcemap'] = sourceMapPluginCode
+  nitro.options._config.virtual['#internal/nitro/ssr-sourcemap'] = sourceMapPluginCode
+  nitro.options.plugins.push('#internal/nitro/ssr-sourcemap')
+
+  // a nitro plugin, so that the app is not evaluated before nitro installs `globalThis.$fetch`
+  const warmupPluginCode = `export { default } from ${JSON.stringify(pathToFileURL(warmupPluginPath).href)}`
+  nitro.options.virtual['#internal/nitro/vite-node-warmup'] = warmupPluginCode
+  nitro.options._config.virtual['#internal/nitro/vite-node-warmup'] = warmupPluginCode
+  nitro.options.plugins.push('#internal/nitro/vite-node-warmup')
+
+  // The SSR dev server runs with `hmr: false`, so on the legacy two-server path
+  // invalidations made while handling a hot update (virtual modules, importers
+  // of a renamed component) are mirrored from the client environment's
+  // `hotUpdate`. See nuxt/nuxt#30169.
+  let legacySsrServer: ViteDevServer | undefined
+
+  return {
+    name: 'nuxt:vite-node-server',
+    enforce: 'post',
+    hotUpdate ({ timestamp, modules }) {
+      if (!legacySsrServer || this.environment.name !== 'client') { return }
+      const ssrGraph = legacySsrServer.moduleGraph
+      const invalidated = new Set(modules)
+      for (const mod of this.environment.moduleGraph.idToModuleMap.values()) {
+        if (mod.lastInvalidationTimestamp >= timestamp) {
+          invalidated.add(mod)
+        }
+      }
+      for (const mod of invalidated) {
+        const ssrMod = mod.id && ssrGraph.getModuleById(mod.id)
+        if (ssrMod) {
+          ssrGraph.invalidateModule(ssrMod, undefined, timestamp)
+        }
+      }
+    },
+    async configureServer (clientServer) {
+      // early return if plugins are 'borrowed' for testing/storybook
+      if (!tryUseNuxt()) {
+        return
+      }
+
+      // When `ssr: false` without the vite environment API, the client dev server's
+      // config only carries the client entry, so we resolve the SPA entry up front.
+      const spaEntryPath = !nuxt.options.ssr && !nuxt.options.experimental.viteEnvironmentApi
+        ? await resolvePath(join(nuxt.options.appDir, 'entry-spa'))
+        : undefined
+
+      // the dev SSR entry only imports the app entry as it renders, so the runner is given
+      // the app entry directly and evaluates the shared graph before the first request
+      const warmupPath = nuxt.options.ssr && nuxt.options.vite.warmupEntry !== false
+        ? await resolvePath(join(nuxt.options.appDir, 'entry'))
+        : undefined
+
+      // The SSR module graph isn't reachable from the file watcher or the
+      // `app:templatesGenerated` hook for modules invalidated by user plugins
+      // (e.g. virtual modules invalidated via `handleHotUpdate`). Track the
+      // most recent invalidation/HMR timestamp we've observed so we can pick
+      // up any module whose timestamp advanced since the previous SSR render.
+      // See https://github.com/nuxt/nuxt/issues/30169.
+      let lastSeenTimestamp = 0
+
+      // Files the watcher saw change but couldn't map to an SSR module yet:
+      // the SSR graph is populated lazily by `fetchModule` on render, so a
+      // file in an extended layer often isn't present at watch time and never
+      // gets its SSR timestamp advanced by Vite's HMR. We resolve these against
+      // the (now-populated) SSR graph at render time and invalidate them along
+      // with their importers, so an edit to e.g. a sibling-layer component
+      // reaches the page that renders it.
+      //
+      // The value counts down the renders a file may stay unresolved before we
+      // give up on it, so files that are never SSR-relevant don't accumulate.
+      const pendingChangedFiles = new Map<string, number>()
+      const PENDING_CHANGED_FILE_RENDERS = 2
+
+      function collectInvalidatedSsrModules (ssrServer: ViteDevServer) {
+        const ssrModuleGraph = nuxt.options.experimental.viteEnvironmentApi
+          ? ssrServer.environments.ssr.moduleGraph
+          : ssrServer.moduleGraph
+        let maxSeen = lastSeenTimestamp
+        for (const mod of ssrModuleGraph.idToModuleMap.values()) {
+          const modTimestamp = Math.max(mod.lastHMRTimestamp, mod.lastInvalidationTimestamp)
+          if (modTimestamp > lastSeenTimestamp) {
+            markInvalidate(mod)
+            if (modTimestamp > maxSeen) {
+              maxSeen = modTimestamp
+            }
+          }
+        }
+        lastSeenTimestamp = maxSeen
+
+        for (const [file, remaining] of pendingChangedFiles) {
+          const mods = ssrModuleGraph.getModulesByFile(file)
+          if (!mods?.size) {
+            if (remaining <= 1) {
+              pendingChangedFiles.delete(file)
+            } else {
+              pendingChangedFiles.set(file, remaining - 1)
+            }
+            continue
+          }
+
+          // A `handleHotUpdate` hook reacting to this edit invalidates virtual
+          // modules only in the client graph (`server.moduleGraph`), so the SSR
+          // copy keeps serving a stale evaluation. Re-evaluate any virtual
+          // module the changed file imports. The SSR graph fills lazily, so the
+          // import may not exist yet on the first render; stay pending until it
+          // surfaces or the countdown runs out.
+          // See https://github.com/nuxt/nuxt/issues/30169.
+          let invalidatedVirtual = false
+          // `ssrModuleGraph` is a union of the legacy and environment graphs, so its
+          // `invalidateModule` is typed against the intersection of both node types.
+          // The nodes we pass always come from this same graph, so narrow the call.
+          const invalidateModule = (mod: ModuleNode | EnvironmentModuleNode) =>
+            (ssrModuleGraph.invalidateModule as (mod: ModuleNode | EnvironmentModuleNode) => void)(mod)
+          const seen = new Set<ModuleNode | EnvironmentModuleNode>()
+          const invalidateVirtualImports = (mod: ModuleNode | EnvironmentModuleNode) => {
+            for (const imported of mod.importedModules) {
+              if (seen.has(imported)) { continue }
+              seen.add(imported)
+              if (imported.id?.startsWith('\0')) {
+                invalidateModule(imported)
+                markInvalidate(imported)
+                invalidatedVirtual = true
+              }
+              invalidateVirtualImports(imported)
+            }
+          }
+          for (const mod of mods) {
+            invalidateVirtualImports(mod)
+            invalidateModule(mod)
+          }
+          markInvalidates(mods)
+
+          if (invalidatedVirtual || remaining <= 1) {
+            pendingChangedFiles.delete(file)
+          } else {
+            pendingChangedFiles.set(file, remaining - 1)
+          }
+        }
+      }
+
+      function resolveServer (ssrServer: ViteDevServer) {
+        const viteNodeServerOptions = {
+          socketPath,
+          root: nuxt.options.srcDir,
+          entryPath: spaEntryPath ?? resolveServerEntry(ssrServer.config),
+          warmupPath,
+          base: '/',
+          maxRetryAttempts: nuxt.options.vite.viteNode?.maxRetryAttempts,
+          baseRetryDelay: nuxt.options.vite.viteNode?.baseRetryDelay,
+          maxRetryDelay: nuxt.options.vite.viteNode?.maxRetryDelay,
+          requestTimeout: nuxt.options.vite.viteNode?.requestTimeout,
+          // TODO: remove baseURL in future
+          baseURL: nuxt.options.devServer.url,
+        }
+
+        process.env.NUXT_VITE_NODE_OPTIONS = JSON.stringify(viteNodeServerOptions)
+
+        socketServer = createViteNodeSocketServer(nuxt, ssrServer, clientServer, invalidates, () => collectInvalidatedSsrModules(ssrServer), viteNodeServerOptions)
+      }
+
+      if (nuxt.options.experimental.viteEnvironmentApi || !nuxt.options.ssr) {
+        resolveServer(clientServer)
+      } else {
+        nuxt.hook('vite:serverCreated', (ssrServer, ctx) => {
+          if (!ctx.isServer) { return }
+          legacySsrServer = ssrServer
+          resolveServer(ssrServer)
+        })
+      }
+
+      nuxt.hook('close', cleanupSocket)
+
+      const client = nuxt.options.experimental.viteEnvironmentApi ? clientServer.environments.client : clientServer
+      nuxt.hook('app:templatesGenerated', (_app, changedTemplates) => {
+        // The SSR dev server runs with `hmr: false`, so a regenerated template
+        // (e.g. `routes.mjs` after a page is added) only ever invalidates its
+        // client-graph copy. Without also invalidating the SSR copy, server
+        // renders keep evaluating the stale module and never pick up the new
+        // route. See https://github.com/nuxt/nuxt/issues/30169.
+        const ssrModuleGraph = nuxt.options.experimental.viteEnvironmentApi
+          ? clientServer.environments.ssr.moduleGraph
+          : legacySsrServer?.moduleGraph
+        for (const template of changedTemplates) {
+          const virtualId = toVirtualId(template.dst, nuxt)
+          const mods = client.moduleGraph.getModulesByFile(virtualId)
+          for (const mod of mods || []) {
+            markInvalidate(mod)
+          }
+          const ssrMods = ssrModuleGraph?.getModulesByFile(virtualId)
+          for (const mod of ssrMods || []) {
+            ssrModuleGraph!.invalidateModule(mod as ModuleNode & EnvironmentModuleNode)
+            markInvalidate(mod)
+          }
+        }
+      })
+
+      clientServer.watcher.on('all', (_event, file) => {
+        invalidates.add(file)
+        const normalized = normalize(file)
+        markInvalidates(clientServer.moduleGraph.getModulesByFile(normalized))
+        pendingChangedFiles.set(normalized, PENDING_CHANGED_FILE_RENDERS)
+      })
+    },
+    async buildEnd () {
+      await cleanupSocket()
+    },
+  }
+}
+
+let _node: ViteNodeServer | undefined
+let _nodeServer: ViteDevServer | undefined
+
+function getNode (server: ViteDevServer) {
+  if (!_node || _nodeServer !== server) {
+    _node = new ViteNodeServer(server, {
+      transformMode: {
+        ssr: [/.*/],
+        web: [],
+      },
+    })
+    _nodeServer = server
+  }
+  return _node
+}
+
+function createViteNodeSocketServer (nuxt: Nuxt, ssrServer: ViteDevServer, clientServer: ViteDevServer, invalidates: Set<string>, collectInvalidatedSsrModules: () => void, config: ViteNodeServerOptions) {
+  const server = net.createServer((socket) => {
+    const INITIAL_BUFFER_SIZE = 64 * 1024 // 64kB
+    const MAX_BUFFER_SIZE = 1024 * 1024 * 1024 // 1GB
+
+    let buffer = Buffer.alloc(INITIAL_BUFFER_SIZE)
+    let writeOffset = 0
+    let readOffset = 0
+
+    // Optimize socket settings for performance
+    socket.setNoDelay(true)
+    socket.setKeepAlive(true, 0)
+
+    async function processMessage (request: ViteNodeRequest) {
+      try {
+        switch (request.type) {
+          case 'manifest': {
+            const manifestData = getManifest(nuxt, ssrServer, resolveClientEntry(clientServer.config))
+            sendResponse<typeof request.type>(socket, request.id, manifestData)
+            return
+          }
+          case 'invalidates': {
+            collectInvalidatedSsrModules()
+            const responsePayload = Array.from(invalidates)
+            invalidates.clear()
+            sendResponse<typeof request.type>(socket, request.id, responsePayload)
+            return
+          }
+          case 'resolve': {
+            const { id: resolveId, importer } = request.payload
+            if (!resolveId) {
+              throw { status: 400, message: 'Missing id for resolve' } satisfies ErrorPartial
+            }
+            const ssrNode = nuxt.options.experimental.viteEnvironmentApi
+              ? ssrServer.environments.ssr.pluginContainer
+              : getNode(ssrServer)
+            const resolvedResult = await ssrNode.resolveId(resolveId, importer).catch(() => null)
+            sendResponse<typeof request.type>(socket, request.id, resolvedResult)
+            return
+          }
+          case 'module': {
+            if (request.payload.moduleId === '/') {
+              throw { status: 400, message: 'Invalid moduleId' } satisfies ErrorPartial
+            }
+            const moduleId = request.payload.moduleId
+            const fetchModule = nuxt.options.experimental.viteEnvironmentApi
+              ? () => ssrServer.environments.ssr.fetchModule(moduleId)
+              : isBundlerTracingEnabled(nuxt)
+                ? () => traceAsync('nuxt.bundler.module', { url: moduleId, environment: 'ssr' }, () => getNode(ssrServer).fetchModule(moduleId))
+                : () => getNode(ssrServer).fetchModule(moduleId)
+            const response = await Promise.resolve(fetchModule())
+              .catch(async (err) => {
+                const file = ssrServer.environments.ssr.moduleGraph.getModuleById(request.payload.moduleId)?.file ?? undefined
+                const errorData = serializeViteNodeError(err, request.payload.moduleId, file)
+
+                if (!errorData.frame && err.code === 'PARSE_ERROR') {
+                  try {
+                    const clientNode = nuxt.options.experimental.viteEnvironmentApi
+                      ? ssrServer.environments.client
+                      : getNode(ssrServer)
+                    errorData.frame = await clientNode.transformRequest(request.payload.moduleId)
+                      .then(res => `${err.message || ''}\n${res?.code}`).catch(() => undefined)
+                  } catch {
+                    // Ignore transform errors
+                  }
+                }
+                throw { data: errorData, message: err.message || 'Error fetching module' } satisfies ErrorPartial
+              }) as Exclude<FetchResult, { cache: true }>
+            // Attach the sourcemap from the module graph so vite-node can use it.
+            if (response && !response.map) {
+              const graph = ssrServer.environments.ssr.moduleGraph
+              const mod = graph.getModuleById(request.payload.moduleId)
+                       || graph.fileToModulesMap.get(request.payload.moduleId)?.values().next().value
+              if (mod?.transformResult?.map) {
+                response.map = mod.transformResult.map as FetchResult['map']
+              }
+            }
+            sendResponse<typeof request.type>(socket, request.id, response)
+            return
+          }
+          default:
+            // @ts-expect-error this should never happen
+            throw { status: 400, message: `Unknown request type: ${request.type}` } satisfies ErrorPartial
+        }
+      } catch (error: any) {
+        sendError(socket, request.id, error)
+      }
+    }
+
+    const resetBuffer = () => {
+      writeOffset = 0
+      readOffset = 0
+    }
+
+    const compactBuffer = () => {
+      if (readOffset > 0) {
+        const remainingData = writeOffset - readOffset
+        if (remainingData > 0) {
+          buffer.copy(buffer, 0, readOffset, writeOffset)
+        }
+        writeOffset = remainingData
+        readOffset = 0
+      }
+    }
+
+    const ensureBufferCapacity = (additionalBytes: number) => {
+      const requiredSize = writeOffset + additionalBytes
+
+      if (requiredSize > MAX_BUFFER_SIZE) {
+        throw bundlerDiagnostics.NUXT_B7012({ requiredSize, maxSize: MAX_BUFFER_SIZE })
+      }
+
+      if (requiredSize > buffer.length) {
+        // try compacting first
+        compactBuffer()
+
+        // ... then if we still need more space, grow the buffer
+        if (writeOffset + additionalBytes > buffer.length) {
+          const newSize = Math.min(
+            Math.max(buffer.length * 2, requiredSize),
+            MAX_BUFFER_SIZE,
+          )
+          const newBuffer = Buffer.alloc(newSize)
+          buffer.copy(newBuffer, 0, 0, writeOffset)
+          buffer = newBuffer
+        }
+      }
+    }
+
+    socket.on('data', (data) => {
+      try {
+        ensureBufferCapacity(data.length)
+        data.copy(buffer, writeOffset)
+        writeOffset += data.length
+
+        // Process all complete messages in the buffer
+        while (writeOffset - readOffset >= 4) {
+          const messageLength = buffer.readUInt32BE(readOffset)
+          const totalLength = 4 + messageLength
+
+          if (writeOffset - readOffset < totalLength) {
+            break // Wait for more data
+          }
+
+          const messageJSON = buffer.subarray(readOffset + 4, readOffset + totalLength).toString('utf-8')
+          readOffset += totalLength
+
+          try {
+            const request = JSON.parse(messageJSON)
+            processMessage(request).catch((error) => {
+              sendError(socket, request?.id || 'unknown', error)
+            })
+          } catch (parseError) {
+            // invalid JSON
+            const errorMessage = parseError instanceof Error ? parseError.message : 'Unknown parse error'
+            socket.destroy(new Error(`Invalid JSON in message: ${errorMessage}`))
+            return
+          }
+        }
+
+        // compact buffer periodically to prevent memory waste
+        if (readOffset > buffer.length / 2) {
+          compactBuffer()
+        }
+      } catch (error) {
+        // buffer management error - close connection
+        socket.destroy(error instanceof Error ? error : new Error('Buffer management error'))
+      }
+    })
+
+    socket.on('error', () => {
+      resetBuffer()
+    })
+
+    socket.on('close', () => {
+      resetBuffer()
+    })
+  })
+
+  const currentSocketPath = config.socketPath
+  if (!currentSocketPath) {
+    throw bundlerDiagnostics.NUXT_B7013()
+  }
+
+  listenAndRestrict(server, currentSocketPath)
+
+  server.on('error', () => { })
+
+  return server
+}
+
+export function listenAndRestrict (server: net.Server, socketPath: string): void {
+  const isWindowsPipe = socketPath.startsWith('\\\\.\\pipe\\')
+  if (isWindowsPipe) {
+    server.listen(socketPath)
+    return
+  }
+  // 1. the 0700 parent directory (created by pickSocketPath) is the access-control
+  //    boundary, since AF_UNIX connect requires +x on every parent.
+  // 2. The post-listen chmod 0600 protects the socket file itself.
+  // 3. The umask wrap tightens the in-process window between bind(2) and the chmod,
+  //    where the file would otherwise briefly exist with the default umask
+  //    and be observable to other code.
+  const previousUmask = process.umask(0o077)
+  try {
+    server.listen(socketPath, () => {
+      try {
+        fs.chmodSync(socketPath, 0o600)
+      } catch (error) {
+        bundlerDiagnostics.NUXT_B7018({ cause: error })
+        server.close()
+        try {
+          fs.rmSync(dirname(socketPath), { recursive: true, force: true })
+        } catch {
+          // mkdtemp directory cleanup is best-effort
+        }
+      }
+    })
+  } finally {
+    process.umask(previousUmask)
+  }
+}
+
+function sendResponse<T extends keyof ViteNodeRequestMap> (
+  socket: net.Socket,
+  id: number,
+  data: ViteNodeRequestMap[T]['response'],
+): undefined {
+  try {
+    const response = { id, type: 'response', data }
+    const responseJSON = JSON.stringify(response)
+    const messageBuffer = Buffer.from(responseJSON, 'utf-8')
+    const messageLength = messageBuffer.length
+
+    // pre-allocate single buffer for length + message to avoid Buffer.concat()
+    const fullMessage = Buffer.alloc(4 + messageLength)
+    fullMessage.writeUInt32BE(messageLength, 0)
+    messageBuffer.copy(fullMessage, 4)
+
+    socket.write(fullMessage, (err) => {
+      if (err) {
+        // Failed to send response - connection likely closed
+      }
+    })
+  } catch (error) {
+    // Send error response instead
+    sendError(socket, id, error)
+  }
+}
+
+function sendError (socket: net.Socket, id: number, error: any) {
+  const errorResponse = {
+    id,
+    type: 'error',
+    error: {
+      message: error.message,
+      stack: error.stack,
+      status: error.status,
+      statusText: error.statusText,
+      data: error.data,
+    },
+  }
+  const responseJSON = JSON.stringify(errorResponse)
+  const messageBuffer = Buffer.from(responseJSON, 'utf-8')
+  const messageLength = messageBuffer.length
+
+  // Pre-allocate single buffer for length + message to avoid Buffer.concat()
+  const fullMessage = Buffer.alloc(4 + messageLength)
+  fullMessage.writeUInt32BE(messageLength, 0)
+  messageBuffer.copy(fullMessage, 4)
+
+  socket.write(fullMessage, (err) => {
+    if (err) {
+      // Failed to send error response - connection likely closed
+    }
+  })
+}
+
+export type ViteNodeServerOptions = {
+  baseURL: string
+  socketPath: string
+  root: string
+  entryPath: string
+  warmupPath?: string
+  base: string
+  maxRetryAttempts?: number
+  baseRetryDelay?: number
+  maxRetryDelay?: number
+  requestTimeout?: number
+}

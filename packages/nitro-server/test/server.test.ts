@@ -1,0 +1,387 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { describe, expect, it, vi } from 'vitest'
+import { join, resolve } from 'pathe'
+import { rollup } from 'rollup'
+import { build } from 'tsdown'
+import tsdownConfig from '../tsdown.config.ts'
+import { resolveModuleExportNames } from '@nuxt/kit/internal'
+import fc from 'fast-check'
+import { createApp, createEvent, createRouter, eventHandler, toPlainHandler } from 'h3'
+import type { H3Event } from 'h3'
+import * as shipped from '../../nuxt/src/server/index.ts'
+import type { RequestEvent } from '../../nuxt/src/server/index.ts'
+
+const { hooks, localFetch } = vi.hoisted(() => ({
+  hooks: {},
+  localFetch: vi.fn((_path: string, _init: RequestInit) => Promise.resolve(new Response('ok'))),
+}))
+
+// the delegate reads nitro's `useRuntimeConfig` and a virtual route rules module, which only
+// resolve inside a built server bundle
+vi.mock('nitropack/runtime', () => ({
+  useRuntimeConfig: () => ({ app: { baseURL: '/base/' } }),
+  useNitroApp: () => ({ hooks, localFetch }),
+}))
+vi.mock('#internal/nuxt/route-rules.mjs', () => ({
+  normalizeRouteRulePath: (path: string) => path,
+}))
+
+const delegate = await import('../src/runtime/server.ts')
+const { toPortableEvent } = await import('../src/runtime/utils/event.ts')
+
+const delegatePath = resolve(import.meta.dirname, '../src/runtime/server.ts')
+
+describe('the h3-backed `nuxt/server` implementations', () => {
+  it('exports every name the portable surface does', async () => {
+    const [surface, implemented] = await Promise.all([
+      resolveModuleExportNames(resolve(import.meta.dirname, '../../nuxt/src/server/index.ts'), { url: import.meta.url }),
+      resolveModuleExportNames(delegatePath, { url: import.meta.url }),
+    ])
+
+    expect(surface.length).toBeGreaterThan(0)
+    expect(surface.filter(name => !implemented.includes(name))).toEqual([])
+  })
+
+  it('leaves no unused h3 imports in the built runtime', async () => {
+    const outDir = await mkdtemp(join(tmpdir(), 'nuxt-nitro-runtime-'))
+    try {
+      const runtimeConfig = tsdownConfig.find(config => config.outDir === 'dist/runtime/')!
+      await build({ ...runtimeConfig, cwd: resolve(import.meta.dirname, '..'), outDir, config: false, logLevel: 'silent' })
+
+      const unused: string[] = []
+      const bundle = await rollup({
+        input: 'entry',
+        external: id => !id.startsWith('.') && !id.startsWith('/'),
+        onwarn: (warning) => {
+          if (warning.code === 'UNUSED_EXTERNAL_IMPORT' && warning.exporter === 'h3') {
+            unused.push(...warning.names!)
+          }
+        },
+        plugins: [{
+          name: 'entry',
+          resolveId: id => id === 'entry' ? id : undefined,
+          load: id => id === 'entry' ? `import { defineEventHandler } from ${JSON.stringify(join(outDir, 'server.mjs'))}\nexport default defineEventHandler(() => 'ok')` : undefined,
+        }],
+      })
+      await bundle.generate({ format: 'es' })
+      await bundle.close()
+
+      expect(unused).toEqual([])
+    } finally {
+      await rm(outDir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * The delegate reads an h3 v1 event, where the shipped implementations read the
+ * web-standard shape, so the two are only interchangeable if they agree on what they
+ * return for the same request.
+ */
+describe('the shape of what it reads off an h3 v1 event', () => {
+  /** The web-standard event the shipped implementations read, for comparing against. */
+  function webEvent (url: string, headers?: Record<string, string>): RequestEvent {
+    return {
+      req: new Request(url, { headers }),
+      url: new URL(url),
+      res: { headers: new Headers() },
+      context: {},
+    }
+  }
+
+  function event (path: string, options: { method?: string, headers?: Record<string, string>, ip?: string } = {}): H3Event {
+    const headers: Record<string, string | string[] | undefined> = {}
+    const req = { method: options.method || 'GET', url: path, headers: { host: 'nuxt.com', ...options.headers }, socket: { remoteAddress: options.ip } }
+    const res = {
+      statusCode: 200,
+      statusMessage: undefined as string | undefined,
+      setHeader: (name: string, value: string | string[]) => { headers[name.toLowerCase()] = value },
+      getHeader: (name: string) => headers[name.toLowerCase()],
+      getHeaders: () => ({ ...headers }),
+      hasHeader: (name: string) => name.toLowerCase() in headers,
+      removeHeader: (name: string) => { delete headers[name.toLowerCase()] },
+    }
+    return createEvent(req as never, res as never)
+  }
+
+  it('reads the request URL, headers and query', () => {
+    const e = event('/api/hello?name=nuxt&tag=a&tag=b', { headers: { 'x-custom': 'value' } })
+
+    expect(delegate.getRequestURL(e).pathname).toBe('/api/hello')
+    expect(delegate.getRequestHeader(e, 'X-Custom')).toBe('value')
+    expect(delegate.getRequestHeaders(e)).toMatchObject({ 'x-custom': 'value' })
+    expect(delegate.getQuery(e)).toEqual({ name: 'nuxt', tag: ['a', 'b'] })
+  })
+
+  it('reads router params as they appear in the request URL, which nitropack routes decoded', () => {
+    const e = event('/base/api/users/a%20b%2Fc/x%25y/z?page=1')
+    Object.assign(e, { _path: '/api/users/a b%2Fc/x%25y/z?page=1' })
+    e.context.matchedRoute = { path: '/api/users/:id/**:rest' } as never
+    e.context.params = { id: 'a b%2Fc', rest: 'x%25y/z' }
+
+    expect(delegate.getRouterParams(e)).toEqual({ id: 'a%20b%2Fc', rest: 'x%25y/z' })
+    expect(delegate.getRouterParam(e, 'id', { decode: true })).toBe('a b%2Fc')
+    expect(delegate.getRouterParam(e, 'rest', { decode: true })).toBe('x%y/z')
+  })
+
+  it('reads router params as h3 matched them when it cannot line them up with the URL', () => {
+    const e = event('/api/users/a%20b')
+    e.context.params = { id: 'a b' }
+    expect(delegate.getRouterParams(e)).toEqual({ id: 'a b' })
+
+    e.context.matchedRoute = { path: '/api/other/:id/:extra' } as never
+    expect(delegate.getRouterParams(e)).toEqual({ id: 'a b' })
+  })
+
+  describe.each(['/', '/base/'])('router params routed by h3 under %s', (base) => {
+    const router = createRouter({ preemptive: true })
+    for (const route of ['/api/auth/**:slug', '/api/users/:id', '/api/users/:id/**:rest', '/api/items/*/x']) {
+      router.use(route, eventHandler(event => ({
+        matched: event.context.params,
+        params: delegate.getRouterParams(event),
+        decoded: delegate.getRouterParams(event, { decode: true }),
+      })))
+    }
+    const app = createApp()
+    app.use(base, router.handler)
+    const handle = toPlainHandler(app)
+
+    async function request (path: string) {
+      const response = await handle({ method: 'GET', path: base.slice(0, -1) + path, headers: {} })
+      expect(response.status).toBe(200)
+      return JSON.parse(response.body as string) as Record<'matched' | 'params' | 'decoded', Record<string, string>>
+    }
+
+    it.for([
+      ['/api/auth/private%3Fignored/public', { slug: 'private' }],
+      ['/api/auth/private%3fignored/public', { slug: 'private' }],
+      ['/api/auth/a/b%3F/c', { slug: 'a/b' }],
+      ['/api/auth/a/%3Fb/c', { slug: 'a' }],
+      ['/api/auth/a%3Fb?c=%3F/d', { slug: 'a' }],
+      ['/api/auth/a%253Fb/c', { slug: 'a%253Fb/c' }],
+      ['/api/auth/a%23b/c', { slug: 'a%23b/c' }],
+      ['/api/auth/a%2Fb/c', { slug: 'a%2Fb/c' }],
+      ['/api/auth/a%2F%3Fb/c', { slug: 'a%2F' }],
+      ['/api/auth/caf%C3%A9/', { slug: 'caf%C3%A9' }],
+      ['/api/auth/a//', { slug: 'a/' }],
+      ['/api/auth/a%20b?x=1', { slug: 'a%20b' }],
+      ['/api/users/a%3Fb', { id: 'a' }],
+      ['/api/users/a%20b/', { id: 'a%20b' }],
+      ['/api/users/a%20b/c%3F/d', { id: 'a%20b', rest: 'c' }],
+      ['/api/users/a%3F/b/c', { id: 'a' }],
+      ['/api/items/a%2Fb/x', { _0: 'a%2Fb' }],
+      ['/api/items/a%23b/x?y', { _0: 'a%23b' }],
+    ] as const)('reads %s as h3 matched it', async ([path, params]) => {
+      const { matched, params: encoded, decoded } = await request(path)
+      expect(encoded).toEqual(params)
+      for (const key in matched) {
+        expect(decoded[key]).toBe(shipped.getRouterParam({ context: { params: matched } }, key, { decode: true }))
+      }
+    })
+
+    it('reads the same params h3 matched for any path', async () => {
+      const segment = fc.array(fc.constantFrom('a', 'é', '%20', '%3F', '%3f', '%23', '%2F', '%25', '%253F', '%2525', '%C3%A9', '?', '#', ''), { maxLength: 4 }).map(parts => parts.join(''))
+      const prefix = fc.constantFrom('/api/auth/', '/api/users/', '/api/items/')
+      await fc.assert(fc.asyncProperty(prefix, fc.array(segment, { minLength: 1, maxLength: 4 }), async (prefix, segments) => {
+        const path = prefix + segments.join('/')
+        const response = await handle({ method: 'GET', path: base.slice(0, -1) + path, headers: {} })
+        if (response.status !== 200) {
+          return
+        }
+        const { matched, params, decoded } = JSON.parse(response.body as string)
+        expect(decoded).toEqual(shipped.getRouterParams({ context: { params: matched } }, { decode: true }))
+        for (const value of Object.values(params)) {
+          expect(path).toContain(value)
+        }
+      }))
+    })
+  })
+
+  it('reads the client IP from the socket, and the first forwarded hop only when opted in', () => {
+    const e = event('/', { headers: { 'x-forwarded-for': '203.0.113.1, 10.0.0.1' }, ip: '198.51.100.7' })
+    expect(delegate.getRequestIP(e)).toBe('198.51.100.7')
+    expect(delegate.getRequestIP(e, { xForwardedFor: true })).toBe('203.0.113.1')
+    expect(delegate.getRequestIP(event('/'))).toBeUndefined()
+  })
+
+  it('applies CORS through the node response, merging `vary`', () => {
+    const e = event('/', { method: 'OPTIONS', headers: { 'origin': 'https://nuxt.com', 'access-control-request-method': 'PUT', 'access-control-request-headers': 'x-custom' } })
+    const response = delegate.handleCors(toPortableEvent(e), { origin: ['https://nuxt.com'], credentials: true })
+
+    expect(response && response.status).toBe(204)
+    expect(e.node.res.getHeader('access-control-allow-origin')).toBe('https://nuxt.com')
+    expect(e.node.res.getHeader('access-control-allow-methods')).toBe('PUT')
+    expect(e.node.res.getHeader('vary')).toBe('origin, access-control-request-method, access-control-request-headers')
+  })
+
+  it.for([
+    ['no header', {}],
+    ['forwarded headers', { 'x-forwarded-host': ' nuxt.com:8443 , proxy', 'x-forwarded-proto': 'https, http' }],
+    ['an unsupported forwarded protocol', { 'x-forwarded-proto': 'ftp' }],
+    ['a forwarded IPv6 host', { 'x-forwarded-host': '[::1]:99999' }],
+  ] as const)('reads the host, protocol and URL from %s the same way as the shipped implementation', ([, forwarded]) => {
+    const headers = { host: 'internal:3000', ...forwarded }
+    const web = webEvent('http://internal:3000/api?a=1', headers)
+    for (const trust of [false, true]) {
+      const options = { xForwardedHost: trust, xForwardedProto: trust }
+      const e = event('/api?a=1', { headers })
+      expect([delegate.getRequestURL(e, options).href, delegate.getRequestHost(e, options), delegate.getRequestProtocol(e, options)])
+        .toEqual([shipped.getRequestURL(web, options).href, shipped.getRequestHost(web, options), shipped.getRequestProtocol(web, options)])
+    }
+  })
+
+  it('reads the host, protocol and URL off the event it hands a handler', () => {
+    const e = event('/api?a=1', { headers: { 'x-forwarded-host': 'nuxt.com', 'x-forwarded-proto': 'https' } })
+    const portable = toPortableEvent(e)
+    const options = { xForwardedHost: true, xForwardedProto: true }
+    expect([delegate.getRequestURL(portable as never, options).href, delegate.getRequestHost(portable as never, options), delegate.getRequestProtocol(portable as never, options)])
+      .toEqual(['https://nuxt.com/api?a=1', 'nuxt.com', 'https'])
+  })
+
+  it('parses every cookie the same way as the shipped implementation', () => {
+    const cookie = 'a=1; b=%20; a=2'
+    expect(delegate.parseCookies(event('/', { headers: { cookie } }))).toEqual(shipped.parseCookies(webEvent('https://nuxt.com/', { cookie })))
+  })
+
+  it('fetches a route of the app relative to the base URL', async () => {
+    const e = event('/page', { headers: { 'cookie': 'a=1', 'x-other': 'y' } })
+
+    expect(await (await delegate.serverFetch(e, '/api/echo?a=1', { method: 'POST' })).text()).toBe('ok')
+
+    const [path, init] = localFetch.mock.calls[0]!
+    expect(path).toBe('/base/api/echo?a=1')
+    expect(init.method).toBe('POST')
+    expect(Object.fromEntries(init.headers as Headers)).toEqual({ cookie: 'a=1' })
+  })
+
+  it('registers server hooks on the nitro app', () => {
+    expect(delegate.useServerHooks()).toBe(hooks)
+  })
+
+  it('reads a missing header as undefined rather than as an empty string', () => {
+    expect(delegate.getRequestHeader(event('/'), 'x-missing')).toBeUndefined()
+  })
+
+  it('sets the status and reason phrase', () => {
+    const e = event('/')
+    delegate.setResponseStatus(e, 418, 'Teapot')
+    expect(e.node.res.statusCode).toBe(418)
+    expect(e.node.res.statusMessage).toBe('Teapot')
+  })
+
+  it('sets and reads cookies', () => {
+    const e = event('/', { headers: { cookie: 'a=1; b=2' } })
+    expect(delegate.getCookie(e, 'b')).toBe('2')
+
+    delegate.setCookie(e, 'c', '3')
+    expect(e.node.res.getHeader('set-cookie')).toBe('c=3; Path=/')
+  })
+
+  it('constructs an error h3 v1 recognises, readable under both majors\' names', () => {
+    const error = delegate.createError({ status: 404, statusText: 'Not Found' })
+
+    expect((error.constructor as { __h3_error__?: boolean }).__h3_error__).toBe(true)
+    expect(error).toMatchObject({ statusCode: 404, statusMessage: 'Not Found', message: 'Not Found' })
+    // the names the portable surface declares, which a handler branches on
+    expect(error.status).toBe(404)
+    expect(error.statusText).toBe('Not Found')
+    expect(delegate.isNuxtError(error)).toBe(true)
+  })
+
+  it('recognises an error h3 v1 threw for itself, and exposes its status portably', () => {
+    class H3Error extends Error {
+      static __h3_error__ = true
+      statusCode = 418
+      statusMessage = 'Teapot'
+    }
+    const error: unknown = new H3Error('teapot')
+
+    expect(delegate.isNuxtError(error)).toBe(true)
+    if (delegate.isNuxtError(error)) {
+      expect(error.status).toBe(418)
+      expect(error.statusText).toBe('Teapot')
+    }
+
+    expect(delegate.isNuxtError(new Error('oops'))).toBe(false)
+  })
+
+  it('redirects with the same response and body as the shipped implementation', () => {
+    const e = event('/')
+    const body = delegate.sendRedirect(e, '/login?next="><script>alert(1)</script>')
+
+    expect(e.node.res.statusCode).toBe(302)
+    expect(e.node.res.getHeader('location')).toBe('/login?next="><script>alert(1)</script>')
+    expect(body).toBe(shipped.sendRedirect(webEvent('https://nuxt.com/'), '/login?next="><script>alert(1)</script>'))
+    expect(body).not.toContain('<script>')
+  })
+
+  describe('the event it hands a handler', () => {
+    it('reads the request, its URL and the response in the portable shape', () => {
+      const e = event('/api/hello?name=nuxt', { headers: { 'x-custom': 'value' } })
+      const handler = delegate.defineEventHandler(portable => portable)
+
+      const portable = handler(e)
+
+      expect(portable.req).toBeInstanceOf(Request)
+      expect(portable.req.headers.get('x-custom')).toBe('value')
+      expect(portable.url.pathname).toBe('/api/hello')
+      expect(portable.url.search).toBe('?name=nuxt')
+      expect(portable.context).toBe(e.context)
+
+      portable.res.status = 418
+      portable.res.headers.set('x-from-portable', 'yes')
+      expect(e.node.res.statusCode).toBe(418)
+      expect(e.node.res.getHeader('x-from-portable')).toBe('yes')
+    })
+
+    it('writes response headers the way a standard `Headers` object does', () => {
+      const portable = delegate.defineEventHandler(portable => portable)(event('/'))
+      const standard = new Headers()
+      for (const target of [portable.res.headers, standard]) {
+        target.set('X-B', 'one')
+        target.append('x-b', 'two')
+        target.set('x-a', 'first')
+        target.append('set-cookie', 'a=1')
+        target.append('set-cookie', 'b=2')
+        target.set('x-removed', 'yes')
+        target.delete('X-Removed')
+      }
+
+      const read = (headers: Headers) => {
+        const visited: string[][] = []
+        headers.forEach((value, name) => visited.push([name, value]))
+        return { entries: [...headers], keys: [...headers.keys()], values: [...headers.values()], visited, cookies: headers.getSetCookie(), b: headers.get('x-b'), removed: headers.has('x-removed') }
+      }
+      expect(read(portable.res.headers)).toEqual(read(standard))
+    })
+
+    it('is still the runtime event, so h3\'s own helpers work on it', () => {
+      const e = event('/api/hello?name=nuxt')
+      const handler = delegate.defineEventHandler(portable => portable)
+
+      const portable = handler(e) as unknown as H3Event
+
+      expect(portable.node).toBe(e.node)
+      expect(portable.path).toBe('/api/hello?name=nuxt')
+      expect(delegate.getQuery(portable)).toEqual({ name: 'nuxt' })
+      delegate.setResponseStatus(portable, 204)
+      expect(e.node.res.statusCode).toBe(204)
+    })
+
+    it('is the same event every time, so state stored on it is shared', () => {
+      const e = event('/')
+      const handler = delegate.defineEventHandler(portable => portable)
+
+      expect(handler(e)).toBe(handler(e))
+    })
+  })
+
+  it('explains when given the event of a handler defined with h3\'s `defineEventHandler`', () => {
+    const e = event('/api/mixed?name=nuxt')
+
+    expect(() => delegate.getValidatedQuery(e as never, query => query)).toThrow(/NUXT_E8012.*getValidatedQuery.*import `defineEventHandler` from `nuxt\/server`/is)
+    expect(() => delegate.handleCors(e as never)).toThrow(expect.objectContaining({ statusCode: 500 }))
+    expect(() => delegate.useSession(e as never, { password: 'x'.repeat(32) })).toThrow(/NUXT_E8012/)
+  })
+})

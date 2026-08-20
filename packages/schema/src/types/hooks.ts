@@ -1,0 +1,566 @@
+import type { Server as HttpServer } from 'node:http'
+import type { Server as HttpsServer } from 'node:https'
+import type { TSConfig } from 'pkg-types'
+import type { ViteDevServer } from 'vite'
+import type { Unimport } from 'unimport'
+import type { Compiler, Configuration, Stats } from 'webpack'
+import type { Schema, SchemaDefinition } from 'untyped'
+import type { RouteLocationRaw, RouteRecordRaw } from 'vue-router'
+import type { RawVueCompilerOptions } from '@vue/language-core'
+import type { ViteConfig } from './config.ts'
+import type { NuxtCompatibility, NuxtCompatibilityIssues } from './compatibility.ts'
+import type { Component, ComponentsOptions } from './components.ts'
+import type { NuxtImport, NuxtImportPreset, NuxtImportPresetSource } from './imports.ts'
+import type { NuxtManifest } from './manifest.ts'
+import type { Nuxt, NuxtApp, ResolvedNuxtTemplate } from './nuxt.ts'
+import type { ModuleMeta } from './module.ts'
+import type { ServerEventHandler, ServerRequestTypes, ServerRouteHandler } from './server.ts'
+import type { NitroConfig, NitroInstance, RouteRuleConfig } from './nitro.ts'
+
+export type HookResult = Promise<void> | void
+
+// https://www.typescriptlang.org/docs/handbook/triple-slash-directives.html
+export type TSReference = { types: string } | { path: string }
+
+export type WatchEvent = 'add' | 'addDir' | 'change' | 'unlink' | 'unlinkDir'
+
+// If the user does not have `@vue/language-core` installed, RawVueCompilerOptions will be typed as `any`,
+// thus making the whole `VueTSConfig` type `any`. We only augment TSConfig if RawVueCompilerOptions is available.
+export type VueTSConfig = 0 extends 1 & RawVueCompilerOptions ? TSConfig : TSConfig & { vueCompilerOptions?: RawVueCompilerOptions }
+
+export interface NuxtPageMeta {
+  [key: PropertyKey]: unknown
+}
+
+export interface NuxtPage {
+  name?: string
+  path: string
+  props?: RouteRecordRaw['props']
+  file?: string
+  /**
+   * Named view files keyed by view name, including `default`. Populated by the
+   * page scanner from the `name@view.vue` filename convention. When set, the
+   * keys are wired up to vue-router's [`components`](https://router.vuejs.org/guide/essentials/named-views.html)
+   * option so multiple `<NuxtPage name="..." />` outlets can render.
+   */
+  components?: Record<string, string>
+  meta?: NuxtPageMeta
+  alias?: string[] | string
+  redirect?: RouteLocationRaw
+  children?: NuxtPage[]
+  middleware?: string[] | string
+  /**
+   * Set the render mode.
+   *
+   * `all` means the page will be rendered isomorphically - with JavaScript both on client and server.
+   *
+   * `server` means pages are automatically rendered with server components, so there will be no JavaScript to render the page in your client bundle.
+   *
+   * `client` means that page will render on the client-side only.
+   */
+  mode?: 'client' | 'server' | 'all'
+  /** Route rules for the route this page is served at, as declared with `defineRouteRules()`. */
+  rules?: RouteRuleConfig
+  /** @internal */
+  _sync?: boolean
+}
+
+export type NuxtMiddleware = {
+  name: string
+  path: string
+  global?: boolean
+}
+
+export type NuxtLayout = {
+  name: string
+  file: string
+}
+
+/**
+ * @deprecated Use {@link NuxtImportPreset}
+ */
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+export interface ImportPresetWithDeprecation extends NuxtImportPreset {
+}
+
+export interface ModuleInstallInfo {
+  /** A human-readable name for the module: `meta.name` where available, otherwise the package name, a path relative to `rootDir`, or the function name */
+  name: string
+  meta: ModuleMeta
+  /** The resolved path of the module on disk, where it is not an inline function */
+  path?: string
+}
+
+export interface GenerateAppOptions {
+  filter?: (template: ResolvedNuxtTemplate<any>) => boolean
+}
+
+export interface NuxtAnalyzeMeta {
+  name: string
+  slug: string
+  startTime: number
+  endTime: number
+  analyzeDir: string
+  buildDir: string
+  outDir: string
+}
+
+/**
+ * The listeners to Nuxt build time events
+ */
+export interface NuxtHooks {
+  // Kit
+  /**
+   * Allows extending compatibility checks.
+   * @param compatibility Compatibility object
+   * @param issues Issues to be mapped
+   * @returns Promise
+   */
+  'kit:compatibility': (compatibility: NuxtCompatibility, issues: NuxtCompatibilityIssues) => HookResult
+
+  // Nuxt
+  /**
+   * Called after Nuxt initialization, when the Nuxt instance is ready to work.
+   * @param nuxt The configured Nuxt object
+   * @returns Promise
+   */
+  'ready': (nuxt: Nuxt) => HookResult
+  /**
+   * Called when Nuxt instance is gracefully closing.
+   * @param nuxt The configured Nuxt object
+   * @returns Promise
+   */
+  'close': (nuxt: Nuxt) => HookResult
+  /**
+   * Called to restart the current Nuxt instance.
+   * @returns Promise
+   */
+  'restart': (options?: {
+    /**
+     * Try to restart the whole process if supported
+     */
+    hard?: boolean
+  }) => HookResult
+
+  /**
+   * Called during Nuxt initialization, before installing user modules.
+   * @returns Promise
+   */
+  'modules:before': () => HookResult
+  /**
+   * Called during Nuxt initialization, after installing user modules.
+   * @returns Promise
+   */
+  'modules:done': () => HookResult
+  /**
+   * Called immediately before each individual module is set up.
+   * @param module Information about the module about to be set up
+   * @returns Promise
+   */
+  'module:before': (module: ModuleInstallInfo) => HookResult
+  /**
+   * Called immediately after each individual module has been set up.
+   * @param module Information about the module that was set up, including how long it took
+   * @returns Promise
+   */
+  'module:done': (module: ModuleInstallInfo & {
+    /** The module entry path, if it could be resolved */
+    entryPath?: string
+    /**
+     * Timings for the module, in milliseconds. `setup` is how long the module took to set up; a module may report
+     * additional keys of its own. This is the same object recorded in `_installedModules`.
+     */
+    timings: { setup: number } & Record<string, number | undefined>
+  }) => HookResult
+
+  /**
+   * Called after resolving the `app` instance.
+   * @param app The resolved `NuxtApp` object
+   * @returns Promise
+   */
+  'app:resolve': (app: NuxtApp) => HookResult
+  /**
+   * Called during `NuxtApp` generation, to allow customizing, modifying or adding new files to the build directory (either virtually or to written to `.nuxt`).
+   * @param app The configured `NuxtApp` object
+   * @returns Promise
+   */
+  'app:templates': (app: NuxtApp) => HookResult
+  /**
+   * Called after templates are compiled into the [virtual file system](https://nuxt.com/docs/4.x/directory-structure/nuxt) (vfs).
+   * @param app The configured `NuxtApp` object
+   * @returns Promise
+   */
+  'app:templatesGenerated': (app: NuxtApp, templates: ResolvedNuxtTemplate[], options?: GenerateAppOptions) => HookResult
+  /**
+   * Called when Nuxt needs the full set of route handlers the server will serve, so that it can
+   * type `$fetch` and `useFetch` against them. The configured `server.builder` is expected to add
+   * the handlers it discovered by scanning, in addition to those registered through
+   * `serverHandlers`.
+   * @param routes Array of route handlers to be extended
+   * @param context Object the builder can extend
+   * @param context.requestTypes How the builder's types read a handler's validated request shapes
+   * @returns Promise
+   */
+  'server:routes': (routes: ServerRouteHandler[], context: { requestTypes?: ServerRequestTypes }) => HookResult
+  /**
+   * Called when the dev middleware is being registered on the server builder's dev server.
+   * @param handler the Vite or Webpack event handler
+   * @returns Promise
+   */
+  'server:devHandler': (handler: ServerEventHandler, options: { cors: (path: string) => boolean }) => HookResult
+
+  /**
+   * Called before the server builder writes `.nuxt/tsconfig.server.json`, allowing addition of custom references and declarations.
+   * @param options Objects containing `references`, `declarations`
+   * @param options.references Array of TypeScript references to add
+   * @param options.declarations Array of declaration strings to add
+   * @returns Promise
+   */
+  'nitro:prepare:types': (options: { references: TSReference[], declarations: string[] }) => HookResult
+  /**
+   * Called before initializing the server builder, allowing customization of its configuration.
+   * @param nitroConfig The server builder config to be extended
+   * @returns Promise
+   */
+  'nitro:config': (nitroConfig: NitroConfig) => HookResult
+  /**
+   * Called after the server instance is initialized, which allows registering its hooks and interacting directly with it.
+   * @param nitro The created server instance
+   * @returns Promise
+   */
+  'nitro:init': (nitro: NitroInstance) => HookResult
+  /**
+   * Called before building the server instance.
+   * @param nitro The created server instance
+   * @returns Promise
+   */
+  'nitro:build:before': (nitro: NitroInstance) => HookResult
+  /**
+   * Called after copying public assets. Allows modifying public assets before the server is built.
+   * @param nitro The created server instance
+   * @returns Promise
+   */
+  'nitro:build:public-assets': (nitro: NitroInstance) => HookResult
+
+  /**
+   * Called before Nuxt bundle builder.
+   * @returns Promise
+   */
+  'build:before': () => HookResult
+  /**
+   * Called after Nuxt bundle builder is complete.
+   * @returns Promise
+   */
+  'build:done': () => HookResult
+  /**
+   * Called during the manifest build by Vite and Webpack. This allows customizing the manifest that Nitro will use to render `<script>` and `<link>` tags in the final HTML.
+   * @param manifest The manifest object to build
+   * @returns Promise
+   */
+  'build:manifest': (manifest: NuxtManifest) => HookResult
+
+  /**
+   * Called when `nuxt analyze` is finished
+   * @param meta the analyze meta object, mutations will be saved to `meta.json`
+   * @returns Promise
+   */
+  'build:analyze:done': (meta: NuxtAnalyzeMeta) => HookResult
+
+  /**
+   * Called before generating the app.
+   * @param options GenerateAppOptions object
+   * @returns Promise
+   */
+  'builder:generateApp': (options?: GenerateAppOptions) => HookResult
+  /**
+   * Called at build time in development when the watcher spots a change to a file or directory in the project.
+   * @param event "add" | "addDir" | "change" | "unlink" | "unlinkDir"
+   * @param path the path to the watched file
+   * @returns Promise
+   */
+  'builder:watch': (event: WatchEvent, path: string) => HookResult
+
+  /**
+   * Called after page routes are scanned from the file system.
+   * @param pages Array containing scanned pages
+   * @returns Promise
+   */
+  'pages:extend': (pages: NuxtPage[]) => HookResult
+
+  /**
+   * Called after page routes have been augmented with scanned metadata.
+   * @param pages Array containing resolved pages
+   * @returns Promise
+   */
+  'pages:resolved': (pages: NuxtPage[]) => HookResult
+
+  /**
+   * Called when resolving `app/router.options` files. It allows modifying the detected router options files
+   * and adding new ones.
+   *
+   * Later items in the array override earlier ones.
+   *
+   * Adding a router options file will switch on page-based routing, unless `optional` is set, in which case
+   * it will only apply when page-based routing is already enabled.
+   * @param context An object with `files` containing an array of router options files.
+   * @param context.files Array of router options files
+   * @returns Promise
+   */
+  'pages:routerOptions': (context: { files: Array<{ path: string, optional?: boolean }> }) => HookResult
+
+  /**
+   * Called at setup allowing modules to extend sources.
+   * @param presets Array containing presets objects
+   * @returns Promise
+   */
+  'imports:sources': (presets: NuxtImportPresetSource[]) => HookResult
+  /**
+   * Called at setup allowing modules to extend imports.
+   * @param imports Array containing the imports to extend
+   * @returns Promise
+   */
+  'imports:extend': (imports: NuxtImport[]) => HookResult
+  /**
+   * Called when the [unimport](https://github.com/unjs/unimport) context is created.
+   * @param context The Unimport context
+   * @returns Promise
+   */
+  'imports:context': (context: Unimport) => HookResult
+  /**
+   * Allows extending import directories.
+   * @param dirs Array containing directories as string
+   * @returns Promise
+   */
+  'imports:dirs': (dirs: string[]) => HookResult
+
+  // Components
+  /**
+   * Called within `app:resolve` allowing to extend the directories that are scanned for auto-importable components.
+   * @param dirs The `dirs` option to push new items
+   * @returns Promise
+   */
+  'components:dirs': (dirs: ComponentsOptions['dirs']) => HookResult
+  /**
+   * Allows extending new components.
+   * @param components The `components` array to push new items
+   * @returns Promise
+   */
+  'components:extend': (components: Component[]) => HookResult
+
+  /**
+   * Allows extending the routes to be pre-rendered.
+   * @param ctx Nuxt context
+   * @param ctx.routes Set of routes to be pre-rendered
+   * @returns Promise
+   */
+  'prerender:routes': (ctx: { routes: Set<string> }) => HookResult
+
+  // @nuxt/cli
+  /**
+   * Called when an error occurs at build time.
+   * @param error Error object
+   * @returns Promise
+   */
+  'build:error': (error: Error) => HookResult
+  /**
+   * Called before @nuxt/cli writes `.nuxt/tsconfig.json` and `.nuxt/nuxt.d.ts`, allowing addition of custom references and declarations in `nuxt.d.ts`, or directly modifying the options in `tsconfig.json`
+   * @param options Objects containing `references`, `declarations`, `tsConfig`
+   * @param options.references Array of TypeScript references to add
+   * @param options.declarations Array of declaration strings to add
+   * @param options.tsConfig The Vue TypeScript config object
+   * @param options.nodeTsConfig The Node TypeScript config object
+   * @param options.nodeReferences Array of Node TypeScript references
+   * @param options.sharedTsConfig The shared TypeScript config object
+   * @param options.sharedReferences Array of shared TypeScript references
+   * @param options.serverTsConfig The server TypeScript config object
+   * @param options.serverReferences Array of server TypeScript references
+   * @returns Promise
+   */
+  'prepare:types': (options: { references: TSReference[], declarations: string[], tsConfig: VueTSConfig, nodeTsConfig: TSConfig, nodeReferences: TSReference[], sharedTsConfig: TSConfig, sharedReferences: TSReference[], serverTsConfig: TSConfig, serverReferences: TSReference[] }) => HookResult
+  /**
+   * Called when the dev server is loading.
+   * @param listenerServer The HTTP/HTTPS server object
+   * @param listener The server's listener object
+   * @returns Promise
+   */
+  'listen': (listenerServer: HttpServer | HttpsServer, listener: any) => HookResult
+
+  // Schema
+  /**
+   * Allows extending default schemas.
+   * @param schemas Schemas to be extend
+   * @returns void
+   */
+  'schema:extend': (schemas: SchemaDefinition[]) => void
+  /**
+   * Allows extending resolved schema.
+   * @param schema Schema object
+   * @returns void
+   */
+  'schema:resolved': (schema: Schema) => void
+  /**
+   * Called before writing the given schema.
+   * @param schema Schema object
+   * @returns void
+   */
+  'schema:beforeWrite': (schema: Schema) => void
+  /**
+   * Called after the schema is written.
+   * @returns void
+   */
+  'schema:written': () => void
+
+  // Vite
+  /**
+   * Allows to extend Vite default context.
+   * @param viteBuildContext The vite build context object
+   * @param viteBuildContext.nuxt The Nuxt instance
+   * @param viteBuildContext.config The Vite config object
+   * @returns Promise
+   */
+  'vite:extend': (viteBuildContext: { nuxt: Nuxt, config: ViteConfig }) => HookResult
+  /**
+   * Allows to extend Vite default config.
+   * @param viteInlineConfig The vite inline config object
+   * @param env Server or client
+   * @param env.isClient Whether the config is for the client build
+   * @param env.isServer Whether the config is for the server build
+   * @returns Promise
+   * @deprecated
+   */
+  'vite:extendConfig': (viteInlineConfig: Readonly<ViteConfig>, env: { isClient: boolean, isServer: boolean }) => HookResult
+  /**
+   * Allows to read the resolved Vite config.
+   * @param viteInlineConfig The vite inline config object
+   * @param env Server or client
+   * @param env.isClient Whether the config is for the client build
+   * @param env.isServer Whether the config is for the server build
+   * @returns Promise
+   * @deprecated
+   */
+  'vite:configResolved': (viteInlineConfig: Readonly<ViteConfig>, env: { isClient: boolean, isServer: boolean }) => HookResult
+  /**
+   * Called when the Vite server is created.
+   * @param viteServer Vite development server
+   * @param env Server or client
+   * @param env.isClient Whether the server is for the client build
+   * @param env.isServer Whether the server is for the server build
+   * @returns Promise
+   */
+  'vite:serverCreated': (viteServer: ViteDevServer, env: { isClient: boolean, isServer: boolean }) => HookResult
+  /**
+   * Called after Vite server is compiled.
+   * @returns Promise
+   */
+  'vite:compiled': () => HookResult
+
+  // webpack
+  /**
+   * Called before configuring the webpack compiler.
+   * @param webpackConfigs Configs objects to be pushed to the compiler
+   * @returns Promise
+   */
+  'webpack:config': (webpackConfigs: Configuration[]) => HookResult
+  /**
+   * Allows to read the resolved webpack config
+   * @param webpackConfigs Configs objects to be pushed to the compiler
+   * @returns Promise
+   */
+  'webpack:configResolved': (webpackConfigs: Readonly<Configuration>[]) => HookResult
+  /**
+   * Called right before compilation.
+   * @param options The options to be added
+   * @param options.name The name of the compiler
+   * @param options.compiler The webpack compiler instance
+   * @returns Promise
+   */
+  'webpack:compile': (options: { name: string, compiler: Compiler }) => HookResult
+  /**
+   * Called after resources are loaded.
+   * @param options The compiler options
+   * @param options.name The name of the compiler
+   * @param options.compiler The webpack compiler instance
+   * @param options.stats The webpack compilation stats
+   * @returns Promise
+   */
+  'webpack:compiled': (options: { name: string, compiler: Compiler, stats: Stats }) => HookResult
+
+  /**
+   * Called on `change` on WebpackBar.
+   * @param shortPath the short path
+   * @returns void
+   */
+  'webpack:change': (shortPath: string) => void
+  /**
+   * Called on `done` if has errors on WebpackBar.
+   * @returns void
+   */
+  'webpack:error': () => void
+  /**
+   * Called on `allDone` on WebpackBar.
+   * @returns void
+   */
+  'webpack:done': () => void
+  /**
+   * Called on `progress` on WebpackBar.
+   * @param statesArray The array containing the states on progress
+   * @returns void
+   */
+  'webpack:progress': (statesArray: any[]) => void
+
+  // rspack
+  /**
+   * Called before configuring the webpack compiler.
+   * @param webpackConfigs Configs objects to be pushed to the compiler
+   * @returns Promise
+   */
+  'rspack:config': (webpackConfigs: Configuration[]) => HookResult
+  /**
+   * Allows to read the resolved webpack config
+   * @param webpackConfigs Configs objects to be pushed to the compiler
+   * @returns Promise
+   */
+  'rspack:configResolved': (webpackConfigs: Readonly<Configuration>[]) => HookResult
+  /**
+   * Called right before compilation.
+   * @param options The options to be added
+   * @param options.name The name of the compiler
+   * @param options.compiler The rspack compiler instance
+   * @returns Promise
+   */
+  'rspack:compile': (options: { name: string, compiler: Compiler }) => HookResult
+  /**
+   * Called after resources are loaded.
+   * @param options The compiler options
+   * @param options.name The name of the compiler
+   * @param options.compiler The rspack compiler instance
+   * @param options.stats The rspack compilation stats
+   * @returns Promise
+   */
+  'rspack:compiled': (options: { name: string, compiler: Compiler, stats: Stats }) => HookResult
+
+  /**
+   * Called on `change` on WebpackBar.
+   * @param shortPath the short path
+   * @returns void
+   */
+  'rspack:change': (shortPath: string) => void
+  /**
+   * Called on `done` if has errors on WebpackBar.
+   * @returns void
+   */
+  'rspack:error': () => void
+  /**
+   * Called on `allDone` on WebpackBar.
+   * @returns void
+   */
+  'rspack:done': () => void
+  /**
+   * Called on `progress` on WebpackBar.
+   * @param statesArray The array containing the states on progress
+   * @returns void
+   */
+  'rspack:progress': (statesArray: any[]) => void
+}
+
+export type NuxtHookName = keyof NuxtHooks

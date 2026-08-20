@@ -1,0 +1,98 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>nuxt/renovate-config-nuxt",
+    ":pinDevDependencies",
+    ":widenPeerDependencies"
+  ],
+  "baseBranchPatterns": [
+    "main",
+    "4.x"
+  ],
+  "ignoreDeps": [
+    "npm"
+  ],
+  "minimumReleaseAge": "1 day",
+  "packageRules": [
+    {
+      "groupName": "webpack",
+      "matchPackageNames": [
+        "/webpack/",
+        "/-loader/"
+      ]
+    },
+    {
+      "groupName": "vitest",
+      "matchPackageNames": [
+        "vitest",
+        "/^@vitest//"
+      ]
+    },
+    {
+      "matchBaseBranches": [
+        "main",
+        "4.x"
+      ],
+      "ignoreDeps": [
+        "nuxt",
+        "nuxt3",
+        "@nuxt/kit"
+      ]
+    },
+    {
+      "matchBaseBranches": [
+        "4.x"
+      ],
+      "matchUpdateTypes": [
+        "patch",
+        "minor",
+        "pin",
+        "digest",
+        "lockFileMaintenance"
+      ],
+      "groupName": "all non-major dependencies",
+      "groupSlug": "all-non-major",
+      "matchPackageNames": [
+        "*"
+      ]
+    },
+    {
+      "groupName": "vite and rolldown",
+      "groupSlug": "rolldown",
+      "matchPackageNames": [
+        "vite",
+        "rolldown",
+        "rolldown-string",
+        "obuild",
+        "tsdown",
+        "oxc-parser",
+        "oxc-walker",
+        "@oxc-project/types"
+      ],
+      "description": "nuxt peers on rolldown loosely so package managers can reuse vite's copy, but this workspace pins it to vite's exact version via the catalog and an override. Bump them together or the workspace resolves a second rolldown and loads a second native binding."
+    },
+    {
+      "groupName": "nitro",
+      "groupSlug": "nitro",
+      "dependencyDashboardApproval": true,
+      "matchPackageNames": [
+        "nitropack",
+        "h3",
+        "ofetch",
+        "unenv",
+        "unstorage"
+      ]
+    },
+    {
+      "matchPackageNames": [
+        "@nuxt/**"
+      ],
+      "minimumReleaseAge": "0"
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "postUpdateOptions": [
+      "pnpmDedupe"
+    ]
+  }
+}

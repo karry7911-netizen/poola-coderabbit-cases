@@ -1,0 +1,100 @@
+{
+  "name": "@nuxt/webpack-builder",
+  "version": "4.6.2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuxt/nuxt.git",
+    "directory": "packages/webpack"
+  },
+  "description": "Webpack bundler for Nuxt",
+  "homepage": "https://nuxt.com",
+  "license": "MIT",
+  "type": "module",
+  "types": "./src/index.ts",
+  "imports": {
+    "#vue-module-identifier": "./src/loaders/vue-module-identifier.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "prepack": "node ../../scripts/prepack.ts && tsdown",
+    "build": "tsdown",
+    "test:attw": "node ../../scripts/test-attw.ts"
+  },
+  "dependencies": {
+    "@nuxt/kit": "workspace:*",
+    "@vue/compiler-sfc": "catalog:vue",
+    "autoprefixer": "catalog:build",
+    "css-loader": "catalog:webpack",
+    "css-minimizer-webpack-plugin": "catalog:webpack",
+    "cssnano": "catalog:build",
+    "defu": "catalog:build",
+    "esbuild-loader": "catalog:webpack",
+    "escape-string-regexp": "catalog:build",
+    "exsolve": "catalog:build",
+    "file-loader": "catalog:webpack",
+    "fork-ts-checker-webpack-plugin": "catalog:webpack",
+    "hash-sum": "catalog:webpack",
+    "knitwork": "catalog:build",
+    "memfs": "catalog:webpack",
+    "mini-css-extract-plugin": "catalog:webpack",
+    "ohash": "catalog:build",
+    "pathe": "catalog:build",
+    "postcss": "catalog:build",
+    "postcss-import": "catalog:build",
+    "postcss-import-resolver": "catalog:build",
+    "postcss-loader": "catalog:build",
+    "postcss-url": "catalog:build",
+    "pug-plain-loader": "catalog:webpack",
+    "raw-loader": "catalog:webpack",
+    "rolldown-string": "catalog:vite",
+    "seroval": "catalog:build",
+    "time-fix-plugin": "catalog:webpack",
+    "ufo": "catalog:build",
+    "unenv": "catalog:build",
+    "unplugin": "catalog:build",
+    "url-loader": "catalog:webpack",
+    "vue-bundle-renderer": "catalog:build",
+    "vue-loader": "catalog:vue",
+    "webpack": "catalog:webpack",
+    "webpack-bundle-analyzer": "catalog:webpack",
+    "webpack-dev-middleware": "catalog:webpack",
+    "webpack-hot-middleware": "catalog:webpack",
+    "webpackbar": "catalog:webpack"
+  },
+  "devDependencies": {
+    "@nuxt/schema": "workspace:*",
+    "@rspack/core": "catalog:dev",
+    "@types/hash-sum": "catalog:dev",
+    "@types/webpack-bundle-analyzer": "catalog:dev",
+    "@types/webpack-hot-middleware": "catalog:dev",
+    "h3": "1.15.11",
+    "h3-next": "npm:h3@2.0.2",
+    "rollup": "catalog:dev",
+    "tsdown": "catalog:dev",
+    "vue": "catalog:app-runtime"
+  },
+  "peerDependencies": {
+    "nuxt": "workspace:*",
+    "vue": "^3.3.4"
+  },
+  "engines": {
+    "node": "^22.22.3 || ^24.15.0 || >=26.0.0"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": "./dist/index.mjs",
+      "./dist/*": "./dist/*",
+      "./package.json": "./package.json"
+    },
+    "types": "./dist/index.d.mts",
+    "imports": {
+      "#vue-module-identifier": "./dist/loaders/vue-module-identifier.mjs"
+    }
+  }
+}

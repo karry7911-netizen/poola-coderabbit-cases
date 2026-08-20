@@ -1,0 +1,286 @@
+import type { RolldownString } from 'rolldown-string'
+import { generateTransform, rolldownString } from 'rolldown-string'
+import { createUnplugin } from 'unplugin'
+import type { Component } from '@nuxt/schema'
+import { resolve } from 'pathe'
+
+import { parseAndWalk, walk } from 'oxc-walker'
+import type { ESTree } from 'rolldown/utils'
+import { distDir } from '../../dirs.ts'
+import { VUE_ID_RE } from '../../core/utils/plugins.ts'
+
+interface TreeShakeTemplatePluginOptions {
+  getComponents (): Component[]
+}
+
+const SSR_RENDER_RE = /ssrRenderComponent/
+const PLACEHOLDER_EXACT_RE = /^(?:fallback|placeholder)$/
+const CLIENT_ONLY_NAME_RE = /^(?:_unref\()?(?:_component_)?(?:Lazy|lazy_)?(?:client_only|ClientOnly\)?)$/
+
+export const TreeShakeTemplatePlugin = (options: TreeShakeTemplatePluginOptions) => createUnplugin(() => {
+  const regexpMap = new WeakMap<Component[], [RegExp, RegExp, string[]]>()
+  return {
+    name: 'nuxt:tree-shake-template',
+    enforce: 'post',
+    transform: {
+      filter: {
+        id: { include: VUE_ID_RE },
+      },
+      handler (code, id, meta?: unknown) {
+        const components = options.getComponents()
+
+        if (!regexpMap.has(components)) {
+          const serverPlaceholderPath = resolve(distDir, 'app/components/server-placeholder')
+          const clientOnlyComponents = components
+            .filter(c => c.mode === 'client' && !components.some(other => other.mode !== 'client' && other.pascalName === c.pascalName && !other.filePath.startsWith(serverPlaceholderPath)))
+            .flatMap(c => [c.pascalName, c.kebabName.replaceAll('-', '_')])
+            .concat(['ClientOnly', 'client_only'])
+
+          regexpMap.set(components, [new RegExp(`(${clientOnlyComponents.join('|')})`), new RegExp(`^(${clientOnlyComponents.map(c => `(?:(?:_unref\\()?(?:_component_)?(?:Lazy|lazy_)?${c}\\)?)`).join('|')})$`), clientOnlyComponents])
+        }
+
+        const [COMPONENTS_RE, COMPONENTS_IDENTIFIERS_RE] = regexpMap.get(components)!
+        if (!COMPONENTS_RE.test(code)) { return }
+
+        const s = rolldownString(code, id, meta)
+
+        const candidateNames = new Set<string>()
+
+        // remove client only components or components called in ClientOnly default slot
+        const { program: ast } = parseAndWalk(code, id, (node) => {
+          if (!isSsrRender(node)) {
+            return
+          }
+
+          const [componentCall, _, children] = node.arguments
+          if (!componentCall) { return }
+
+          if (componentCall.type === 'Identifier' || componentCall.type === 'MemberExpression' || componentCall.type === 'CallExpression') {
+            const componentName = getComponentName(node)
+            if (!componentName || !COMPONENTS_IDENTIFIERS_RE.test(componentName) || children?.type !== 'ObjectExpression') { return }
+
+            const isClientOnlyComponent = CLIENT_ONLY_NAME_RE.test(componentName)
+            const slotsToRemove = isClientOnlyComponent ? children.properties.filter(prop => prop.type === 'Property' && prop.key.type === 'Identifier' && !PLACEHOLDER_EXACT_RE.test(prop.key.name)) : children.properties
+
+            for (const slot of slotsToRemove) {
+              s.remove(slot.start, slot.end + 1)
+              const removedCode = `({${code.slice(slot.start, slot.end + 1)}})`
+
+              parseAndWalk(removedCode, id, (node) => {
+                if (!isSsrRender(node)) { return }
+                const name = getComponentName(node)
+                if (name) {
+                  candidateNames.add(name)
+                }
+              })
+            }
+          }
+        })
+
+        // detect which candidates are still called elsewhere with a single re-parse of the transformed code
+        const componentsToRemove: string[] = []
+        if (candidateNames.size) {
+          const referencedNames = getSetupReferencedNames(s.toString(), id)
+          for (const name of candidateNames) {
+            if (!referencedNames.has(name)) {
+              componentsToRemove.push(name)
+            }
+          }
+        }
+        const removedNodes = new WeakSet<ESTree.Node>()
+
+        for (const componentName of componentsToRemove) {
+        // remove import declaration if it exists
+          removeImportDeclaration(ast, componentName, s)
+          // remove variable declaration
+          removeVariableDeclarator(ast, componentName, s, removedNodes)
+          // remove from setup return statement
+          removeFromSetupReturn(ast, componentName, s)
+        }
+
+        return generateTransform(s, id)
+      },
+    },
+  }
+})
+
+/**
+ * find and remove all property with the name parameter from the setup return statement and the __returned__ object
+ */
+function removeFromSetupReturn (codeAst: ESTree.Program, name: string, magicString: RolldownString) {
+  let walkedInSetup = false
+  walk(codeAst, {
+    enter (node) {
+      if (walkedInSetup) {
+        this.skip()
+      } else if (node.type === 'Property' && node.key.type === 'Identifier' && node.key.name === 'setup' && (node.value.type === 'FunctionExpression' || node.value.type === 'ArrowFunctionExpression')) {
+        // walk into the setup function
+        walkedInSetup = true
+        if (node.value.body?.type === 'BlockStatement') {
+          const returnStatement = node.value.body.body.find(statement => statement.type === 'ReturnStatement') as ESTree.ReturnStatement
+          if (returnStatement && returnStatement.argument?.type === 'ObjectExpression') {
+            // remove from return statement
+            removePropertyFromObject(returnStatement.argument, name, magicString)
+          }
+
+          // remove from __returned__
+          const variableList = node.value.body.body.filter((statement): statement is ESTree.VariableDeclaration => statement.type === 'VariableDeclaration')
+          const returnedVariableDeclaration = variableList.find(declaration => declaration.declarations[0]?.id.type === 'Identifier' && declaration.declarations[0]?.id.name === '__returned__' && declaration.declarations[0]?.init?.type === 'ObjectExpression')
+          if (returnedVariableDeclaration) {
+            const init = returnedVariableDeclaration.declarations[0]?.init as ESTree.ObjectExpression | undefined
+            if (init) {
+              removePropertyFromObject(init, name, magicString)
+            }
+          }
+        }
+      }
+    },
+  })
+}
+
+/**
+ * remove a property from an object expression
+ */
+function removePropertyFromObject (node: ESTree.ObjectExpression, name: string, magicString: RolldownString) {
+  for (const property of node.properties) {
+    if (property.type === 'Property' && property.key.type === 'Identifier' && property.key.name === name) {
+      magicString.remove(property.start, property.end + 1)
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * is the node a call expression ssrRenderComponent()
+ */
+function isSsrRender (node: ESTree.Node): node is ESTree.CallExpression {
+  return node.type === 'CallExpression' && node.callee.type === 'Identifier' && SSR_RENDER_RE.test(node.callee.name)
+}
+
+function removeImportDeclaration (ast: ESTree.Program, importName: string, magicString: RolldownString): boolean {
+  for (const node of ast.body) {
+    if (node.type !== 'ImportDeclaration' || !node.specifiers) {
+      continue
+    }
+    const specifierIndex = node.specifiers.findIndex(s => s.local.name === importName)
+    if (specifierIndex > -1) {
+      if (node.specifiers!.length > 1) {
+        const specifier = node.specifiers![specifierIndex]!
+        magicString.remove(specifier.start, specifier.end + 1)
+        node.specifiers!.splice(specifierIndex, 1)
+      } else {
+        magicString.remove(node.start, node.end)
+      }
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * return the set of identifiers referenced inside the setup function and the ssrRender function.
+ * identifiers inside variable declarations are skipped, so a component's own declaration does not count as a reference.
+ * a component whose name is absent from this set is not used anywhere and can be removed.
+ */
+function getSetupReferencedNames (code: string, id: string): Set<string> {
+  const names = new Set<string>()
+  parseAndWalk(code, id, function (node) {
+    if ((node.type === 'Property' && node.key.type === 'Identifier' && node.value.type === 'FunctionExpression' && node.key.name === 'setup') || (node.type === 'FunctionDeclaration' && (node.id?.name === '_sfc_ssrRender' || node.id?.name === 'ssrRender'))) {
+      // walk through the setup function node or the ssrRender function
+      walk(node, {
+        enter (node) {
+          if (node.type === 'VariableDeclaration') {
+            this.skip()
+          } else if (node.type === 'Identifier') {
+            names.add(node.name)
+          } else if (node.type === 'MemberExpression') {
+            // dev only with $setup or _ctx
+            if (node.property.type === 'Literal' && typeof node.property.value === 'string') {
+              names.add(node.property.value)
+            } else if (node.property.type === 'Identifier') {
+              names.add(node.property.name)
+            }
+          }
+        },
+      })
+    }
+  })
+  return names
+}
+
+/**
+ * retrieve the component identifier being used on ssrRender callExpression
+ * @param ssrRenderNode - ssrRender callExpression
+ */
+function getComponentName (ssrRenderNode: ESTree.CallExpression): string | undefined {
+  const componentCall = ssrRenderNode.arguments[0]
+  if (!componentCall) { return }
+
+  if (componentCall.type === 'Identifier') {
+    return componentCall.name
+  } else if (componentCall.type === 'MemberExpression') {
+    if (componentCall.property.type === 'Literal') {
+      return componentCall.property.value as string
+    }
+  } else if (componentCall.type === 'CallExpression') {
+    return getComponentName(componentCall)
+  }
+}
+
+/**
+ * remove a variable declaration within the code
+ */
+function removeVariableDeclarator (codeAst: ESTree.Program, name: string, magicString: RolldownString, removedNodes: WeakSet<ESTree.Node>): ESTree.Node | void {
+  // remove variables
+  walk(codeAst, {
+    enter (node) {
+      if (node.type !== 'VariableDeclaration') { return }
+      for (const declarator of node.declarations) {
+        const toRemove = findMatchingPatternToRemove(declarator.id, node, name, removedNodes)
+        if (toRemove) {
+          magicString.remove(toRemove.start, toRemove.end + 1)
+          removedNodes.add(toRemove)
+        }
+      }
+    },
+  })
+}
+
+/**
+ * find the Pattern to remove which the identifier is equal to the name parameter.
+ */
+function findMatchingPatternToRemove (node: ESTree.BindingPattern, toRemoveIfMatched: ESTree.Node, name: string, removedNodeSet: WeakSet<ESTree.Node>): ESTree.Node | undefined {
+  if (node.type === 'Identifier') {
+    if (node.name === name) {
+      return toRemoveIfMatched
+    }
+  } else if (node.type === 'ArrayPattern') {
+    const elements = node.elements.filter((e): e is ESTree.BindingPattern => e !== null && !removedNodeSet.has(e))
+
+    for (const element of elements) {
+      const matched = findMatchingPatternToRemove(element, elements.length > 1 ? element : toRemoveIfMatched, name, removedNodeSet)
+      if (matched) { return matched }
+    }
+  } else if (node.type === 'ObjectPattern') {
+    const properties = node.properties.filter((e): e is ESTree.BindingProperty => e.type === 'Property' && !removedNodeSet.has(e))
+
+    for (const [index, property] of properties.entries()) {
+      let nodeToRemove: ESTree.Node = property
+      if (properties.length < 2) {
+        nodeToRemove = toRemoveIfMatched
+      }
+
+      const matched = findMatchingPatternToRemove(property.value, nodeToRemove, name, removedNodeSet)
+      if (matched) {
+        if (matched === property) {
+          properties.splice(index, 1)
+        }
+        return matched
+      }
+    }
+  } else if (node.type === 'AssignmentPattern') {
+    const matched = findMatchingPatternToRemove(node.left, toRemoveIfMatched, name, removedNodeSet)
+    if (matched) { return matched }
+  }
+}

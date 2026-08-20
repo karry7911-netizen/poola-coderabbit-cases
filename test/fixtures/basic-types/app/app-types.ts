@@ -1,0 +1,1150 @@
+import { describe, expectTypeOf, it } from 'vitest'
+import type { ComputedRef, Ref, SlotsType } from 'vue'
+import type { NavigationFailure, RouteLocationNormalized, RouteLocationRaw, Router, useRouter as vueUseRouter } from 'vue-router'
+import type { H3Error, H3Event } from 'h3'
+import { getRouteRules as getNitroRouteRules } from 'nitropack/runtime'
+import type { NitroRouteRules } from 'nitropack/types'
+
+import type { AsyncData, AsyncDataWithExtensions, AugmentedAsyncData, DeclaredUseFetch, Endpoint, KeysOf, MergedAddonsExtensions, PickFrom, TypedFetch, UseAsyncData, UseFetch } from 'nuxt/app'
+import { $fetch } from '#build/fetch'
+import type { AppConfig, AppConfigInput, NuxtConfig as NuxtConfigFromAt, NuxtHooks as NuxtHooksFromAt } from '@nuxt/schema'
+import type { AppConfigInput as AppConfigInputFromNuxt, NuxtConfig as NuxtConfigFromNuxt, NuxtHooks as NuxtHooksFromNuxt } from 'nuxt/schema'
+import { defineNuxtConfig } from 'nuxt/config'
+import { callWithNuxt, isVue3 } from '#app'
+import type { NuxtError, NuxtRequestEvent, NuxtSSRContext, PageMeta } from '#app'
+import type { NavigateToOptions } from '#app/composables/router'
+import { LazyWithTypes, NuxtIsland, NuxtLayout, NuxtLink, NuxtPage, ServerComponent, WithTypes } from '#components'
+import type { IslandComponent, LazyComponent } from '#components'
+import { getRouteRules, prefetchComponents, preloadComponents, useRequestEvent, useRouter } from '#imports'
+import type { LayoutKey } from '#build/types/nitro-layouts'
+
+type DefaultAsyncDataErrorValue = undefined
+type DefaultAsyncDataValue = undefined
+
+interface TestResponse { message: string }
+
+declare module '@nuxt/schema' {
+  interface ServerRoutes {
+    '/api/registered': { get: { registered: true } }
+    '/api/registered-post': { post: { created: true } }
+    '/api/registered/:id': { default: number }
+    '/api/scored/:id': { get: 'param' }
+    '/api/scored/static': { get: 'static' }
+    '/api/catch-all/**': { get: 'catchAll' }
+  }
+}
+
+declare module 'nuxt/app' {
+  interface NuxtLayouts {
+    withFunction: {
+      someProp: number
+      function: () => void
+    }
+  }
+}
+
+// `hook-augmenting-module` augments both `@nuxt/schema` and `nuxt/schema`, and enters the
+// program through `<reference types="hook-augmenting-module" />`, as published modules do.
+expectTypeOf<'hook-augmenting-module:ping'>().toExtend<keyof NuxtHooksFromAt>()
+expectTypeOf<'hook-augmenting-module:ping'>().toExtend<keyof NuxtHooksFromNuxt>()
+expectTypeOf<'hook-augmenting-module:ping'>().toExtend<keyof NonNullable<NuxtConfigFromAt['hooks']>>()
+expectTypeOf<'hook-augmenting-module:ping'>().toExtend<keyof NonNullable<NuxtConfigFromNuxt['hooks']>>()
+expectTypeOf<'hook-augmenting-module:nuxt-ping'>().toExtend<keyof NuxtHooksFromAt>()
+expectTypeOf<'hook-augmenting-module:nuxt-ping'>().toExtend<keyof NuxtHooksFromNuxt>()
+expectTypeOf<'hook-augmenting-module:nuxt-ping'>().toExtend<keyof NonNullable<NuxtConfigFromAt['hooks']>>()
+expectTypeOf<'hook-augmenting-module:nuxt-ping'>().toExtend<keyof NonNullable<NuxtConfigFromNuxt['hooks']>>()
+expectTypeOf(useAppConfig().hookAugmentingModule).toEqualTypeOf<{ enabled: boolean } | undefined>()
+
+defineNuxtConfig({
+  hooks: {
+    'hook-augmenting-module:ping' (payload) {
+      expectTypeOf(payload).toEqualTypeOf<{ value: number }>()
+    },
+  },
+})
+
+describe('API routes', () => {
+  it('types the auto-imported $fetch with nitro routes', () => {
+    // https://github.com/nuxt/nuxt/pull/35582 regression: `$fetch` was typed as
+    // ofetch's plain `$fetch`, returning `Promise<any>` for every request
+    expectTypeOf($fetch).toEqualTypeOf<TypedFetch>()
+    expectTypeOf($fetch('/api/other')).toEqualTypeOf<Promise<unknown>>()
+  })
+
+  it('types the response of a handler written against `nuxt/server`', () => {
+    expectTypeOf($fetch('/api/portable')).toEqualTypeOf<Promise<{ greeting: string }>>()
+  })
+
+  it('types responses of routes registered in `ServerRoutes`', () => {
+    expectTypeOf($fetch('/api/registered')).toEqualTypeOf<Promise<{ registered: true }>>()
+    expectTypeOf($fetch('/api/registered', { method: 'GET' })).toEqualTypeOf<Promise<{ registered: true }>>()
+    expectTypeOf($fetch('/api/registered-post', { method: 'post' })).toEqualTypeOf<Promise<{ created: true }>>()
+    expectTypeOf($fetch(`/api/registered/${String(Math.random())}`)).toEqualTypeOf<Promise<number>>()
+    // @ts-expect-error the route is only registered for `post`
+    $fetch('/api/registered-post', { method: 'get' })
+  })
+
+  it('prefers the most specific registered route pattern', () => {
+    expectTypeOf($fetch('/api/scored/static')).toEqualTypeOf<Promise<'static'>>()
+    expectTypeOf($fetch(`/api/scored/${String(Math.random())}`)).toEqualTypeOf<Promise<'param' | 'static'>>()
+    expectTypeOf($fetch('/api/catch-all/nested/path')).toEqualTypeOf<Promise<'catchAll'>>()
+  })
+
+  it('falls back to `unknown` for unregistered requests', () => {
+    expectTypeOf($fetch('/api/unregistered')).toEqualTypeOf<Promise<unknown>>()
+    expectTypeOf($fetch('/api/unregistered', { method: 'PATCH' })).toEqualTypeOf<Promise<unknown>>()
+    expectTypeOf($fetch<TestResponse>('/api/unregistered')).toEqualTypeOf<Promise<TestResponse>>()
+  })
+
+  it('types responses of registered routes through `useFetch`', () => {
+    expectTypeOf(useFetch('/api/registered').data).toEqualTypeOf<Ref<{ registered: true } | DefaultAsyncDataValue>>()
+    expectTypeOf(useFetch('/api/registered-post', { method: 'post' }).data).toEqualTypeOf<Ref<{ created: true } | DefaultAsyncDataValue>>()
+    expectTypeOf(useFetch('/api/registered', { pick: ['registered'] }).data).toEqualTypeOf<Ref<{ registered: true } | DefaultAsyncDataValue>>()
+    expectTypeOf(useRequestFetch()('/api/registered')).toEqualTypeOf<Promise<{ registered: true }>>()
+  })
+
+  it('generates types for routes', () => {
+    expectTypeOf($fetch('/api/hello')).toEqualTypeOf<Promise<string>>()
+    // registered in extends
+    expectTypeOf($fetch('/api/foo')).toEqualTypeOf<Promise<string>>()
+    // registered in module
+    expectTypeOf($fetch('/auto-registered-module')).toEqualTypeOf<Promise<string>>()
+    expectTypeOf($fetch('/api/hey')).toEqualTypeOf<Promise<{ foo: string, baz: string }>>()
+    expectTypeOf($fetch('/api/hey', { method: 'get' })).toEqualTypeOf<Promise<{ foo: string, baz: string }>>()
+    expectTypeOf($fetch('/api/hey', { method: 'post' })).toEqualTypeOf<Promise<{ method: 'post' }>>()
+    // @ts-expect-error not a valid method
+    expectTypeOf($fetch('/api/hey', { method: 'patch ' })).toEqualTypeOf<Promise<{ foo: string, baz: string }>>()
+    expectTypeOf($fetch('/api/union')).toEqualTypeOf<Promise<{ type: 'a', foo: string } | { type: 'b', baz: string }>>()
+    expectTypeOf($fetch('/api/other')).toEqualTypeOf<Promise<unknown>>()
+    expectTypeOf($fetch<TestResponse>('/test')).toEqualTypeOf<Promise<TestResponse>>()
+  })
+
+  it('works with useRequestFetch', () => {
+    const $fetch = useRequestFetch()
+    expectTypeOf($fetch('/api/hello')).toEqualTypeOf<Promise<string>>()
+    // registered in extends
+    expectTypeOf($fetch('/api/foo')).toEqualTypeOf<Promise<string>>()
+    // registered in module
+    expectTypeOf($fetch('/auto-registered-module')).toEqualTypeOf<Promise<string>>()
+    expectTypeOf($fetch('/api/hey')).toEqualTypeOf<Promise<{ foo: string, baz: string }>>()
+    expectTypeOf($fetch('/api/hey', { method: 'get' })).toEqualTypeOf<Promise<{ foo: string, baz: string }>>()
+    expectTypeOf($fetch('/api/hey', { method: 'post' })).toEqualTypeOf<Promise<{ method: 'post' }>>()
+    // @ts-expect-error not a valid method
+    expectTypeOf($fetch('/api/hey', { method: 'patch ' })).toEqualTypeOf<Promise<{ foo: string, baz: string }>>()
+    expectTypeOf($fetch('/api/union')).toEqualTypeOf<Promise<{ type: 'a', foo: string } | { type: 'b', baz: string }>>()
+    expectTypeOf($fetch('/api/other')).toEqualTypeOf<Promise<unknown>>()
+    expectTypeOf($fetch<TestResponse>('/test')).toEqualTypeOf<Promise<TestResponse>>()
+  })
+
+  it('works with useAsyncData', () => {
+    expectTypeOf(useAsyncData('api-hello', () => $fetch('/api/hello')).data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+    expectTypeOf(useAsyncData('api-hey', () => $fetch('/api/hey')).data).toEqualTypeOf<Ref<{ foo: string, baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useAsyncData('api-hey-with-pick', () => $fetch('/api/hey'), { pick: ['baz'] }).data).toEqualTypeOf<Ref<{ baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf<PickFrom<{ foo: string, baz: string }, ['baz']>>().toEqualTypeOf<{ baz: string }>()
+    expectTypeOf(useAsyncData('api-union', () => $fetch('/api/union')).data).toEqualTypeOf<Ref<{ type: 'a', foo: string } | { type: 'b', baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useAsyncData('api-union-with-pick', () => $fetch('/api/union'), { pick: ['type'] }).data).toEqualTypeOf<Ref<{ type: 'a' } | { type: 'b' } | DefaultAsyncDataValue>>()
+    expectTypeOf(useAsyncData('api-other', () => $fetch('/api/other')).data).toEqualTypeOf<Ref<unknown>>()
+    expectTypeOf(useAsyncData<TestResponse>('api-generics', () => $fetch('/test')).data).toEqualTypeOf<Ref<TestResponse | DefaultAsyncDataValue>>()
+
+    // https://github.com/nuxt/nuxt/issues/28030
+    function useGenericAsyncData<T extends { id: number }> () {
+      const { data } = useAsyncData<T>('api-generic-param', () => Promise.resolve({ id: 1 } as T))
+      expectTypeOf(data.value?.id).toEqualTypeOf<number | undefined>()
+      const { data: fetched } = useFetch<T>('/api/hello')
+      expectTypeOf(fetched.value?.id).toEqualTypeOf<number | undefined>()
+    }
+    useGenericAsyncData()
+
+    expectTypeOf(useAsyncData('api-error-generics', () => $fetch('/error')).error).toEqualTypeOf<Ref<NuxtError<unknown> | DefaultAsyncDataErrorValue>>()
+    expectTypeOf(useAsyncData<any, string>('api-error-generics', () => $fetch('/error')).error).toEqualTypeOf<Ref<NuxtError<string> | DefaultAsyncDataErrorValue>>()
+    // backwards compatibility
+    expectTypeOf(useAsyncData<any, Error>('api-error-generics', () => $fetch('/error')).error).toEqualTypeOf<Ref<Error | DefaultAsyncDataErrorValue>>()
+    expectTypeOf(useAsyncData<any, NuxtError<string>>('api-error-generics', () => $fetch('/error')).error).toEqualTypeOf<Ref<NuxtError<string> | DefaultAsyncDataErrorValue>>()
+
+    expectTypeOf(useLazyAsyncData('lazy-api-hello', () => $fetch('/api/hello')).data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyAsyncData('lazy-api-hey', () => $fetch('/api/hey')).data).toEqualTypeOf<Ref<{ foo: string, baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyAsyncData('lazy-api-hey-with-pick', () => $fetch('/api/hey'), { pick: ['baz'] }).data).toEqualTypeOf<Ref<{ baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyAsyncData('lazy-api-union', () => $fetch('/api/union')).data).toEqualTypeOf<Ref<{ type: 'a', foo: string } | { type: 'b', baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyAsyncData('lazy-api-union-with-pick', () => $fetch('/api/union'), { pick: ['type'] }).data).toEqualTypeOf<Ref<{ type: 'a' } | { type: 'b' } | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyAsyncData('lazy-api-other', () => $fetch('/api/other')).data).toEqualTypeOf<Ref<unknown>>()
+    expectTypeOf(useLazyAsyncData<TestResponse>('lazy-api-generics', () => $fetch('/test')).data).toEqualTypeOf<Ref<TestResponse | DefaultAsyncDataValue>>()
+
+    expectTypeOf(useLazyAsyncData('lazy-error-generics', () => $fetch('/error')).error).toEqualTypeOf<Ref<NuxtError<unknown> | DefaultAsyncDataErrorValue>>()
+    expectTypeOf(useLazyAsyncData<any, string>('lazy-error-generics', () => $fetch('/error')).error).toEqualTypeOf<Ref<NuxtError<string> | DefaultAsyncDataErrorValue>>()
+  })
+
+  it('works with useFetch', () => {
+    expectTypeOf(useFetch('/api/hello').data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+    expectTypeOf(useFetch('/api/hey').data).toEqualTypeOf<Ref<{ foo: string, baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useFetch('/api/hey', { method: 'GET' }).data).toEqualTypeOf<Ref<{ foo: string, baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useFetch('/api/hey', { method: 'get' }).data).toEqualTypeOf<Ref<{ foo: string, baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useFetch('/api/hey', { method: 'POST' }).data).toEqualTypeOf<Ref<{ method: 'post' } | DefaultAsyncDataValue>>()
+    expectTypeOf(useFetch('/api/hey', { method: 'post' }).data).toEqualTypeOf<Ref<{ method: 'post' } | DefaultAsyncDataValue>>()
+    // @ts-expect-error not a valid method
+    useFetch('/api/hey', { method: 'PATCH' })
+    expectTypeOf(useFetch('/api/hey', { pick: ['baz'] }).data).toEqualTypeOf<Ref<{ baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useFetch('/api/union').data).toEqualTypeOf<Ref<{ type: 'a', foo: string } | { type: 'b', baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useFetch('/api/union', { pick: ['type'] }).data).toEqualTypeOf<Ref<{ type: 'a' } | { type: 'b' } | DefaultAsyncDataValue>>()
+    expectTypeOf(useFetch('/api/other').data).toEqualTypeOf<Ref<unknown>>()
+    // https://github.com/nuxt/nuxt/issues/22488 — dynamic + static handlers on the same prefix
+    const dynamicId = String(Math.random())
+    expectTypeOf(useFetch(`/api/posts/${dynamicId}`).data).toEqualTypeOf<Ref<number | string | DefaultAsyncDataValue>>()
+    expectTypeOf(useFetch('/api/posts/static').data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+    expectTypeOf($fetch(`/api/posts/${dynamicId}`)).toEqualTypeOf<Promise<number | string>>()
+    expectTypeOf(useFetch<TestResponse>('/test').data).toEqualTypeOf<Ref<TestResponse | DefaultAsyncDataValue>>()
+    expectTypeOf(useFetch<TestResponse>('/test', { method: 'POST' }).data).toEqualTypeOf<Ref<TestResponse | DefaultAsyncDataValue>>()
+
+    // https://github.com/nuxt/nuxt/issues/22753
+    expectTypeOf(useFetch('/error').error).toEqualTypeOf<Ref<NuxtError<unknown> | DefaultAsyncDataErrorValue>>()
+    expectTypeOf(useFetch<any, string>('/error').error).toEqualTypeOf<Ref<string | DefaultAsyncDataErrorValue>>()
+
+    expectTypeOf(useLazyFetch('/api/hello').data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyFetch('/api/hey').data).toEqualTypeOf<Ref<{ foo: string, baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyFetch('/api/hey', { pick: ['baz'] }).data).toEqualTypeOf<Ref<{ baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyFetch('/api/union').data).toEqualTypeOf<Ref<{ type: 'a', foo: string } | { type: 'b', baz: string } | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyFetch('/api/union', { pick: ['type'] }).data).toEqualTypeOf<Ref<{ type: 'a' } | { type: 'b' } | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyFetch('/api/other').data).toEqualTypeOf<Ref<unknown>>()
+    expectTypeOf(useLazyFetch<TestResponse>('/test').data).toEqualTypeOf<Ref<TestResponse | DefaultAsyncDataValue>>()
+
+    expectTypeOf(useLazyFetch('/error').error).toEqualTypeOf<Ref<NuxtError<unknown> | DefaultAsyncDataErrorValue>>()
+    expectTypeOf(useLazyFetch<any, string>('/error').error).toEqualTypeOf<Ref<string | DefaultAsyncDataErrorValue>>()
+  })
+
+  it('works with useFetch and generic type', () => {
+    type ApiResponse = { message: string }
+
+    useFetch<ApiResponse>('/api/v1/users', {
+      onResponse ({ response }) {
+        expectTypeOf(response._data).toEqualTypeOf<ApiResponse | undefined>()
+      },
+    })
+  })
+
+  // https://github.com/nuxt/nuxt/issues/35341
+  it('accepts MaybeRefOrGetter for documented option fields', () => {
+    const method = ref<'POST'>('POST')
+    const base = ref('/api')
+    const search = ref('x')
+    const state = reactive({ name: 'a' })
+
+    for (const useFn of [useFetch, useLazyFetch]) {
+      useFn('/x', {
+        method,
+        baseURL: base,
+        query: { q: search },
+        params: { q: search },
+        headers: { 'x-test': search },
+        body: state,
+      })
+      useFn('/x', {
+        method: computed(() => method.value),
+        baseURL: computed(() => base.value),
+        query: computed(() => ({ q: search.value })),
+        params: computed(() => ({ q: search.value })),
+        headers: computed(() => ({ 'x-test': search.value })),
+        body: computed(() => ({ ...state })),
+      })
+      useFn('/x', {
+        method: () => method.value,
+        baseURL: () => base.value,
+        query: () => ({ q: search.value }),
+        params: () => ({ q: search.value }),
+        headers: () => ({ 'x-test': search.value }),
+        body: () => ({ ...state }),
+      })
+    }
+
+    // @ts-expect-error wrong shape: number is not a method
+    useFetch('/x', { method: 123 })
+    // @ts-expect-error wrong shape: getter must return a method
+    useFetch('/x', { method: () => 123 })
+  })
+})
+
+describe('nitro compatible APIs', () => {
+  it('getRouteRules', async () => {
+    const a = await getRouteRules('/test')
+    const c = getNitroRouteRules({} as H3Event)
+
+    expectTypeOf(c).toEqualTypeOf<NitroRouteRules>()
+    expectTypeOf(a).toEqualTypeOf<Record<string, any>>()
+  })
+  it('useRuntimeConfig', () => {
+    useRuntimeConfig({} as H3Event)
+  })
+})
+
+describe('aliases', () => {
+  it('allows importing from path aliases', () => {
+    expectTypeOf(useRouter).toEqualTypeOf<typeof vueUseRouter>()
+    expectTypeOf(isVue3).toEqualTypeOf<boolean>()
+  })
+})
+
+describe('import meta', () => {
+  it('types envName', () => {
+    expectTypeOf(import.meta.envName).toEqualTypeOf<string>()
+  })
+})
+
+describe('middleware', () => {
+  it('recognizes named middleware', () => {
+    definePageMeta({ middleware: 'named' })
+    // provided by layer
+    definePageMeta({ middleware: 'override' })
+    definePageMeta({ middleware: 'foo' })
+    // @ts-expect-error ignore global middleware
+    definePageMeta({ middleware: 'global' })
+    // @ts-expect-error Invalid middleware
+    definePageMeta({ middleware: 'nonexistent' })
+  })
+  it('types routeRules', () => {
+    defineNuxtConfig({
+      routeRules: {
+        // @ts-expect-error Invalid middleware
+        '/nonexistent': { appMiddleware: 'nonexistent' },
+        // @ts-expect-error ignore global middleware
+        '/global': { appMiddleware: 'global' },
+        '/named': { appMiddleware: 'named' },
+      },
+    })
+  })
+  it('handles adding middleware', () => {
+    addRouteMiddleware('example', (to, from) => {
+      expectTypeOf(to).toEqualTypeOf<RouteLocationNormalized>()
+      expectTypeOf(from).toEqualTypeOf<RouteLocationNormalized>()
+      expectTypeOf(navigateTo).toEqualTypeOf<(to: RouteLocationRaw | null | undefined, options?: NavigateToOptions) => void | false | Promise<void | NavigationFailure | false>>()
+      navigateTo('/')
+      abortNavigation()
+      abortNavigation('error string')
+      abortNavigation(new Error('my error'))
+      // @ts-expect-error Must return error or string
+      abortNavigation(true)
+    }, { global: true })
+  })
+  it('handles return types of validate', () => {
+    definePageMeta({
+      validate: async () => {
+        await new Promise(resolve => setTimeout(resolve, 1000))
+        // eslint-disable-next-line no-constant-condition
+        if (0) {
+          return createError({
+            statusCode: 404,
+            statusMessage: 'resource-type-not-found',
+          })
+        }
+        return true
+      },
+    })
+  })
+})
+
+describe('typed router integration', () => {
+  it('allows typing useRouter', () => {
+    const router = useRouter()
+    // @ts-expect-error this named route does not exist
+    router.push({ name: 'some-thing' })
+    // this one does
+    router.push({ name: 'page' })
+    // @ts-expect-error this is an invalid param
+    router.push({ name: 'param-id', params: { bob: 23 } })
+    router.push({ name: 'param-id', params: { id: 4 } })
+    // @ts-expect-error this is an invalid route
+    router.push({ name: 'param' })
+    // @ts-expect-error this is an invalid route
+    router.push({ name: '/param' })
+  })
+
+  it('correctly reads custom names typed in `definePageMeta`', () => {
+    const router = useRouter()
+    router.push({ name: 'some-custom-name' })
+    router.push({ name: 'param-id-view-custom', params: { id: 4 } })
+  })
+
+  it('allows typing useRoute', () => {
+    const route = useRoute('param-id')
+    // @ts-expect-error this param does not exist
+    const _invalid = route.params.something
+    // this param does
+    const _valid = route.params.id
+  })
+
+  it('allows typing navigateTo', () => {
+    // @ts-expect-error this named route does not exist
+    navigateTo({ name: 'some-thing' })
+    // this one does
+    navigateTo({ name: 'page' })
+    // @ts-expect-error this is an invalid param
+    navigateTo({ name: 'param-id', params: { bob: 23 } })
+    navigateTo({ name: 'param-id', params: { id: 4 } })
+    // @ts-expect-error this is an invalid param
+    navigateTo({ name: 'param-id-view-custom', params: { bob: 23 } })
+    navigateTo({ name: 'param-id-view-custom', params: { id: 4 } })
+  })
+
+  it('allows typing middleware', () => {
+    defineNuxtRouteMiddleware((to) => {
+      expectTypeOf(to.name).not.toBeAny()
+      // @ts-expect-error this route does not exist
+      expectTypeOf(to.name === 'bob').toEqualTypeOf<boolean>()
+      expectTypeOf(to.name === 'page').toEqualTypeOf<boolean>()
+    })
+  })
+
+  it('respects pages:extend augmentation', () => {
+    // added via pages:extend
+    expectTypeOf(useRoute().name === 'internal-async-parent').toEqualTypeOf<boolean>()
+    // @ts-expect-error this route does not exist
+    expectTypeOf(useRoute().name === 'invalid').toEqualTypeOf<boolean>()
+  })
+
+  it('respects pages added via layer', () => {
+    expectTypeOf(useRoute().name === 'override').toEqualTypeOf<boolean>()
+  })
+
+  it('allows typing NuxtLink', () => {
+    // @ts-expect-error this named route does not exist
+    h(NuxtLink, { to: { name: 'some-thing' } })
+    // @ts-expect-error this named route does not exist
+    h(NuxtLink, { href: { name: 'some-thing' } })
+    // this one does
+    h(NuxtLink, { to: { name: 'page' } })
+    h(NuxtLink, { href: { name: 'page' } })
+    // @ts-expect-error this is an invalid param
+    h(NuxtLink, { to: { name: 'param-id', params: { bob: 23 } } })
+    // @ts-expect-error this is an invalid param
+    h(NuxtLink, { href: { name: 'param-id', params: { bob: 23 } } })
+    h(NuxtLink, { to: { name: 'param-id', params: { id: 4 } } })
+    h(NuxtLink, { href: { name: 'param-id', params: { id: 4 } } })
+
+    // doesn't throw an error when accessing properties of component
+    const _props = NuxtLink.props
+  })
+
+  it('types NuxtLink slot props', () => {
+    type DefaultSlotProps = Parameters<NonNullable<InstanceType<typeof NuxtLink<false>>['$slots']['default']>>[0]
+    expectTypeOf<DefaultSlotProps['href']>().toEqualTypeOf<string>()
+    expectTypeOf<DefaultSlotProps['isActive']>().toEqualTypeOf<boolean>()
+    // @ts-expect-error prefetch state is only exposed to `custom` links
+    expectTypeOf<DefaultSlotProps['prefetched']>().toEqualTypeOf<boolean>()
+
+    type CustomSlotProps = Parameters<NonNullable<InstanceType<typeof NuxtLink<true>>['$slots']['default']>>[0]
+    expectTypeOf<CustomSlotProps['href']>().toEqualTypeOf<string | null>()
+    expectTypeOf<CustomSlotProps['isActive']>().toEqualTypeOf<boolean>()
+    expectTypeOf<CustomSlotProps['isExternal']>().toEqualTypeOf<boolean>()
+    expectTypeOf<CustomSlotProps['prefetched']>().toEqualTypeOf<boolean>()
+    expectTypeOf<CustomSlotProps['route']>().toExtend<{ href: string } | undefined>()
+  })
+
+  // `vue-component-type-helpers` and Vue Language Tools both infer against a construct signature,
+  // and inference against a solely generic construct signature resolves to the empty fallback
+  it('exposes props and slots to structural component type inference', () => {
+    type Props<T> = T extends new (...args: any) => { $props: infer P } ? NonNullable<P> : Record<never, never>
+    type Slots<T> = T extends new (...args: any) => { $slots: infer S } ? NonNullable<S> : Record<never, never>
+    expectTypeOf<'to' | 'href' | 'custom'>().toExtend<keyof Props<typeof NuxtLink>>()
+    expectTypeOf<'default'>().toExtend<keyof Slots<typeof NuxtLink>>()
+  })
+})
+
+describe('layouts', () => {
+  it('definePageMeta recognizes named layouts', () => {
+    definePageMeta({ layout: 'custom' })
+    definePageMeta({ layout: 'pascal-case' })
+    definePageMeta({ layout: 'override' })
+    // @ts-expect-error Invalid layout
+    definePageMeta({ layout: 'invalid-layout' })
+  })
+
+  it('NuxtLayout recognizes named layouts', () => {
+    h(NuxtLayout, { name: 'custom' })
+    // @ts-expect-error Invalid layout
+    h(NuxtLayout, { name: 'invalid-layout' })
+
+    h(NuxtLayout, { fallback: 'custom' })
+    // @ts-expect-error Invalid layout
+    h(NuxtLayout, { fallback: 'invalid-layout' })
+  })
+
+  it('setPageLayout recognizes named layouts and props', () => {
+    setPageLayout('custom')
+    setPageLayout('pascal-case')
+    setPageLayout('override')
+    setPageLayout('with-props', { aProp: 42 })
+    setPageLayout(false)
+    // @ts-expect-error No props when disabling the layout
+    setPageLayout(false, { aProp: 42 })
+    // @ts-expect-error Invalid layout
+    setPageLayout('invalid-layout')
+    // @ts-expect-error Invalid layout props
+    setPageLayout('with-props', { aProp: 'string-instead-of-number' })
+  })
+
+  it('expect setPageLayout to raise TS error when using non-serializable props values', () => {
+    // @ts-expect-error Non-serializable layout props
+    setPageLayout('withFunction', { aProp: () => {}, someProp: 5 })
+  })
+})
+
+describe('nuxtApp', () => {
+  it('types injections provided by plugins', () => {
+    expectTypeOf(useNuxtApp().$pluginInjection).toEqualTypeOf<() => ''>()
+    expectTypeOf(useNuxtApp().$foo).toEqualTypeOf<() => 'String generated from foo plugin!'>()
+    expectTypeOf(useNuxtApp().$router).toEqualTypeOf<Router>()
+  })
+  it('marks unknown injections as unknown', () => {
+    expectTypeOf(useNuxtApp().doesNotExist).toEqualTypeOf<unknown>()
+    expectTypeOf(useNuxtApp().$random).toEqualTypeOf<unknown>()
+  })
+})
+
+describe('plugins', () => {
+  it('dependsOn is strongly typed', () => {
+    defineNuxtPlugin({
+      // @ts-expect-error invalid plugin name
+      dependsOn: ['something'],
+    })
+    defineNuxtPlugin({
+      dependsOn: ['nuxt:router'],
+    })
+  })
+})
+
+describe('runtimeConfig', () => {
+  it('generated runtimeConfig types', () => {
+    const runtimeConfig = useRuntimeConfig()
+    expectTypeOf(runtimeConfig.public.testConfig).toEqualTypeOf<number>()
+    expectTypeOf(runtimeConfig.public.needsFallback).toEqualTypeOf<string>()
+    expectTypeOf(runtimeConfig.privateConfig).toEqualTypeOf<string>()
+    expectTypeOf(runtimeConfig.public.ids).toEqualTypeOf<(1 | 2 | 3)[]>()
+    expectTypeOf(runtimeConfig.unknown).toEqualTypeOf<unknown>()
+
+    const injectedConfig = useNuxtApp().$config
+    expectTypeOf(injectedConfig.public.testConfig).toEqualTypeOf<number>()
+    expectTypeOf(injectedConfig.public.needsFallback).toEqualTypeOf<string>()
+    expectTypeOf(injectedConfig.privateConfig).toEqualTypeOf<string>()
+    expectTypeOf(injectedConfig.public.ids).toEqualTypeOf<(1 | 2 | 3)[]>()
+    expectTypeOf(injectedConfig.unknown).toEqualTypeOf<unknown>()
+  })
+
+  it('reaches the payload and SSR context types', () => {
+    const payloadConfig = useNuxtApp().payload.config!
+    expectTypeOf(payloadConfig.public.ids).toEqualTypeOf<(1 | 2 | 3)[]>()
+    expectTypeOf(payloadConfig.public.testConfig).toEqualTypeOf<number>()
+    expectTypeOf<NonNullable<NuxtSSRContext['runtimeConfig']>['public']['ids']>().toEqualTypeOf<(1 | 2 | 3)[]>()
+  })
+})
+
+describe('head', () => {
+  it('types useHead', () => {
+    useHead({
+      base: { href: '/base' },
+      link: computed(() => []),
+      meta: [
+        { key: 'key', name: 'description', content: 'some description ' },
+        () => ({ key: 'key', name: 'description', content: 'some description ' }),
+      ],
+      titleTemplate: (titleChunk) => {
+        return titleChunk ? `${titleChunk} - Site Title` : 'Site Title'
+      },
+    })
+  })
+  it('types head for defineNuxtComponent', () => {
+    defineNuxtComponent({
+      head (nuxtApp) {
+        expectTypeOf(nuxtApp).not.toBeAny()
+        return {
+          title: 'Site Title',
+        }
+      },
+    })
+
+    defineNuxtComponent({
+      // @ts-expect-error wrong return type for head function
+      head () {
+        return {
+          test: true,
+        }
+      },
+    })
+  })
+})
+
+describe('components', () => {
+  it('includes types for NuxtPage', () => {
+    expectTypeOf(NuxtPage).not.toBeAny()
+  })
+
+  it('includes types for other components', () => {
+    h(WithTypes)
+    // @ts-expect-error wrong prop type for this component
+    h(WithTypes, { aProp: '40' })
+
+    // TODO: assert typed slots, exposed, generics, etc.
+  })
+
+  it('correctly includes event types with island components', () => {
+    const Comp = defineComponent({
+      __typeProps: {} as {
+        onClick: (foo: string) => any
+      },
+    })
+    const IslandComp = Comp as unknown as IslandComponent<typeof Comp>
+    h(IslandComp, {
+      // @ts-expect-error: foo must be string, not number
+      onClick: (foo: number) => foo,
+    })
+    h(IslandComp, {
+      onClick: (foo) => {
+        foo satisfies string
+        return foo
+      },
+    })
+  })
+
+  it('correctly includes event types with lazy components', () => {
+    const Comp = defineComponent({
+      __typeProps: {} as {
+        onClick: (foo: string) => any
+      },
+    })
+    const LazyComp = Comp as unknown as LazyComponent<typeof Comp>
+    h(LazyComp, {
+      // @ts-expect-error: foo must be string, not number
+      onClick: (foo: number) => foo,
+    })
+    h(LazyComp, {
+      onClick: (foo) => {
+        foo satisfies string
+        return foo
+      },
+    })
+  })
+
+  it('includes types for lazy hydration', () => {
+    h(LazyWithTypes)
+    h(LazyWithTypes, { hydrateAfter: 300 })
+    h(LazyWithTypes, { hydrateOnIdle: true })
+
+    // @ts-expect-error wrong prop type for this hydration strategy
+    h(LazyWithTypes, { hydrateAfter: '' })
+  })
+
+  it('include fallback slot in server components', () => {
+    expectTypeOf(ServerComponent.slots).toEqualTypeOf<SlotsType<{ fallback: { error: unknown } }> | undefined>()
+  })
+
+  it('suggests global component names to preloadComponents/prefetchComponents', () => {
+    type GlobalComponentName = 'GlobalComponent' | 'LazyGlobalComponent' | (string & {})
+    expectTypeOf(preloadComponents).parameter(0).toEqualTypeOf<GlobalComponentName | Array<GlobalComponentName>>()
+    expectTypeOf(prefetchComponents).parameter(0).toEqualTypeOf<GlobalComponentName | Array<GlobalComponentName>>()
+    void preloadComponents('RegisteredInAPlugin')
+  })
+
+  it('types NuxtIsland name against island component names', () => {
+    h(NuxtIsland, { name: 'ServerComponent' })
+    // @ts-expect-error not an island component
+    h(NuxtIsland, { name: 'WithTypes' })
+  })
+})
+
+describe('composables', () => {
+  it('allows providing default refs', () => {
+    expectTypeOf(useState('test', () => ref('hello'))).toEqualTypeOf<Ref<string>>()
+    expectTypeOf(useState('test', () => 'hello')).toEqualTypeOf<Ref<string>>()
+
+    expectTypeOf(useCookie('test', { default: () => ref(500) })).toEqualTypeOf<Ref<number>>()
+    expectTypeOf(useCookie('test', { default: () => 500 })).toEqualTypeOf<Ref<number>>()
+    useCookie<number | null>('test').value = null
+
+    expectTypeOf(useAsyncData('test', () => Promise.resolve(500), { default: () => ref(500) }).data).toEqualTypeOf<Ref<number>>()
+    expectTypeOf(useAsyncData('test', () => Promise.resolve(500), { default: () => 500 }).data).toEqualTypeOf<Ref<number>>()
+    expectTypeOf(useAsyncData('test', () => Promise.resolve('500'), { default: () => ref(500) }).data).toEqualTypeOf<Ref<string | number>>()
+    expectTypeOf(useAsyncData('test', () => Promise.resolve('500'), { default: () => 500 }).data).toEqualTypeOf<Ref<string | number>>()
+
+    expectTypeOf(useFetch('/test', { default: () => ref(500) }).data).toEqualTypeOf<Ref<unknown>>()
+    expectTypeOf(useFetch('/test', { default: () => 500 }).data).toEqualTypeOf<Ref<unknown>>()
+  })
+
+  it('enforces readonly cookies', () => {
+    // @ts-expect-error readonly cookie
+    useCookie('test', { readonly: true }).value = 'thing'
+  })
+
+  it('correct types when using ResT type-assertion with default function', () => {
+    // @ts-expect-error default type should match generic type
+    useFetch<string>('/test', { default: () => 0 })
+    // @ts-expect-error default type should match generic type
+    useLazyFetch<string>('/test', { default: () => 0 })
+    // @ts-expect-error default type should match generic type
+    useAsyncData<string>(() => $fetch('/test'), { default: () => 0 })
+    // @ts-expect-error default type should match generic type
+    useLazyAsyncData<string>(() => $fetch('/test'), { default: () => 0 })
+
+    expectTypeOf(useFetch<string>('/test', { default: () => 'test' }).data).toEqualTypeOf<Ref<string>>()
+    expectTypeOf(useLazyFetch<string>('/test', { default: () => 'test' }).data).toEqualTypeOf<Ref<string>>()
+    expectTypeOf(useAsyncData<string>(() => $fetch('/test'), { default: () => 'test' }).data).toEqualTypeOf<Ref<string>>()
+    expectTypeOf(useLazyAsyncData<string>(() => $fetch('/test'), { default: () => 'test' }).data).toEqualTypeOf<Ref<string>>()
+
+    // transform must match the explicit generic because of typescript limitations microsoft/TypeScript#14400
+    expectTypeOf(useFetch<string>('/test', { transform: () => 'transformed' }).data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyFetch<string>('/test', { transform: () => 'transformed' }).data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+    expectTypeOf(useAsyncData<string>(() => $fetch('/test'), { transform: () => 'transformed' }).data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyAsyncData<string>(() => $fetch('/test'), { transform: () => 'transformed' }).data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+
+    expectTypeOf(useFetch<string>('/test', { default: () => 'test', transform: () => 'transformed' }).data).toEqualTypeOf<Ref<string>>()
+    expectTypeOf(useLazyFetch<string>('/test', { default: () => 'test', transform: () => 'transformed' }).data).toEqualTypeOf<Ref<string>>()
+    expectTypeOf(useAsyncData<string>(() => $fetch('/test'), { default: () => 'test', transform: () => 'transformed' }).data).toEqualTypeOf<Ref<string>>()
+    expectTypeOf(useLazyAsyncData<string>(() => $fetch('/test'), { default: () => 'test', transform: () => 'transformed' }).data).toEqualTypeOf<Ref<string>>()
+  })
+
+  it('supports asynchronous transform', () => {
+    const { data } = useAsyncData('test', () => $fetch('/test') as Promise<{ foo: 'bar' }>, {
+      async transform (data) {
+        await Promise.resolve()
+        return data.foo
+      },
+    })
+    expectTypeOf(data).toEqualTypeOf<Ref<'bar' | DefaultAsyncDataValue>>()
+  })
+
+  it('infer request url string literal from server/api routes', () => {
+    // request can accept dynamic string type
+    const dynamicStringUrl = 'https://example.com/api'
+    expectTypeOf(useFetch(dynamicStringUrl).data).toEqualTypeOf<Ref<unknown>>()
+
+    // request param should infer string literal type / show auto-complete hint base on server routes, ex: '/api/hello'
+    expectTypeOf(useFetch('/api/hello').data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+    expectTypeOf(useLazyFetch('/api/hello').data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+
+    // request can accept string literal and Request object type
+    expectTypeOf(useFetch('https://example.com/api').data).toEqualTypeOf<Ref<unknown>>()
+    expectTypeOf(useFetch(new Request('test')).data).toEqualTypeOf<Ref<unknown>>()
+  })
+
+  it('provides proper type support when using overloads', () => {
+    expectTypeOf(useState('test')).toEqualTypeOf(useState())
+    expectTypeOf(useState('test', () => ({ foo: Math.random() }))).toEqualTypeOf(useState(() => ({ foo: Math.random() })))
+
+    expectTypeOf(useAsyncData(computed(() => 'test'), () => Promise.resolve({ foo: Math.random() })))
+      .toEqualTypeOf(useAsyncData(() => Promise.resolve({ foo: Math.random() })))
+    expectTypeOf(useAsyncData(computed(() => 'test'), () => Promise.resolve({ foo: Math.random() }), { transform: data => data.foo }))
+      .toEqualTypeOf(useAsyncData(() => Promise.resolve({ foo: Math.random() }), { transform: data => data.foo }))
+
+    expectTypeOf(useLazyAsyncData(computed(() => 'test'), () => Promise.resolve({ foo: Math.random() })))
+      .toEqualTypeOf(useLazyAsyncData(() => Promise.resolve({ foo: Math.random() })))
+    expectTypeOf(useLazyAsyncData(computed(() => 'test'), () => Promise.resolve({ foo: Math.random() }), { transform: data => data.foo }))
+      .toEqualTypeOf(useLazyAsyncData(() => Promise.resolve({ foo: Math.random() }), { transform: data => data.foo }))
+
+    expectTypeOf(useAsyncData('test', () => Promise.resolve({ foo: Math.random() })))
+      .toEqualTypeOf(useAsyncData(() => Promise.resolve({ foo: Math.random() })))
+    expectTypeOf(useAsyncData('test', () => Promise.resolve({ foo: Math.random() }), { transform: data => data.foo }))
+      .toEqualTypeOf(useAsyncData(() => Promise.resolve({ foo: Math.random() }), { transform: data => data.foo }))
+
+    expectTypeOf(useLazyAsyncData('test', () => Promise.resolve({ foo: Math.random() })))
+      .toEqualTypeOf(useLazyAsyncData(() => Promise.resolve({ foo: Math.random() })))
+    expectTypeOf(useLazyAsyncData('test', () => Promise.resolve({ foo: Math.random() }), { transform: data => data.foo }))
+      .toEqualTypeOf(useLazyAsyncData(() => Promise.resolve({ foo: Math.random() }), { transform: data => data.foo }))
+
+    // Default values: #14437
+    // TODO: what?!
+    expectTypeOf(useAsyncData('test', () => Promise.resolve({ foo: { bar: 500 } }), { default: () => ({ bar: 500 }), transform: v => v.foo }).data).toEqualTypeOf<Ref<{ bar: number } | { bar: number }>>()
+    expectTypeOf(useLazyAsyncData('test', () => Promise.resolve({ foo: { bar: 500 } }), { default: () => ({ bar: 500 }), transform: v => v.foo }))
+      .toEqualTypeOf(useLazyAsyncData(() => Promise.resolve({ foo: { bar: 500 } }), { default: () => ({ bar: 500 }), transform: v => v.foo }))
+    expectTypeOf(useFetch('/api/hey', { default: () => 1, transform: v => v.foo }).data).toEqualTypeOf<Ref<string | number>>()
+    expectTypeOf(useLazyFetch('/api/hey', { default: () => 'bar', transform: v => v.foo }).data).toEqualTypeOf<Ref<string>>()
+  })
+
+  it('uses types compatible between useRequestHeaders and useFetch', () => {
+    useFetch('/api/hey', {
+      headers: useRequestHeaders(),
+    })
+    useFetch('/api/hey', {
+      headers: useRequestHeaders(['test']),
+    })
+    const { test } = useRequestHeaders(['test'])
+    expectTypeOf(test).toEqualTypeOf<string | undefined>()
+  })
+
+  it('allows passing reactive values in useFetch', () => {
+    useFetch('/api/hey', {
+      headers: {
+        key: ref('test'),
+      },
+      query: {
+        param: computed(() => 'thing'),
+      },
+    })
+  })
+
+  it('correctly types returns with key signatures', () => {
+    interface TestType {
+      id: string
+      content: string[]
+      [x: string]: any
+    }
+
+    const testFetch = () => Promise.resolve({}) as Promise<TestType>
+
+    const { data: notTypedData } = useAsyncData('test', testFetch)
+    expectTypeOf(notTypedData.value!.id).toEqualTypeOf<string>()
+    expectTypeOf(notTypedData.value!.content).toEqualTypeOf<string[]>()
+    expectTypeOf(notTypedData.value!.untypedKey).toEqualTypeOf<any>()
+  })
+
+  it('correctly types returns when using with getCachedData', () => {
+    expectTypeOf(useAsyncData('test', () => Promise.resolve({ foo: 1 }), {
+      getCachedData: key => useNuxtApp().payload.data[key],
+    }).data).toEqualTypeOf<Ref<{ foo: number } | DefaultAsyncDataValue>>()
+    useAsyncData('test', () => Promise.resolve({ foo: 1 }), {
+      // @ts-expect-error cached data should return the same as value of fetcher
+      getCachedData: () => ({ bar: 2 }),
+    })
+    useAsyncData<{ foo: number }, unknown, { foo: number }>('test', () => Promise.resolve({ foo: 1 }), {
+      // @ts-expect-error cached data should return the same as asserted type of `useAsyncData`
+      getCachedData: () => ({ bar: 2 }),
+    })
+  })
+
+  it('infers transformed data independently from typed cached data', () => {
+    const asyncData = useAsyncData(
+      () => Promise.resolve({
+        foo: 'bar',
+      }),
+      {
+        transform: data => data.foo,
+        getCachedData: () => 'bar',
+      },
+    )
+
+    expectTypeOf(asyncData.data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+  })
+
+  it('propagates factory transform type through createUseAsyncData (#35128)', () => {
+    interface Foo { a: number, b: string }
+
+    // defaults mode
+    const useFooData = createUseAsyncData({
+      transform: (res: Foo) => ({ count: res.a }),
+    })
+    const r1 = useFooData('key', () => Promise.resolve({ a: 1, b: 'x' } as Foo))
+    expectTypeOf(r1.data).toEqualTypeOf<Ref<{ count: number } | DefaultAsyncDataValue>>()
+
+    const r1NoKey = useFooData(() => Promise.resolve({ a: 1, b: 'x' } as Foo))
+    expectTypeOf(r1NoKey.data).toEqualTypeOf<Ref<{ count: number } | DefaultAsyncDataValue>>()
+
+    // override mode (function form)
+    const useFooDataOverride = createUseAsyncData(() => ({
+      transform: (res: Foo) => ({ count: res.a }),
+    }))
+    const r2 = useFooDataOverride('key', () => Promise.resolve({ a: 1, b: 'x' } as Foo))
+    expectTypeOf(r2.data).toEqualTypeOf<Ref<{ count: number } | DefaultAsyncDataValue>>()
+
+    // no factory transform: falls back to handler return type
+    const useBareData = createUseAsyncData({})
+    const r3 = useBareData('key', () => Promise.resolve({ a: 1, b: 'x' } as Foo))
+    expectTypeOf(r3.data).toEqualTypeOf<Ref<Foo | DefaultAsyncDataValue>>()
+
+    // caller transform still wins over factory transform default
+    const r4 = useFooData('key', () => Promise.resolve({ a: 1, b: 'x' } as Foo), {
+      transform: res => res.b,
+    })
+    expectTypeOf(r4.data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+  })
+
+  it('propagates factory transform type through createUseFetch (#35128)', () => {
+    interface Foo { a: number, b: string }
+
+    // defaults mode
+    const useFooFetch = createUseFetch({
+      transform: (res: Foo) => ({ count: res.a }),
+    })
+    const r1 = useFooFetch<Foo>('/api/foo')
+    expectTypeOf(r1.data).toEqualTypeOf<Ref<{ count: number } | DefaultAsyncDataValue>>()
+
+    // override mode (function form)
+    const useFooFetchOverride = createUseFetch(() => ({
+      transform: (res: Foo) => ({ count: res.a }),
+    }))
+    const r2 = useFooFetchOverride<Foo>('/api/foo')
+    expectTypeOf(r2.data).toEqualTypeOf<Ref<{ count: number } | DefaultAsyncDataValue>>()
+
+    // no factory transform: falls back to fetch result type
+    const useBareFetch = createUseFetch({})
+    const r3 = useBareFetch<Foo>('/api/foo')
+    expectTypeOf(r3.data).toEqualTypeOf<Ref<Foo | DefaultAsyncDataValue>>()
+
+    // caller transform overrides factory transform default
+    // (only works without an explicit `ResT` generic, due to microsoft/TypeScript#14400)
+    const r4 = useFooFetch('/api/foo', { transform: (res: Foo) => res.b })
+    expectTypeOf(r4.data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+  })
+
+  it('propagates factory `default` / `pick` types through createUseAsyncData / createUseFetch (#35128)', () => {
+    interface Foo { a: number, b: string }
+
+    // createUseAsyncData: factory `default` widens the returned data type
+    const useWithDefault = createUseAsyncData({ default: () => 'fallback' as const })
+    const d1 = useWithDefault('k', () => Promise.resolve({ a: 1, b: 'x' } as Foo))
+    expectTypeOf(d1.data.value).toEqualTypeOf<Foo | 'fallback'>()
+
+    // factory transform + default together: data is the transform output (or factory default)
+    const useWithBoth = createUseAsyncData({
+      transform: (res: Foo) => ({ count: res.a }),
+      default: () => ({ count: 0 }),
+    })
+    const d2 = useWithBoth('k', () => Promise.resolve({ a: 1, b: 'x' } as Foo))
+    expectTypeOf(d2.data.value).toEqualTypeOf<{ count: number }>()
+
+    // factory pick narrows the returned data type.
+    // The factory `pick` option doesn't infer FPickKeys (array literals widen to `string[]`),
+    // so the user passes it explicitly as a generic.
+    const useWithPick = createUseAsyncData<Foo, Foo, ['a']>({ pick: ['a'] })
+    const d3 = useWithPick('k', () => Promise.resolve({ a: 1, b: 'x' } as Foo))
+    expectTypeOf(d3.data.value).toEqualTypeOf<Pick<Foo, 'a'> | undefined>()
+
+    // createUseFetch: factory `default` widens the returned data type
+    const useFetchWithDefault = createUseFetch({ default: () => 'fallback' as const })
+    const f1 = useFetchWithDefault<Foo>('/api/foo')
+    expectTypeOf(f1.data.value).toEqualTypeOf<Foo | 'fallback'>()
+
+    // createUseFetch: factory transform + default
+    const useFetchBoth = createUseFetch({
+      transform: (res: Foo) => ({ count: res.a }),
+      default: () => ({ count: 0 }),
+    })
+    const f2 = useFetchBoth<Foo>('/api/foo')
+    expectTypeOf(f2.data.value).toEqualTypeOf<{ count: number }>()
+  })
+
+  it('types addon options and extensions on created composables', () => {
+    const tenant = defineUseFetchAddon({
+      setup: (options: UseFetchAddonOptions<{ tenant?: string }>) => {
+        options.tenant ??= 'default'
+        return asyncData => ({ isSuccess: computed(() => asyncData.status.value === 'success') })
+      },
+      key: options => options.tenant,
+    })
+    const retries = defineUseFetchAddon({
+      setup: (options: UseFetchAddonOptions<{ retries?: number }>) => {
+        options.middleware.push(next => next())
+        return () => ({ attempts: ref(0) })
+      },
+    })
+
+    const useApi = createUseFetch({ addons: [tenant, retries] })
+    const r1 = useApi('/api/hello', { tenant: 'a', retries: 2 })
+    expectTypeOf(r1.data).toEqualTypeOf<Ref<string | DefaultAsyncDataValue>>()
+    expectTypeOf(r1.isSuccess).toEqualTypeOf<ComputedRef<boolean>>()
+    expectTypeOf(r1.attempts).toEqualTypeOf<Ref<number>>()
+    // @ts-expect-error `tenant` is a string
+    useApi('/api/hello', { tenant: 1 })
+    // @ts-expect-error not an option any addon declares
+    useApi('/api/hello', { unknownOption: true })
+
+    const { isSuccess } = useApi('/api/hello')
+    expectTypeOf(isSuccess).toEqualTypeOf<ComputedRef<boolean>>()
+    expectTypeOf(useApi('/api/hello').then(r => r.isSuccess)).toEqualTypeOf<Promise<ComputedRef<boolean>>>()
+
+    const useBare = createUseFetch({})
+    expectTypeOf(useBare).toEqualTypeOf<UseFetch<any, KeysOf<any>>>()
+    // @ts-expect-error `tenant` is not declared for this composable
+    useBare('/api/hello', { tenant: 'a' })
+    // @ts-expect-error nor is the extension present
+    void useBare('/api/hello').isSuccess
+
+    interface Pet { id: number, name: string }
+    interface PetStore {
+      '/pets': { [Endpoint]: { GET: { response: Pet[] } } }
+    }
+    const usePetStore = createUseFetch({ routes: {} as PetStore, addons: [tenant] })
+    expectTypeOf(usePetStore).toEqualTypeOf<DeclaredUseFetch<PetStore, unknown, KeysOf<unknown>, undefined, { tenant?: string }, MergedAddonsExtensions<[typeof tenant]>>>()
+    const p1 = usePetStore('/pets', { tenant: 'a' })
+    expectTypeOf(p1.data).toEqualTypeOf<Ref<Pet[] | DefaultAsyncDataValue>>()
+    expectTypeOf(p1.isSuccess).toEqualTypeOf<ComputedRef<boolean>>()
+    // @ts-expect-error `tenant` is a string
+    usePetStore('/pets', { tenant: 1 })
+
+    const polling = defineUseAsyncDataAddon({
+      setup: (options: UseAsyncDataAddonOptions<{ pollEvery?: number }>) => {
+        options.middleware.push(next => next())
+        return () => ({ polling: ref(Boolean(options.pollEvery)) })
+      },
+    })
+    const usePolled = createUseAsyncData({ addons: [polling] })
+    expectTypeOf(usePolled).toEqualTypeOf<UseAsyncData<unknown, unknown, KeysOf<unknown>, undefined, { pollEvery?: number }, MergedAddonsExtensions<[typeof polling]>>>()
+    const a1 = usePolled('k', () => Promise.resolve(1), { pollEvery: 1000 })
+    expectTypeOf(a1.data.value).toEqualTypeOf<number | DefaultAsyncDataValue>()
+    expectTypeOf(a1.polling).toEqualTypeOf<Ref<boolean>>()
+    expectTypeOf(a1).toEqualTypeOf<AsyncDataWithExtensions<number | DefaultAsyncDataValue, NuxtError | DefaultAsyncDataErrorValue, { polling: Ref<boolean> }>>()
+    expectTypeOf<AugmentedAsyncData<number, NuxtError, MergedAddonsExtensions<[typeof polling]>>>().toEqualTypeOf<AsyncDataWithExtensions<number, NuxtError, { polling: Ref<boolean> }>>()
+    // @ts-expect-error `pollEvery` is a number
+    usePolled('k', () => Promise.resolve(1), { pollEvery: '1s' })
+
+    const optionsOnlyFetch = defineUseFetchAddon({
+      setup: (options: UseFetchAddonOptions<{ enabled?: boolean }>) => { options.middleware.push(next => next()) },
+    })
+    const optionsOnlyAsyncData = defineUseAsyncDataAddon({
+      setup: (options: UseAsyncDataAddonOptions<{ enabled?: boolean }>) => { options.middleware.push(next => next()) },
+    })
+    type Plain = AsyncData<string | DefaultAsyncDataValue, NuxtError | DefaultAsyncDataErrorValue>
+    expectTypeOf(createUseFetch({ addons: [optionsOnlyFetch] })('/api/hello')).toEqualTypeOf<Plain>()
+    expectTypeOf(createUseAsyncData({ addons: [optionsOnlyAsyncData] })(() => Promise.resolve('hello'))).toEqualTypeOf<Plain>()
+  })
+})
+
+describe('app config', () => {
+  it('merges app config as expected', () => {
+    interface ExpectedMergedAppConfig {
+      // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+      nuxt: {}
+      fromLayer: boolean
+      fromNuxtConfig: boolean
+      nested: {
+        val: number
+      }
+      userConfig: 123 | 456
+      someThing?: {
+        value?: string | false
+      }
+      hookAugmentingModule?: { enabled: boolean }
+      themed: {
+        colors: { primary: string, neutral: string }
+        slots: { root: string, body: string }
+        variants: string[]
+        format: (value: string) => string
+      }
+      [key: string]: unknown
+    }
+    expectTypeOf<AppConfig>().toEqualTypeOf<ExpectedMergedAppConfig>()
+  })
+  it('does not recurse into function and array values', () => {
+    expectTypeOf<AppConfig['themed']['format']>().toEqualTypeOf<(value: string) => string>()
+    expectTypeOf<AppConfig['themed']['variants']>().toEqualTypeOf<string[]>()
+  })
+  it('accepts partial overrides of module-provided app config', () => {
+    expectTypeOf<AppConfigInput['themed']>().toEqualTypeOf<{
+      colors?: { primary?: string, neutral?: string }
+      slots?: { root?: string, body?: string }
+      variants?: string[]
+      format?: (value: string) => string
+    } | undefined>()
+  })
+  it('resolves the same input type through `nuxt/schema` and `@nuxt/schema`', () => {
+    expectTypeOf<AppConfigInputFromNuxt['themed']>().toEqualTypeOf<AppConfigInput['themed']>()
+  })
+})
+
+describe('extends type declarations', () => {
+  it('correctly adds references to tsconfig', () => {
+    expectTypeOf<import('bing').BingInterface>().toEqualTypeOf<{ foo: 'bar' }>()
+  })
+})
+
+describe('composables inference', () => {
+  it('callWithNuxt', () => {
+    const bob = callWithNuxt({} as any, () => true)
+    expectTypeOf<typeof bob>().toEqualTypeOf<Promise<boolean>>()
+  })
+  it('runWithContext', () => {
+    const bob = useNuxtApp().runWithContext(() => true)
+    expectTypeOf<typeof bob>().toEqualTypeOf<boolean | Promise<boolean>>()
+  })
+})
+
+describe('kit utilities', () => {
+  it('addTypeTemplate', () => {
+    // @ts-expect-error Fromage is 'cheese'
+    const _fake: Fromage = 'babybel'
+
+    const _fromage: Fromage = 'cheese'
+  })
+})
+
+declare module '#app' {
+  interface NuxtApp {
+    $augmentedViaPoundApp: (msg: string) => number
+  }
+  interface PageMeta {
+    poundAppMetaField?: boolean
+  }
+  interface RuntimeNuxtHooks {
+    'pound-app:custom-hook': (payload: { foo: string }) => void | Promise<void>
+  }
+}
+
+declare module 'nuxt/app' {
+  interface NuxtApp {
+    $augmentedViaNuxtApp: string
+  }
+}
+
+declare module '#app' {
+  interface NuxtPayload {
+    poundAppPayloadField?: 'from-pound-app'
+  }
+}
+
+describe('module augmentation of runtime app types', () => {
+  it('merges `NuxtApp` augmentations from `#app` and `nuxt/app`', () => {
+    const nuxtApp = useNuxtApp()
+    expectTypeOf(nuxtApp.$augmentedViaPoundApp).toEqualTypeOf<(msg: string) => number>()
+    expectTypeOf(nuxtApp.$augmentedViaNuxtApp).toEqualTypeOf<string>()
+  })
+  it('sees the same `NuxtApp` interface through both specifiers', () => {
+    const viaNuxtApp: import('nuxt/app').NuxtApp = useNuxtApp()
+    expectTypeOf(viaNuxtApp.$augmentedViaPoundApp).toEqualTypeOf<(msg: string) => number>()
+    expectTypeOf(viaNuxtApp.$augmentedViaNuxtApp).toEqualTypeOf<string>()
+    const viaPoundApp: import('#app').NuxtApp = viaNuxtApp
+    expectTypeOf(viaPoundApp).toEqualTypeOf<typeof viaNuxtApp>()
+  })
+  it('merges `PageMeta` augmentations from `#app`', () => {
+    definePageMeta({ poundAppMetaField: true })
+    expectTypeOf<PageMeta['poundAppMetaField']>().toEqualTypeOf<boolean | undefined>()
+  })
+  it('merges `RuntimeNuxtHooks` augmentations from `#app`', () => {
+    useNuxtApp().hook('pound-app:custom-hook', (payload) => {
+      expectTypeOf(payload).toEqualTypeOf<{ foo: string }>()
+    })
+  })
+  it('re-exports the same leaf types through `#app` as `#app/types` declares', () => {
+    expectTypeOf<import('#app').NuxtPayload>().toEqualTypeOf<import('#app/types').NuxtPayload>()
+    expectTypeOf<import('#app').NuxtSSRContext>().toEqualTypeOf<import('#app/types').NuxtSSRContext>()
+  })
+  it('flows `#app` payload augmentations through to the `#app/types` leaf', () => {
+    // `@nuxt/nitro-server` reads `NuxtPayload` from `#app/types`; a user
+    // augmentation applied via `#app` must be visible there too.
+    expectTypeOf<import('#app/types').NuxtPayload['poundAppPayloadField']>().toEqualTypeOf<'from-pound-app' | undefined>()
+  })
+})
+
+describe('error typing', () => {
+  it('useError exposes NuxtError fields', () => {
+    const error = useError()
+    expectTypeOf(error.value?.fatal).toEqualTypeOf<boolean | undefined>()
+    expectTypeOf(error.value?.__nuxt_error).toEqualTypeOf<true | undefined>()
+  })
+
+  it('stays structurally compatible with the error h3 constructs during SSR', () => {
+    expectTypeOf<H3Error>().toExtend<NuxtError>()
+  })
+})
+
+describe('request event typing', () => {
+  it('resolves the event to the one contributed by `@nuxt/nitro-server`', () => {
+    expectTypeOf(useRequestEvent()).toEqualTypeOf<H3Event | undefined>()
+    expectTypeOf<NuxtSSRContext['event']>().toEqualTypeOf<H3Event>()
+    expectTypeOf<NuxtRequestEvent>().toEqualTypeOf<H3Event>()
+  })
+})
+
+describe('route rules typing', () => {
+  it('resolves the rules contributed by `@nuxt/nitro-server`', () => {
+    const rules = getRouteRules(useRequestEvent()!)
+    expectTypeOf(rules.redirect).toEqualTypeOf<string | undefined>()
+    expectTypeOf(rules.prerender).toEqualTypeOf<boolean | undefined>()
+    expectTypeOf(rules.appMiddleware).toEqualTypeOf<Record<string, boolean> | undefined>()
+    expectTypeOf(rules.payload).toEqualTypeOf<boolean | undefined>()
+    expectTypeOf(rules.appLayout).toEqualTypeOf<LayoutKey | false | undefined>()
+    expectTypeOf(rules.headers).toEqualTypeOf<Record<string, string> | undefined>()
+  })
+})

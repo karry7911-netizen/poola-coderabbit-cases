@@ -1,0 +1,236 @@
+import { createHash } from 'node:crypto'
+import { pathToFileURL } from 'node:url'
+import { resolve } from 'pathe'
+import { addBuildPlugin, addComponent, addPlugin, addTemplate, addVitePlugin, defineNuxtModule, directoryToURL } from '@nuxt/kit'
+import { headDiagnostics } from '@nuxt/kit/internal'
+import type { NuxtOptions } from '@nuxt/schema'
+import { resolveModulePath } from 'exsolve'
+import { streamingIifeCode } from 'unhead/stream/iife'
+import { distDir } from '../dirs.ts'
+import { UnheadImportsPlugin } from './plugins/unhead-imports.ts'
+
+// the bootstrap code is a constant, so its content hash is known before the build runs
+const iifeChunkFileName = `streaming-iife.${createHash('sha256').update(streamingIifeCode).digest('hex').slice(0, 8)}.js`
+
+const components = ['NoScript', 'Link', 'Base', 'Title', 'Meta', 'Style', 'Head', 'Html', 'Body']
+
+export default defineNuxtModule<NuxtOptions['unhead']>({
+  meta: {
+    name: 'nuxt:meta',
+    configKey: 'unhead',
+  },
+  setup (options, nuxt) {
+    const runtimeDir = resolve(distDir, 'head/runtime')
+    const ssrStreamingEnabled = typeof nuxt.options.experimental.ssrStreaming === 'object' && nuxt.options.experimental.ssrStreaming.enabled
+
+    /* eslint-disable @typescript-eslint/no-deprecated */
+    const legacy = options.legacy
+    const headNext = nuxt.options.experimental.headNext
+    /* eslint-enable @typescript-eslint/no-deprecated */
+
+    // Transpile @unhead/vue
+    nuxt.options.build.transpile.push('@unhead/vue')
+
+    // Register components
+    const componentsPath = resolve(runtimeDir, 'components')
+    for (const componentName of components) {
+      addComponent({
+        name: componentName,
+        filePath: componentsPath,
+        export: componentName,
+        // built-in that we do not expect the user to override
+        priority: 10,
+        // kebab case version of these tags is not valid
+        kebabName: componentName,
+      })
+    }
+
+    nuxt.options.alias['#unhead/composables'] = resolve(runtimeDir, 'composables')
+    addBuildPlugin(UnheadImportsPlugin({
+      rootDir: nuxt.options.rootDir,
+    }))
+
+    // v5 users get tree-shaking via the @unhead/vue/vite plugin registered below.
+    // On v4 we fall back to Nuxt's composable tree-shaker so server composables
+    // still get stripped from the client bundle in production builds.
+    if (nuxt.options.future.compatibilityVersion < 5 && !nuxt.options.dev) {
+      nuxt.options.optimization.treeShake.composables.client['@unhead/vue'] = [
+        'useServerHead', 'useServerSeoMeta', 'useServerHeadSafe',
+      ]
+    }
+
+    const importPaths = nuxt.options.modulesDir.map(d => directoryToURL(d))
+    const resolveNuxtUnhead = (id: string) => resolveModulePath(id, { from: import.meta.url })
+
+    // Register @unhead/vue/vite plugin for v5 compat mode
+    // Vite 8+ ships rolldown and lightningcss as direct deps, so minifiers
+    // are always available when using the vite builder. We resolve paths at
+    // setup time so dynamic imports resolve from vite's deps, not nuxt's.
+    if (nuxt.options.future.compatibilityVersion >= 5 && options.vite !== false && nuxt.options.builder === '@nuxt/vite-builder') {
+      const rolldownPath = resolveModulePath('rolldown/experimental', { try: true, from: importPaths })
+      const lightningcssPath = resolveModulePath('lightningcss', { try: true, from: importPaths })
+      // Convert to file:// URLs for Windows compatibility with dynamic import()
+      const rolldownURL = rolldownPath ? pathToFileURL(rolldownPath).href : undefined
+      const lightningcssURL = lightningcssPath ? pathToFileURL(lightningcssPath).href : undefined
+
+      addVitePlugin(async () => {
+        const { Unhead } = await import('@unhead/vue/vite')
+        const viteOptions = options.vite || {}
+        return Unhead({
+          validate: !nuxt.options.test,
+          minify: {
+            js: rolldownURL
+              ? async (code) => {
+                const { minify } = await import(rolldownURL)
+                return (await minify('inline.js', code)).code.trim()
+              }
+              : undefined,
+            css: lightningcssURL
+              ? async (code) => {
+                const { transform } = await import(lightningcssURL)
+                return new TextDecoder().decode(transform({
+                  filename: 'inline.css',
+                  code: new TextEncoder().encode(code),
+                  minify: true,
+                }).code).trim()
+              }
+              : undefined,
+          },
+          ...viteOptions,
+        })
+      })
+    }
+
+    const unheadLegacy = resolveNuxtUnhead('@unhead/vue/legacy')
+    const unheadPlugins = resolveNuxtUnhead('@unhead/vue/plugins')
+
+    addTemplate({
+      filename: 'unhead-options.mjs',
+      dependsOn: [],
+      getContents () {
+        const isV5 = nuxt.options.future.compatibilityVersion >= 5
+
+        // legacy is forced false on v5 by the schema resolver (which warns there), so only v4 reaches this
+        if (legacy) {
+          headDiagnostics.NUXT_B6003()
+        }
+
+        if (headNext === false) {
+          headDiagnostics.NUXT_B6004()
+        }
+
+        const disableCapoSorting = !isV5 && (legacy || headNext === false)
+
+        const lines: string[] = []
+        // v4 parity with v2 defaults: restore the plugin set that unhead v3 no
+        // longer auto-loads (DeprecationsPlugin, PromisesPlugin, TemplateParamsPlugin,
+        // AliasSortingPlugin). v5 keeps TemplateParamsPlugin because %s / %siteName
+        // / %separator title interpolation is a core Nuxt SEO idiom; other plugins
+        // must be registered explicitly.
+        if (!isV5) {
+          lines.push(`import { legacyPlugins } from ${JSON.stringify(unheadLegacy)};`)
+        } else {
+          lines.push(`import { TemplateParamsPlugin } from ${JSON.stringify(unheadPlugins)};`)
+        }
+        lines.push(`export default {`)
+        lines.push(`  disableDefaults: true,`)
+        if (disableCapoSorting) {
+          lines.push(`  disableCapoSorting: true,`)
+        }
+        lines.push(`  plugins: ${isV5 ? '[TemplateParamsPlugin]' : 'legacyPlugins'},`)
+        lines.push(`}`)
+        return lines.join('\n')
+      },
+    })
+
+    addTemplate({
+      filename: 'unhead.config.mjs',
+      dependsOn: [],
+      getContents () {
+        return [
+          `export const renderSSRHeadOptions = ${JSON.stringify(options.renderSSRHeadOptions || {})}`,
+          // in dev the bootstrap code is inlined into the document instead of emitted
+          `export const iifeChunkFileName = ${JSON.stringify(ssrStreamingEnabled && !nuxt.options.dev ? iifeChunkFileName : undefined)}`,
+        ].join('\n')
+      },
+    })
+
+    // template is only exposed in nuxt context, expose in nitro context as well
+    nuxt.hooks.hook('nitro:config', (config) => {
+      config.virtual!['#internal/unhead-options.mjs'] = () => nuxt.vfs['#build/unhead-options.mjs'] || ''
+      config.virtual!['#internal/unhead.config.mjs'] = () => nuxt.vfs['#build/unhead.config.mjs'] || ''
+    })
+
+    // Remove deprecated server composables from auto-imports in v5
+    if (nuxt.options.future.compatibilityVersion >= 5) {
+      const deprecated = new Set(['useServerHead', 'useServerHeadSafe', 'useServerSeoMeta'])
+      nuxt.hooks.hook('imports:sources', (sources) => {
+        for (const source of sources) {
+          if ('from' in source && source.from === '#app/composables/head' && 'imports' in source && Array.isArray(source.imports)) {
+            source.imports = (source.imports as (string | { name: string })[]).filter(
+              i => !deprecated.has(typeof i === 'string' ? i : i.name),
+            )
+          }
+        }
+      })
+    }
+
+    // Emit the unhead streaming IIFE as a raw, content-hashed JS asset in
+    // production so the renderer can load it as a classic script
+    // (`<script async src>` without `type="module"`). The IIFE is a
+    // prebuilt, pre-minified self-invoking string; routing it through the
+    // bundler's chunk graph would wrap it in ESM and break the loader.
+    //
+    // We deliberately do not use unheadVuePlugin's SFC transform here
+    // (HeadStream injection): it causes hydration mismatches because the
+    // server renders <script> and the client renders null. The renderer
+    // injects head update scripts outside the Vue render tree instead.
+    if (ssrStreamingEnabled) {
+      addVitePlugin({
+        name: 'nuxt:streaming-iife-chunk',
+        applyToEnvironment: (env: any) => env.name === 'client',
+
+        buildStart () {
+          if (nuxt.options.dev) { return }
+          const prefix = nuxt.options.app.buildAssetsDir.replace(/^\//, '')
+          this.emitFile({
+            type: 'asset',
+            fileName: prefix + iifeChunkFileName,
+            source: streamingIifeCode,
+          })
+        },
+      })
+
+      // For webpack/rspack we emit the IIFE via `compilation.emitAsset` so
+      // it ships as a classic script outside the chunk graph (no ESM
+      // wrapping). Client compiler, production only - dev inlines the IIFE.
+      if (!nuxt.options.dev && nuxt.options.builder !== '@nuxt/vite-builder') {
+        const makeIifeAssetPlugin = () => ({
+          apply (compiler: any) {
+            if (compiler.options.name !== 'client') { return }
+            compiler.hooks.thisCompilation.tap('nuxt:streaming-iife-chunk', (compilation: any) => {
+              const { RawSource } = compiler.webpack.sources
+              const { PROCESS_ASSETS_STAGE_ADDITIONAL } = compiler.webpack.Compilation
+              compilation.hooks.processAssets.tap(
+                { name: 'nuxt:streaming-iife-chunk', stage: PROCESS_ASSETS_STAGE_ADDITIONAL },
+                () => {
+                  if (!compilation.getAsset(iifeChunkFileName)) {
+                    compilation.emitAsset(iifeChunkFileName, new RawSource(streamingIifeCode))
+                  }
+                },
+              )
+            })
+          },
+        })
+        addBuildPlugin({
+          webpack: makeIifeAssetPlugin,
+          rspack: makeIifeAssetPlugin,
+        })
+      }
+    }
+
+    // Add library-specific plugins
+    addPlugin({ src: resolve(runtimeDir, ssrStreamingEnabled ? 'plugins/unhead-stream.client' : 'plugins/unhead.client') })
+    addPlugin({ src: resolve(runtimeDir, 'plugins/unhead.server') })
+  },
+})

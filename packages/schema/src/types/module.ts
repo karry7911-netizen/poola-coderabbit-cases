@@ -1,0 +1,135 @@
+import type { NuxtHooks } from './hooks.ts'
+import type { Merged } from './merge.ts'
+import type { Nuxt } from './nuxt.ts'
+import type { NuxtCompatibility } from './compatibility.ts'
+
+export interface ModuleMeta {
+  /** Module name. */
+  name?: string
+
+  /** Module version. */
+  version?: string
+
+  /**
+   * The configuration key used within `nuxt.config` for this module's options.
+   * For example, `@nuxtjs/axios` uses `axios`.
+   */
+  configKey?: string
+
+  /**
+   * Constraints for the versions of Nuxt or features this module requires.
+   */
+  compatibility?: NuxtCompatibility
+
+  /**
+   * Fully resolved path used internally by Nuxt. Do not depend on this value.
+   * @internal
+   */
+  rawPath?: string
+
+  /**
+   * Whether the module has been disabled in the Nuxt configuration.
+   * @internal
+   */
+  disabled?: boolean
+
+  [key: string]: unknown
+}
+
+/** The options received.  */
+export type ModuleOptions = Record<string, any>
+
+export type ModuleSetupInstallResult = {
+  /**
+   * Timing information for the initial setup
+   */
+  timings?: {
+    /** Total time took for module setup in ms */
+    setup?: number
+    [key: string]: number | undefined
+  }
+}
+
+type Awaitable<T> = T | Promise<T>
+
+type Prettify<T> = {
+  [K in keyof T]: T[K];
+} & {}
+
+export type ModuleSetupReturn = Awaitable<false | void | ModuleSetupInstallResult>
+
+export type ResolvedModuleOptions<
+  TOptions extends ModuleOptions,
+  TOptionsDefaults extends Partial<TOptions>,
+> =
+  Prettify<
+    Merged<
+      Partial<TOptions>,
+      [Partial<TOptions>, TOptionsDefaults]
+    >
+  >
+
+export interface ModuleDependencyMeta<T = Record<string, unknown>> {
+  version?: string
+  overrides?: Partial<T>
+  defaults?: Partial<T>
+  optional?: boolean
+}
+
+export interface ModuleDependencies {
+  [key: string]: ModuleDependencyMeta<Record<string, unknown>>
+}
+
+/** Module definition passed to 'defineNuxtModule(...)' or 'defineNuxtModule().with(...)'. */
+export interface ModuleDefinition<
+  TOptions extends ModuleOptions,
+  TOptionsDefaults extends Partial<TOptions>,
+  TWith extends boolean,
+> {
+  meta?: ModuleMeta
+  defaults?: TOptionsDefaults | ((nuxt: Nuxt) => Awaitable<TOptionsDefaults>)
+  schema?: TOptions
+  hooks?: Partial<NuxtHooks>
+  moduleDependencies?: ModuleDependencies | ((nuxt: Nuxt) => Awaitable<ModuleDependencies>)
+  onInstall?: (nuxt: Nuxt) => Awaitable<void>
+  onUpgrade?: (nuxt: Nuxt, options: TOptions, previousVersion: string) => Awaitable<void>
+  setup?: (
+    this: void,
+    resolvedOptions: TWith extends true
+      ? ResolvedModuleOptions<TOptions, TOptionsDefaults>
+      : TOptions,
+    nuxt: Nuxt,
+  ) => ModuleSetupReturn
+}
+
+export interface NuxtModule<
+  TOptions extends ModuleOptions = ModuleOptions,
+  TOptionsDefaults extends Partial<TOptions> = Partial<TOptions>,
+  TWith extends boolean = false,
+> {
+  (
+    this: void,
+    resolvedOptions: TWith extends true
+      ? ResolvedModuleOptions<TOptions, TOptionsDefaults>
+      : TOptions,
+    nuxt: Nuxt
+  ): ModuleSetupReturn
+  getOptions?: (
+    inlineOptions?: Partial<TOptions>,
+    nuxt?: Nuxt,
+  ) => Promise<
+    TWith extends true
+      ? ResolvedModuleOptions<TOptions, TOptionsDefaults>
+      : TOptions
+  >
+  getModuleDependencies?: (nuxt: Nuxt) => Awaitable<ModuleDependencies> | undefined
+  getMeta?: () => Promise<ModuleMeta>
+  onInstall?: (nuxt: Nuxt) => Awaitable<void>
+  onUpgrade?: (
+    nuxt: Nuxt,
+    options: TWith extends true
+      ? ResolvedModuleOptions<TOptions, TOptionsDefaults>
+      : TOptions,
+    previousVersion: string,
+  ) => Awaitable<void>
+}

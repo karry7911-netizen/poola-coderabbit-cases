@@ -1,0 +1,48 @@
+import { runInNewContext } from 'node:vm'
+import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { promises as fsp } from 'node:fs'
+import type { Plugin } from 'vite'
+import genericMessages from '../templates/messages.json' with { type: 'json' }
+import pkg from '../../nuxt/package.json' with { type: 'json' }
+
+const templatesRoot = fileURLToPath(new URL('..', import.meta.url))
+
+const r = (...path: string[]) => resolve(join(templatesRoot, ...path))
+
+export const DevRenderingPlugin = () => {
+  return <Plugin>{
+    name: 'dev-rendering',
+    async transformIndexHtml (html: string, context) {
+      // the url is used as a path, so a query string would land in it
+      const page = (context.originalUrl || '/').split(/[?#]/)[0] || '/'
+
+      if (page.endsWith('.png')) { return }
+
+      if (page === '/' || page === '/index.html') {
+        const templateNames = await fsp.readdir(r('templates'))
+        const serializedData = JSON.stringify({ templateNames })
+        return html.replace('{{ data }}', serializedData)
+      }
+
+      const contents = await fsp.readFile(r(page, 'index.html'), 'utf-8')
+
+      const messages = JSON.parse(await fsp.readFile(r(page, 'messages.json'), 'utf-8'))
+
+      const chunks = contents.split(/\{{2,3}[^{}]+\}{2,3}/)
+      let templateString = chunks.shift()
+      for (const expression of contents.matchAll(/\{{2,3}([^{}]+)\}{2,3}/g)) {
+        const value = runInNewContext(expression[1]!.trim(), {
+          version: pkg.version,
+          messages: { ...genericMessages, ...messages },
+        })
+        templateString += `${value}${chunks.shift()}`
+      }
+      if (chunks.length > 0) {
+        templateString += chunks.join('')
+      }
+
+      return templateString
+    },
+  }
+}

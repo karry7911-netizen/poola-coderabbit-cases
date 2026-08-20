@@ -1,0 +1,571 @@
+import { describe, expect, it, vi } from 'vitest'
+import type { RouteLocation, RouteLocationRaw } from 'vue-router'
+import { ref } from 'vue'
+import { withQuery } from 'ufo'
+import type { NuxtLinkOptions, NuxtLinkProps } from '../src/app/components/nuxt-link.ts'
+import { defineNuxtLink } from '../src/app/components/nuxt-link.ts'
+import { useRuntimeConfig } from '../src/app/nuxt.ts'
+
+// mocks `useRuntimeConfig()`
+vi.mock('../src/app/nuxt', () => ({
+  useRuntimeConfig: vi.fn(() => ({
+    app: {
+      baseURL: '/',
+    },
+  })),
+}))
+
+// Mocks `h()`
+vi.mock('vue', async () => {
+  const vue: Record<string, unknown> = await vi.importActual('vue')
+  return {
+    ...vue,
+    resolveComponent: (name: string) => name,
+    h: (...args: any[]) => args,
+  }
+})
+
+// Mocks Nuxt `useRouter()` and `navigateTo()`
+const navigateToMock = vi.fn()
+vi.mock('../src/app/composables/router', () => ({
+  resolveRouteObject (to: Exclude<RouteLocationRaw, string>) {
+    return withQuery(to.path || '', to.query || {}) + (to.hash || '')
+  },
+  navigateTo: (...args: unknown[]) => navigateToMock(...args),
+  useRouter: () => ({
+    resolve: (route: string | RouteLocation): Partial<RouteLocation> & { href: string } => {
+      if (typeof route === 'string') {
+        return { path: route, href: route }
+      }
+      return {
+        path: route.path || `/${route.name?.toString()}`,
+        query: route.query || undefined,
+        hash: route.hash || undefined,
+        href: route.path || `/${route.name?.toString()}`,
+      }
+    },
+    currentRoute: { value: { path: '/' } },
+  }),
+}))
+
+// Helpers for test visibility
+const EXTERNAL = 'a'
+const INTERNAL = 'RouterLink'
+
+// Renders a `<NuxtLink />`
+const nuxtLink = (
+  props: NuxtLinkProps = {},
+  nuxtLinkOptions: Partial<NuxtLinkOptions> = {},
+): { type: string, props: Record<string, unknown>, slots: unknown } => {
+  const component = defineNuxtLink({ componentName: 'NuxtLink', ...nuxtLinkOptions })
+
+  const [type, _props, slots] = (
+    component as unknown as { setup: (props: NuxtLinkProps, context: { slots: Record<string, () => unknown> }) => () => [string, Record<string, unknown>, unknown] }
+  ).setup(props, { slots: { default: () => null } })()
+
+  return { type, props: _props, slots }
+}
+
+describe('nuxt-link:to', () => {
+  it('renders link with `to` prop', () => {
+    expect(nuxtLink({ to: '/to' }).props.to).toBe('/to')
+  })
+
+  it('renders link with `href` prop', () => {
+    expect(nuxtLink({ href: '/href' }).props.to).toBe('/href')
+  })
+
+  it('renders link with `to` prop and warns about `href` prop conflict', () => {
+    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(vi.fn() as any)
+
+    expect(nuxtLink({ to: '/to', href: '/href' }).props.to).toBe('/to')
+    // TODO: Uncomment when `dev` mode for tests is available
+    // expect(consoleWarnSpy).toHaveBeenCalledOnce()
+
+    consoleWarnSpy.mockRestore()
+  })
+
+  it('without to and href', () => {
+    const link = nuxtLink()
+    expect(link.props.href).toBe(null)
+    expect(link.props.rel).toBe(null)
+  })
+})
+
+describe('nuxt-link:isExternal', () => {
+  it('returns based on `to` value', () => {
+    // Internal
+    expect(nuxtLink({ to: '/foo' }).type).toBe(INTERNAL)
+    expect(nuxtLink({ to: '/foo/bar' }).type).toBe(INTERNAL)
+    expect(nuxtLink({ to: '/foo/bar?baz=qux' }).type).toBe(INTERNAL)
+
+    // External
+    expect(nuxtLink({ to: 'https://nuxtjs.org' }).type).toBe(EXTERNAL)
+    expect(nuxtLink({ to: '//nuxtjs.org' }).type).toBe(EXTERNAL)
+    expect(nuxtLink({ to: '/\t/nuxtjs.org' }).type).toBe(EXTERNAL)
+    expect(nuxtLink({ to: '/\n\\nuxtjs.org' }).type).toBe(EXTERNAL)
+    expect(nuxtLink({ to: 'tel:0123456789' }).type).toBe(EXTERNAL)
+    expect(nuxtLink({ to: 'mailto:hello@nuxtlabs.com' }).type).toBe(EXTERNAL)
+  })
+
+  it('returns `false` when `to` is a route location object', () => {
+    expect(nuxtLink({ to: { path: '/to' } }).type).toBe(INTERNAL)
+  })
+
+  it('returns `true` when `to` has a `target`', () => {
+    expect(nuxtLink({ to: { path: '/to' }, target: '_blank' }).type).toBe(EXTERNAL)
+  })
+
+  it('honors `external` prop', () => {
+    expect(nuxtLink({ to: '/to', external: true }).type).toBe(EXTERNAL)
+    expect(nuxtLink({ to: '/to', external: false }).type).toBe(INTERNAL)
+  })
+
+  it('returns `true` when using the `target` prop', () => {
+    expect(nuxtLink({ to: '/foo', target: '_blank' }).type).toBe(EXTERNAL)
+    expect(nuxtLink({ to: '/foo/bar', target: '_blank' }).type).toBe(EXTERNAL)
+    expect(nuxtLink({ to: '/foo/bar?baz=qux', target: '_blank' }).type).toBe(EXTERNAL)
+  })
+
+  it('returns `true` if link starts with hash', () => {
+    expect(nuxtLink({ href: '#hash' }).type).toBe(EXTERNAL)
+    expect(nuxtLink({ to: '#hash' }).type).toBe(EXTERNAL)
+  })
+})
+
+describe('nuxt-link:propsOrAttributes', () => {
+  describe('`isExternal` is `true`', () => {
+    describe('href', () => {
+      it('forwards `to` value', () => {
+        expect(nuxtLink({ to: 'https://nuxtjs.org' }).props.href).toBe('https://nuxtjs.org')
+      })
+
+      it('resolves route location object', () => {
+        expect(nuxtLink({ to: { path: '/to' }, external: true }).props.href).toBe('/to')
+      })
+
+      it('resolves route location object with name', () => {
+        expect(nuxtLink({ to: { name: 'to' }, external: true }).props.href).toBe('/to')
+      })
+
+      it('applies trailing slash behaviour', () => {
+        expect(nuxtLink({ to: { path: '/to' }, external: true }, { trailingSlash: 'append' }).props.href).toBe('/to/')
+        expect(nuxtLink({ to: '/to', external: true }, { trailingSlash: 'append' }).props.href).toBe('/to/')
+      })
+
+      it('strips script-capable protocols from auto-detected external links', () => {
+        const cases = [
+          'javascript:alert(1)',
+          ' javascript:alert(1)',
+          'JAVASCRIPT:alert(1)',
+          'java\tscript:alert(1)',
+          'data:text/html,<script>alert(1)</script>',
+          'vbscript:msgbox(1)',
+          'view-source:javascript:alert(1)',
+          'view-source:view-source:javascript:alert(1)',
+          'blob:https://example.test/abc',
+        ]
+        for (const to of cases) {
+          expect(nuxtLink({ to }).props.href, to).toBe(null)
+        }
+      })
+
+      it('strips script-capable protocols when the caller forces `external: true`', () => {
+        const cases = [
+          'javascript:alert(1)',
+          '\u0001javascript:alert(1)',
+          '\tjavascript:alert(1)',
+          'data:text/html,<script>alert(1)</script>',
+          'view-source:javascript:alert(1)',
+        ]
+        for (const to of cases) {
+          expect(nuxtLink({ to, external: true }).props.href, to).toBe(null)
+        }
+      })
+
+      it('preserves safe external href values', () => {
+        const safe = [
+          'https://nuxtjs.org',
+          'http://nuxtjs.org',
+          '//nuxtjs.org',
+          'mailto:hello@nuxtjs.org',
+          'tel:0123456789',
+          'ftp://example.test/file',
+        ]
+        for (const to of safe) {
+          expect(nuxtLink({ to }).props.href, to).toBe(to)
+        }
+      })
+
+      it('strips script-capable protocols passed through the `custom` slot', () => {
+        let received: { href: string | null } | undefined
+        const component = defineNuxtLink({ componentName: 'NuxtLink' })
+        ;(component as any).setup(
+          { to: 'javascript:alert(1)', custom: true },
+          {
+            slots: {
+              default: (slotProps: { href: string | null }) => {
+                received = slotProps
+                return null
+              },
+            },
+          },
+        )()
+        expect(received?.href).toBe(null)
+      })
+    })
+
+    describe('target', () => {
+      it('forwards `target` prop', () => {
+        expect(nuxtLink({ to: 'https://nuxtjs.org', target: '_blank' }).props.target).toBe('_blank')
+        expect(nuxtLink({ to: 'https://nuxtjs.org', target: null }).props.target).toBe(null)
+      })
+
+      it('defaults to `null`', () => {
+        expect(nuxtLink({ to: 'https://nuxtjs.org' }).props.target).toBe(null)
+      })
+
+      it('prefixes target="_blank" internal links with baseURL', () => {
+        vi.mocked(useRuntimeConfig).withImplementation(() => {
+          return {
+            app: {
+              baseURL: '/base',
+            },
+          } as any
+        }, () => {
+          expect(nuxtLink({ to: '/', target: '_blank' }).props.href).toBe('/base')
+          expect(nuxtLink({ to: '/base', target: '_blank' }).props.href).toBe('/base/base')
+          expect(nuxtLink({ to: '/to', target: '_blank' }).props.href).toBe('/base/to')
+          expect(nuxtLink({ to: '/base/to', target: '_blank' }).props.href).toBe('/base/base/to')
+          expect(nuxtLink({ to: '//base/to', target: '_blank' }).props.href).toBe('//base/to')
+          expect(nuxtLink({ to: '//to.com/thing', target: '_blank' }).props.href).toBe('//to.com/thing')
+          expect(nuxtLink({ to: 'https://test.com/to', target: '_blank' }).props.href).toBe('https://test.com/to')
+
+          expect(nuxtLink({ to: '/', target: '_blank' }, { trailingSlash: 'append' }).props.href).toBe('/base/')
+          expect(nuxtLink({ to: '/base/', target: '_blank' }, { trailingSlash: 'remove' }).props.href).toBe('/base/base')
+        })
+      })
+
+      it('excludes the baseURL for external links', () => {
+        vi.mocked(useRuntimeConfig).withImplementation(() => {
+          return {
+            app: {
+              baseURL: '/base',
+            },
+          } as any
+        }, () => {
+          expect(nuxtLink({ to: 'http://nuxtjs.org/app/about', target: '_blank' }).props.href).toBe('http://nuxtjs.org/app/about')
+          expect(nuxtLink({ to: '//nuxtjs.org/app/about', target: '_blank' }).props.href).toBe('//nuxtjs.org/app/about')
+          expect(nuxtLink({ to: { path: '/' }, external: true }).props.href).toBe('/')
+          expect(nuxtLink({ to: '/', external: true }).props.href).toBe('/')
+        })
+      })
+    })
+
+    describe('rel', () => {
+      it('uses framework\'s default', () => {
+        expect(nuxtLink({ to: 'https://nuxtjs.org' }).props.rel).toBe('noopener noreferrer')
+      })
+
+      it('uses user\'s default', () => {
+        expect(nuxtLink({ to: 'https://nuxtjs.org' }, { externalRelAttribute: 'foo' }).props.rel).toBe('foo')
+        expect(nuxtLink({ to: 'https://nuxtjs.org' }, { externalRelAttribute: null }).props.rel).toBe(null)
+      })
+
+      it('uses and favors `rel` prop', () => {
+        expect(nuxtLink({ to: 'https://nuxtjs.org', rel: 'foo' }).props.rel).toBe('foo')
+        expect(nuxtLink({ to: 'https://nuxtjs.org', rel: 'foo' }, { externalRelAttribute: 'bar' }).props.rel).toBe('foo')
+        expect(nuxtLink({ to: 'https://nuxtjs.org', rel: null }, { externalRelAttribute: 'bar' }).props.rel).toBe(null)
+        expect(nuxtLink({ to: 'https://nuxtjs.org', rel: '' }, { externalRelAttribute: 'bar' }).props.rel).toBe(null)
+      })
+
+      it('honors `noRel` prop', () => {
+        expect(nuxtLink({ to: 'https://nuxtjs.org', noRel: true }).props.rel).toBe(null)
+        expect(nuxtLink({ to: 'https://nuxtjs.org', noRel: false }).props.rel).toBe('noopener noreferrer')
+      })
+
+      it('honors `noRel` prop and warns about `rel` prop conflict', () => {
+        const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(vi.fn() as any)
+
+        expect(nuxtLink({ to: 'https://nuxtjs.org', noRel: true, rel: 'foo' }).props.rel).toBe(null)
+        // TODO: Uncomment when `dev` mode for tests is available
+        // expect(consoleWarnSpy).toHaveBeenCalledOnce()
+
+        consoleWarnSpy.mockRestore()
+      })
+    })
+  })
+
+  describe('`isExternal` is `false`', () => {
+    describe('to', () => {
+      it('forwards `to` prop', () => {
+        expect(nuxtLink({ to: '/to' }).props.to).toBe('/to')
+        expect(nuxtLink({ to: { path: '/to' } }).props.to).toEqual({ path: '/to' })
+        expect(nuxtLink({ to: { name: 'to' } }).props.to).toEqual({ name: 'to' })
+      })
+    })
+
+    describe('activeClass', () => {
+      it('uses framework\'s default', () => {
+        expect(nuxtLink({ to: '/to' }).props.activeClass).toBe(undefined)
+      })
+
+      it('uses user\'s default', () => {
+        expect(nuxtLink({ to: '/to' }, { activeClass: 'activeClass' }).props.activeClass).toBe('activeClass')
+      })
+
+      it('uses and favors `activeClass` prop', () => {
+        expect(nuxtLink({ to: '/to', activeClass: 'propActiveClass' }).props.activeClass).toBe('propActiveClass')
+        expect(nuxtLink({ to: '/to', activeClass: 'propActiveClass' }, { activeClass: 'activeClass' }).props.activeClass).toBe('propActiveClass')
+      })
+    })
+
+    describe('exactActiveClass', () => {
+      it('uses framework\'s default', () => {
+        expect(nuxtLink({ to: '/to' }).props.exactActiveClass).toBe(undefined)
+      })
+
+      it('uses user\'s default', () => {
+        expect(nuxtLink({ to: '/to' }, { exactActiveClass: 'exactActiveClass' }).props.exactActiveClass).toBe('exactActiveClass')
+      })
+
+      it('uses and favors `exactActiveClass` prop', () => {
+        expect(nuxtLink({ to: '/to', exactActiveClass: 'propExactActiveClass' }).props.exactActiveClass).toBe('propExactActiveClass')
+        expect(nuxtLink({ to: '/to', exactActiveClass: 'propExactActiveClass' }, { exactActiveClass: 'exactActiveClass' }).props.exactActiveClass).toBe('propExactActiveClass')
+      })
+    })
+
+    describe('replace', () => {
+      it('forwards `replace` prop', () => {
+        expect(nuxtLink({ to: '/to', replace: true }).props.replace).toBe(true)
+        expect(nuxtLink({ to: '/to', replace: false }).props.replace).toBe(false)
+      })
+    })
+
+    describe('ariaCurrentValue', () => {
+      it('forwards `ariaCurrentValue` prop', () => {
+        expect(nuxtLink({ to: '/to', ariaCurrentValue: 'page' }).props.ariaCurrentValue).toBe('page')
+        expect(nuxtLink({ to: '/to', ariaCurrentValue: 'step' }).props.ariaCurrentValue).toBe('step')
+      })
+    })
+
+    describe('trailingSlashBehavior', () => {
+      it('append slash using options', () => {
+        const appendSlashOptions: NuxtLinkOptions = { trailingSlash: 'append' }
+
+        expect(nuxtLink({ to: '/to' }, appendSlashOptions).props.to).toEqual('/to/')
+        expect(nuxtLink({ to: '/to/' }, appendSlashOptions).props.to).toEqual('/to/')
+        expect(nuxtLink({ to: '/to#abc' }, appendSlashOptions).props.to).toEqual('/to/#abc')
+        expect(nuxtLink({ to: { name: 'to' } }, appendSlashOptions).props.to).toHaveProperty('path', '/to/')
+        expect(nuxtLink({ to: { path: '/to' } }, appendSlashOptions).props.to).toHaveProperty('path', '/to/')
+        expect(nuxtLink({ to: { path: '/to#abc' } }, appendSlashOptions).props.to).toHaveProperty('path', '/to/#abc')
+        expect(nuxtLink({ href: '/to' }, appendSlashOptions).props.to).toEqual('/to/')
+        expect(nuxtLink({ href: '/to#abc' }, appendSlashOptions).props.to).toEqual('/to/#abc')
+        expect(nuxtLink({ to: '/to?param=1' }, appendSlashOptions).props.to).toEqual('/to/?param=1')
+        expect(nuxtLink({ to: '/to?param=1#abc' }, appendSlashOptions).props.to).toEqual('/to/?param=1#abc')
+        expect(nuxtLink({ href: 'mailto:test@example.com' }, appendSlashOptions).props.href).toEqual('mailto:test@example.com')
+      })
+
+      it('remove slash using options', () => {
+        const removeSlashOptions: NuxtLinkOptions = { trailingSlash: 'remove' }
+
+        expect(nuxtLink({ to: '/to' }, removeSlashOptions).props.to).toEqual('/to')
+        expect(nuxtLink({ to: '/to/' }, removeSlashOptions).props.to).toEqual('/to')
+        expect(nuxtLink({ to: '/to/#abc' }, removeSlashOptions).props.to).toEqual('/to#abc')
+        expect(nuxtLink({ to: { name: 'to' } }, removeSlashOptions).props.to).toHaveProperty('path', '/to')
+        expect(nuxtLink({ to: { path: '/to/' } }, removeSlashOptions).props.to).toHaveProperty('path', '/to')
+        expect(nuxtLink({ to: { path: '/to/#abc' } }, removeSlashOptions).props.to).toHaveProperty('path', '/to#abc')
+        expect(nuxtLink({ href: '/to/' }, removeSlashOptions).props.to).toEqual('/to')
+        expect(nuxtLink({ to: '/to/?param=1' }, removeSlashOptions).props.to).toEqual('/to?param=1')
+        expect(nuxtLink({ to: '/to/?param=1#abc' }, removeSlashOptions).props.to).toEqual('/to?param=1#abc')
+        expect(nuxtLink({ href: 'mailto:test@example.com' }, removeSlashOptions).props.href).toEqual('mailto:test@example.com')
+      })
+
+      it('prop overrides option: append', () => {
+        const removeSlashOptions: NuxtLinkOptions = { trailingSlash: 'remove' }
+        // Prop takes priority
+        expect(nuxtLink({ to: '/to', trailingSlash: 'append' }, removeSlashOptions).props.to).toEqual('/to/')
+        expect(nuxtLink({ to: '/to/', trailingSlash: 'append' }, removeSlashOptions).props.to).toEqual('/to/')
+        expect(nuxtLink({ to: { path: '/to' }, trailingSlash: 'append' }, removeSlashOptions).props.to).toHaveProperty('path', '/to/')
+        // External links
+        expect(nuxtLink({ to: '/to', external: true, trailingSlash: 'append' }, removeSlashOptions).props.href).toBe('/to/')
+      })
+
+      it('prop overrides option: remove', () => {
+        const appendSlashOptions: NuxtLinkOptions = { trailingSlash: 'append' }
+        // Prop takes priority
+        expect(nuxtLink({ to: '/to/', trailingSlash: 'remove' }, appendSlashOptions).props.to).toEqual('/to')
+        expect(nuxtLink({ to: '/to', trailingSlash: 'remove' }, appendSlashOptions).props.to).toEqual('/to')
+        expect(nuxtLink({ to: { path: '/to/' }, trailingSlash: 'remove' }, appendSlashOptions).props.to).toHaveProperty('path', '/to')
+        // External links
+        expect(nuxtLink({ to: '/to/', external: true, trailingSlash: 'remove' }, appendSlashOptions).props.href).toBe('/to')
+      })
+
+      it('uses option when prop is not provided', () => {
+        const appendSlashOptions: NuxtLinkOptions = { trailingSlash: 'append' }
+        const removeSlashOptions: NuxtLinkOptions = { trailingSlash: 'remove' }
+
+        // Use append option
+        expect(nuxtLink({ to: '/to' }, appendSlashOptions).props.to).toEqual('/to/')
+        // Use remove option
+        expect(nuxtLink({ to: '/to/' }, removeSlashOptions).props.to).toEqual('/to')
+        // External links with options
+        expect(nuxtLink({ to: '/to', external: true }, appendSlashOptions).props.href).toBe('/to/')
+        expect(nuxtLink({ to: '/to/', external: true }, removeSlashOptions).props.href).toBe('/to')
+      })
+
+      it('leaves the URL untouched when trailingSlash is unset', () => {
+        // When neither the option nor the prop is set, the trailing slash must be
+        // preserved on every render path — the value should be ignored (see #35500).
+
+        // Internal links expose the resolved `to` (via resolveTrailingSlashBehavior)
+        expect(nuxtLink({ to: '/to/' }).props.to).toEqual('/to/')
+        expect(nuxtLink({ to: '/to' }).props.to).toEqual('/to')
+        expect(nuxtLink({ href: '/to/' }).props.to).toEqual('/to/')
+
+        // External links surface the resolved `href` (via applyTrailingSlashBehavior)
+        expect(nuxtLink({ to: '/to/', external: true }).props.href).toBe('/to/')
+        expect(nuxtLink({ to: '/to', external: true }).props.href).toBe('/to')
+
+        // `target="_blank"` internal links also go through the `href` path
+        expect(nuxtLink({ to: '/to/', target: '_blank' }).props.href).toBe('/to/')
+        expect(nuxtLink({ to: '/to', target: '_blank' }).props.href).toBe('/to')
+
+        // An invalid `trailingSlash` value is treated as unset and ignored
+        expect(nuxtLink({ to: '/to/', external: true, trailingSlash: 'invalid' as NuxtLinkProps['trailingSlash'] }).props.href).toBe('/to/')
+      })
+    })
+  })
+})
+
+describe('nuxt-link:useLink', () => {
+  it('accepts plain values for `to`', () => {
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const link = component.useLink({ to: '/about' })
+    expect(link.href.value).toBe('/about')
+    expect(link.isExternal.value).toBe(false)
+  })
+
+  it('accepts a Ref for `to`', () => {
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const to = ref('/about')
+    const link = component.useLink({ to })
+    expect(link.href.value).toBe('/about')
+    expect(link.isExternal.value).toBe(false)
+  })
+
+  it('reacts to changes in a Ref `to`', () => {
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const to = ref('/about')
+    const link = component.useLink({ to })
+    expect(link.href.value).toBe('/about')
+    to.value = '/contact'
+    expect(link.href.value).toBe('/contact')
+  })
+
+  it('correctly identifies external links via Ref `to`', () => {
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const to = ref('https://nuxtjs.org')
+    const link = component.useLink({ to })
+    expect(link.isExternal.value).toBe(true)
+    expect(link.href.value).toBe('https://nuxtjs.org')
+  })
+
+  it('accepts a Ref for `href`', () => {
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const href = ref('/about')
+    const link = component.useLink({ href })
+    expect(link.href.value).toBe('/about')
+    expect(link.isExternal.value).toBe(false)
+  })
+
+  it('reacts to changes in a Ref `href`', () => {
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const href = ref('/about')
+    const link = component.useLink({ href })
+    expect(link.href.value).toBe('/about')
+    href.value = '/contact'
+    expect(link.href.value).toBe('/contact')
+  })
+
+  it('accepts a Ref for `external`', () => {
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const external = ref(true)
+    const link = component.useLink({ to: '/about', external })
+    expect(link.isExternal.value).toBe(true)
+  })
+
+  it('reacts to changes in a Ref `external`', () => {
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const external = ref(false)
+    const link = component.useLink({ to: '/about', external })
+    expect(link.isExternal.value).toBe(false)
+    external.value = true
+    expect(link.isExternal.value).toBe(true)
+  })
+
+  it('accepts a Ref for `target`', () => {
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const target = ref<string | null>('_blank')
+    const link = component.useLink({ to: '/about', target })
+    expect(link.hasTarget.value).toBe(true)
+  })
+
+  it('reacts to changes in a Ref `target`', () => {
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const target = ref<string | null>(null)
+    const link = component.useLink({ to: '/about', target })
+    expect(link.hasTarget.value).toBe(false)
+    target.value = '_blank'
+    expect(link.hasTarget.value).toBe(true)
+  })
+
+  it('navigate() calls navigateTo with correct href', async () => {
+    navigateToMock.mockClear()
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const link = component.useLink({ to: '/about' })
+    await link.navigate()
+    expect(navigateToMock).toHaveBeenCalledWith('/about', { replace: undefined, external: false })
+  })
+
+  it('navigate() uses current Ref value for href', async () => {
+    navigateToMock.mockClear()
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const to = ref('/about')
+    const link = component.useLink({ to })
+    to.value = '/contact'
+    await link.navigate()
+    expect(navigateToMock).toHaveBeenCalledWith('/contact', { replace: undefined, external: false })
+  })
+
+  it('navigate() respects Ref `replace` prop', async () => {
+    navigateToMock.mockClear()
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const replace = ref(true)
+    const link = component.useLink({ to: '/about', replace })
+    await link.navigate()
+    expect(navigateToMock).toHaveBeenCalledWith('/about', { replace: true, external: false })
+  })
+
+  it('navigate() skips links with a script-capable protocol', async () => {
+    navigateToMock.mockClear()
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const link = component.useLink({ to: 'javascript:alert(1)' })
+    await link.navigate()
+    expect(navigateToMock).not.toHaveBeenCalled()
+  })
+
+  it('applies trailingSlash with Ref `to`', () => {
+    const component = defineNuxtLink({ componentName: 'NuxtLink', trailingSlash: 'append' })
+    const to = ref('/about')
+    const link = component.useLink({ to })
+    expect(link.href.value).toBe('/about/')
+  })
+
+  it('applies Ref `trailingSlash` prop', () => {
+    const component = defineNuxtLink({ componentName: 'NuxtLink' })
+    const trailingSlash = ref<'append' | 'remove'>('append')
+    const link = component.useLink({ to: '/about', trailingSlash })
+    expect(link.to.value).toBe('/about/')
+  })
+})

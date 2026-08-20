@@ -1,0 +1,234 @@
+import { Transition, createStaticVNode, h } from 'vue'
+import type { RendererNode, TransitionProps, VNode } from 'vue'
+import { defu } from 'defu'
+// eslint-disable-next-line
+import { isString, isPromise, isArray, isObject } from '@vue/shared'
+import type { RouteLocationNormalized } from 'vue-router'
+import { renderDiagnostics } from '../diagnostics/render'
+import { MAX_VFOR_LENGTH } from './vfor'
+import type { NuxtApp } from '../nuxt'
+import { START_LOCATION } from '#build/pages'
+import { rawVaporSlotKey } from '#build/nuxt.config.mjs'
+
+/**
+ * Internal utility
+ * @private
+ */
+export const _wrapInTransition = (props: any, children: any): { default: () => VNode | undefined } => {
+  return { default: () => import.meta.client && props ? h(Transition, props === true ? {} : props, children) : children.default?.() }
+}
+
+const ROUTE_KEY_PARENTHESES_RE = /(:\w+)\([^)]+\)/g
+const ROUTE_KEY_SYMBOLS_RE = /(:\w+)[?+*]/g
+const ROUTE_KEY_NORMAL_RE = /:\w+/g
+// TODO: consider refactoring into single utility
+// See https://github.com/nuxt/nuxt/blob/main/packages/nuxt/src/pages/runtime/utils.ts#L8-L19
+function generateRouteKey (route: RouteLocationNormalized) {
+  const source = route?.meta.key ?? route.path
+    .replace(ROUTE_KEY_PARENTHESES_RE, '$1')
+    .replace(ROUTE_KEY_SYMBOLS_RE, '$1')
+    .replace(ROUTE_KEY_NORMAL_RE, r => (route.params as Record<string, unknown>)[r.slice(1)]?.toString() || '')
+  return typeof source === 'function' ? source(route) : source
+}
+
+/**
+ * Utility used within router guards
+ * return true if the route has been changed with a page change during navigation
+ */
+export function isChangingPage (to: RouteLocationNormalized, from: RouteLocationNormalized): boolean {
+  if (to === from || from === START_LOCATION) { return false }
+
+  // If route keys are different then it will result in a rerender
+  if (generateRouteKey(to) !== generateRouteKey(from)) { return true }
+
+  const areComponentsSame = to.matched.every((comp, index) =>
+    comp.components && comp.components.default === from.matched[index]?.components?.default,
+  )
+  if (areComponentsSame) {
+    return false
+  }
+  return true
+}
+
+/**
+ * Detect a vapor slot function passed into a vdom component via interop.
+ *
+ * Vapor slots carry Vue's `rawVaporSlotKey` on the slot function itself, so
+ * they can be recognised without invoking the slot. Calling a vapor slot to
+ * inspect the shape of its returned VNodes is not a safe dry run (its content is
+ * not expressed as a VNode tree), so callers use this to skip VNode-shape
+ * heuristics rather than silently make a wrong decision.
+ */
+export function isVaporSlot (slot: ((...args: any[]) => any) | undefined | null): boolean {
+  return !!rawVaporSlotKey && !!slot && !!(slot as any)[rawVaporSlotKey]
+}
+
+const VALID_TAG_RE = /^[a-z][a-z0-9-]*$/i
+/** Return `tag` if it is a safe HTML tag name, otherwise `fallback`. */
+export function sanitizeTag (tag: string | undefined, fallback: string): string {
+  return tag && VALID_TAG_RE.test(tag) ? tag : fallback
+}
+
+export type SSRBuffer = SSRBufferItem[] & { hasAsync?: boolean }
+export type SSRBufferItem = string | SSRBuffer | Promise<SSRBuffer>
+
+/**
+ * create buffer retrieved from @vue/server-renderer
+ * @see https://github.com/vuejs/core/blob/9617dd4b2abc07a5dc40de6e5b759e851b4d0da1/packages/server-renderer/src/render.ts#L57
+ * @private
+ */
+export function createBuffer (): { getBuffer: () => SSRBuffer, push: (item: SSRBufferItem) => void } {
+  let appendable = false
+  const buffer: SSRBuffer = []
+  return {
+    getBuffer (): SSRBuffer {
+      return buffer
+    },
+    push (item: SSRBufferItem) {
+      const isStringItem = isString(item)
+      if (appendable && isStringItem) {
+        buffer[buffer.length - 1] += item as string
+      } else {
+        buffer.push(item)
+      }
+      appendable = isStringItem
+      if (isPromise(item) || (isArray(item) && item.hasAsync)) {
+        buffer.hasAsync = true
+      }
+    },
+  }
+}
+
+/**
+ * helper for NuxtIsland to generate a correct array for scoped data
+ */
+export function vforToArray (source: any): any[] {
+  if (isArray(source)) {
+    return source
+  } else if (isString(source)) {
+    return source.split('')
+  } else if (typeof source === 'number') {
+    if (import.meta.dev && !Number.isInteger(source)) {
+      renderDiagnostics.NUXT_E4013({ source })
+    }
+    if (import.meta.dev && source > MAX_VFOR_LENGTH) {
+      renderDiagnostics.NUXT_E4017({ source, max: MAX_VFOR_LENGTH })
+    }
+    const length = source > MAX_VFOR_LENGTH ? MAX_VFOR_LENGTH : source
+    const array: number[] = []
+    for (let i = 0; i < length; i++) {
+      // Vue's `v-for` over a number is 1-based
+      array[i] = i + 1
+    }
+    return array
+  } else if (isObject(source)) {
+    if (source[Symbol.iterator as any]) {
+      return Array.from(source as Iterable<any>, item =>
+        item,
+      )
+    } else {
+      const keys = Object.keys(source)
+      const array = new Array(keys.length)
+      for (let i = 0, l = keys.length; i < l; i++) {
+        const key = keys[i]!
+        array[i] = source[key]
+      }
+      return array
+    }
+  }
+  return []
+}
+
+/**
+ * Retrieve the HTML content from an element
+ * Handles `<!--[-->` Fragment elements
+ * @param element the element to retrieve the HTML
+ * @param withoutSlots purge all slots from the HTML string retrieved
+ * @returns {string[]|undefined} An array of string which represent the content of each element. Use `.join('')` to retrieve a component vnode.el HTML
+ */
+export function getFragmentHTML (element: RendererNode | null, withoutSlots = false): string[] | undefined {
+  if (element) {
+    if (element.nodeName === '#comment' && element.nodeValue === '[') {
+      return getFragmentChildren(element, [], withoutSlots)
+    }
+    return [getElementHTML(element, withoutSlots)]
+  }
+}
+
+function getFragmentChildren (element: RendererNode | null, blocks: string[] = [], withoutSlots = false) {
+  let current = element
+  while (current?.nodeName && !isEndFragment(current)) {
+    if (!isStartFragment(current)) {
+      blocks.push(getElementHTML(current, withoutSlots))
+    }
+    current = current.nextSibling
+  }
+  return blocks
+}
+
+const ISLAND_TELEPORT_TARGET_SELECTOR = '[data-island-slot],[data-island-component]'
+
+function getElementHTML (element: RendererNode, withoutSlots: boolean) {
+  if (!withoutSlots || !element.querySelector?.(ISLAND_TELEPORT_TARGET_SELECTOR)) {
+    return element.outerHTML
+  }
+  const template = element.ownerDocument.createElement('template')
+  template.innerHTML = element.outerHTML
+  template.content.querySelectorAll(ISLAND_TELEPORT_TARGET_SELECTOR).forEach((n: Element) => { n.innerHTML = '' })
+  return template.innerHTML
+}
+
+/**
+ * Return a static vnode from an element
+ * Default to a div if the element is not found and if a fallback is not provided
+ * @param el renderer node retrieved from the component internal instance
+ * @param staticNodeFallback fallback string to use if the element is not found. Must be a valid HTML string
+ */
+export function elToStaticVNode (el: RendererNode | null, staticNodeFallback?: string): VNode {
+  const fragment: string[] | undefined = el ? getFragmentHTML(el) : staticNodeFallback ? [staticNodeFallback] : undefined
+  if (fragment) {
+    return createStaticVNode(fragment.join(''), fragment.length)
+  }
+  return h('div')
+}
+
+export function isStartFragment (element: RendererNode): boolean {
+  return element.nodeName === '#comment' && element.nodeValue === '['
+}
+
+export function isEndFragment (element: RendererNode): boolean {
+  return element.nodeName === '#comment' && element.nodeValue === ']'
+}
+
+export function toArray<T> (value: T | T[]): T[] {
+  return Array.isArray(value) ? value : [value]
+}
+
+/**
+ * Internal utility
+ * @private
+ */
+export function _mergeTransitionProps (routeProps: TransitionProps[]): TransitionProps {
+  const _props: TransitionProps[] = []
+  for (const prop of routeProps) {
+    if (!prop) { continue }
+    _props.push({
+      ...prop,
+      onAfterLeave: prop.onAfterLeave ? toArray(prop.onAfterLeave) : undefined,
+      onBeforeLeave: prop.onBeforeLeave ? toArray(prop.onBeforeLeave) : undefined,
+    })
+  }
+  return defu(..._props as [TransitionProps, TransitionProps])
+}
+
+export function _startTransition (nuxtApp: NuxtApp): void {
+  nuxtApp['~transitionPromise'] ||= new Promise((resolve) => {
+    nuxtApp['~transitionFinish'] = resolve
+  })
+}
+
+export function _finishTransition (nuxtApp: NuxtApp): void {
+  nuxtApp['~transitionFinish']?.()
+  delete nuxtApp['~transitionFinish']
+  delete nuxtApp['~transitionPromise']
+}

@@ -1,0 +1,1356 @@
+import type { TestAPI } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import type { RouteLocationNormalizedLoaded } from 'vue-router'
+import { type PagesContextOptions, augmentPages, createPagesContext, dynamicPageMetaCache, getDynamicPageMeta, normalizeRoutes, relativizeToParent, resolveRoutePaths } from '../src/pages/utils.ts'
+import type { RouterViewSlotProps } from '../src/pages/runtime/utils.ts'
+import { generateRouteKey } from '../src/pages/runtime/utils.ts'
+import type { Nuxt, NuxtPage } from 'nuxt/schema'
+import { useNuxt } from '@nuxt/kit'
+import type { InputFile } from 'unrouting'
+import fc from 'fast-check'
+import { joinURL, withoutTrailingSlash } from 'ufo'
+
+const mockNuxt = vi.hoisted(() => ({
+  options: {
+    experimental: {
+      normalizePageNames: false,
+    },
+  },
+}))
+vi.mock('@nuxt/kit', async (original) => {
+  const mod = await original<typeof import('@nuxt/kit')>()
+  return {
+    ...mod,
+    useNuxt: vi.fn(() => mockNuxt),
+  }
+})
+
+vi.mock('knitwork', async (original) => {
+  return {
+    ...(await original<typeof import('knitwork')>()),
+    genArrayFromRaw: (val: any) => val,
+    genSafeVariableName: (..._args: string[]) => {
+      return 'mock'
+    },
+  }
+})
+
+/** `augmentPages`, tied to the mocked nuxt instance the way `augmentAndResolve` ties it to a real one. */
+function augmentForNuxt (pages: NuxtPage[], vfs: Record<string, string>, ctx: Parameters<typeof augmentPages>[2] = {}) {
+  return augmentPages(pages, vfs, { nuxt: mockNuxt as unknown as Nuxt, ...ctx })
+}
+
+function dynamicMetaFor (page: NuxtPage) {
+  return getDynamicPageMeta(page, dynamicPageMetaCache(mockNuxt as unknown as Nuxt))
+}
+
+export function generateRoutesFromFiles (files: InputFile[], options: PagesContextOptions = {}): NuxtPage[] {
+  if (!files.length) { return [] }
+  const ctx = createPagesContext(options)
+  ctx.rebuild(files)
+  return ctx.emit()
+}
+
+describe('pages:generateRoutesFromFiles', () => {
+  const normalizedResults: Record<string, any> = {}
+  const normalizedOverrideMetaResults: Record<string, any> = {}
+
+  const enUSComparator = new Intl.Collator('en-US')
+  // dynamic keys are recorded per file rather than on the page, so surface them for `output`
+  function withDynamicMeta (routes: NuxtPage[]): Array<NuxtPage & { dynamic?: string[] }> {
+    return routes.map((route) => {
+      const dynamic = dynamicMetaFor(route)
+      return {
+        ...route,
+        ...dynamic.size ? { dynamic: [...dynamic] } : {},
+        ...route.children ? { children: withDynamicMeta(route.children) } : {},
+      }
+    })
+  }
+
+  function sortRoutes (routes: NuxtPage[]) {
+    for (const route of routes) {
+      route.children &&= sortRoutes(route.children)
+    }
+    return routes.toSorted((a, b) => enUSComparator.compare(b.path, a.path))
+  }
+
+  // Sort normalized route arrays by their serialized path for order-independent snapshots
+  function sortNormalizedArray (arr: any[]): any[] {
+    return arr.map((item) => {
+      if (item && typeof item === 'object' && item.children) {
+        return { ...item, children: sortNormalizedArray(item.children) }
+      }
+      return item
+    }).sort((a, b) => {
+      const aPath = typeof a === 'string' ? a : JSON.stringify(a)
+      const bPath = typeof b === 'string' ? b : JSON.stringify(b)
+      return enUSComparator.compare(bPath, aPath)
+    })
+  }
+
+  function sortNormalizedResults (results: Record<string, any>) {
+    const sorted: Record<string, any> = {}
+    for (const [key, value] of Object.entries(results)) {
+      sorted[key] = Array.isArray(value) ? sortNormalizedArray(value) : value
+    }
+    return sorted
+  }
+
+  for (const test of pageTests) {
+    const _it = test.it || it
+    _it(test.description, async () => {
+      let result
+      if (test.files) {
+        const vfs = Object.fromEntries(
+          test.files.map(file => [file.path, 'template' in file ? file.template : '']),
+        ) as Record<string, string>
+
+        try {
+          const files = test.files.map(file => ({ path: file.path }))
+
+          result = generateRoutesFromFiles(files, { roots: ['pages/', 'layer/pages/'] }).map((route, index) => {
+            return {
+              ...route,
+              meta: test.files![index]!.meta ?? route.meta,
+            }
+          })
+
+          await augmentForNuxt(result, vfs, { extraExtractionKeys: new Set(['extracted']) })
+        } catch (error: any) {
+          expect(error.message).toEqual(test.error)
+        }
+      } else {
+        result = test.output ?? []
+      }
+
+      if (result) {
+        expect.soft(withDynamicMeta(sortRoutes(result))).toEqual(test.output ? sortRoutes(test.output) : undefined)
+
+        normalizedResults[test.description] = normalizeRoutes(result, new Set(), {
+          clientComponentRuntime: '<client-component-runtime>',
+          serverComponentRuntime: '<server-component-runtime>',
+          overrideMeta: false,
+        }).routes
+
+        normalizedOverrideMetaResults[test.description] = normalizeRoutes(result, new Set(), {
+          clientComponentRuntime: '<client-component-runtime>',
+          serverComponentRuntime: '<server-component-runtime>',
+          overrideMeta: true,
+        }).routes
+      }
+    })
+  }
+
+  it('should consistently normalize routes', async () => {
+    // Sort each test case's routes array for order-independent comparison
+    const sorted = sortNormalizedResults(normalizedResults)
+    await expect(sorted).toMatchFileSnapshot('./__snapshots__/pages-override-meta-disabled.test.ts.snap')
+  })
+
+  describe('pages:normalizePageNames', () => {
+    it('should assign __name via Object.assign for sync imports when normalizePageNames is enabled', () => {
+      vi.mocked(useNuxt).mockReturnValueOnce({
+        options: {
+          // @ts-expect-error partial
+          experimental: { normalizePageNames: true },
+        },
+      })
+
+      const pages: NuxtPage[] = [
+        {
+          file: '/pages/sync.vue',
+          name: 'sync',
+          path: '/sync',
+          _sync: true,
+        } as unknown as NuxtPage,
+      ]
+
+      const { routes } = normalizeRoutes(pages, new Set(), {
+        clientComponentRuntime: '<client>',
+        serverComponentRuntime: '<server>',
+      })
+
+      const r0: any = (routes as any)[0]
+      expect(r0.component).toContain('Object.assign(')
+      expect(r0.component).toContain('__name')
+    })
+
+    it('should append then(...Object.assign(m.default, { __name })) for async imports when normalizePageNames is enabled', () => {
+      vi.mocked(useNuxt).mockReturnValueOnce({
+        options: {
+          // @ts-expect-error partial
+          experimental: { normalizePageNames: true },
+        },
+      })
+
+      const pages: NuxtPage[] = [
+        {
+          file: '/pages/async.vue',
+          name: 'async',
+          path: '/async',
+        } as unknown as NuxtPage,
+      ]
+
+      const { routes } = normalizeRoutes(pages, new Set(), {
+        clientComponentRuntime: '<client>',
+        serverComponentRuntime: '<server>',
+      })
+
+      const r0: any = (routes as any)[0]
+      expect(r0.component).toContain('.then((m) => Object.assign(m.default')
+      expect(r0.component).toContain('__name')
+    })
+
+    it('should use createIslandPage without __name for server mode pages', () => {
+      vi.mocked(useNuxt).mockReturnValueOnce({
+        options: {
+          // @ts-expect-error partial
+          experimental: { normalizePageNames: true },
+        },
+      })
+
+      const pages: NuxtPage[] = [
+        {
+          file: '/pages/server.vue',
+          name: 'server-page',
+          path: '/server',
+          mode: 'server',
+        } as unknown as NuxtPage,
+      ]
+
+      const { routes } = normalizeRoutes(pages, new Set(), {
+        clientComponentRuntime: '<client>',
+        serverComponentRuntime: '<server>',
+      })
+
+      const r0: any = (routes as any)[0]
+      expect(r0.component).toContain('createIslandPage(')
+      expect(r0.component).not.toContain('__name')
+      expect(r0.component).not.toContain('.then')
+    })
+
+    it('should assign __name to the resolved component for client mode pages', () => {
+      vi.mocked(useNuxt).mockReturnValueOnce({
+        options: {
+          // @ts-expect-error partial
+          experimental: { normalizePageNames: true },
+        },
+      })
+
+      const pages: NuxtPage[] = [
+        {
+          file: '/pages/client.vue',
+          name: 'client-page',
+          path: '/client',
+          mode: 'client',
+        } as unknown as NuxtPage,
+      ]
+
+      const { routes } = normalizeRoutes(pages, new Set(), {
+        clientComponentRuntime: '<client>',
+        serverComponentRuntime: '<server>',
+      })
+
+      const r0: any = (routes as any)[0]
+      expect(r0.component).toContain('createClientPage(')
+      expect(r0.component).toContain('.then((c) => Object.assign(c,')
+      expect(r0.component).toContain('__name')
+      expect(r0.component).not.toContain('m.default')
+    })
+  })
+
+  describe('pages:namedViews', () => {
+    it('emits a `components` map alongside `component` when the scanner reports named views', () => {
+      const pages: NuxtPage[] = [
+        {
+          name: 'foo-bar',
+          path: 'bar',
+          file: '/pages/foo/bar.vue',
+          components: {
+            default: '/pages/foo/bar.vue',
+            left: '/pages/foo/bar@left.vue',
+          },
+        } as unknown as NuxtPage,
+      ]
+
+      const { routes } = normalizeRoutes(pages, new Set(), {
+        clientComponentRuntime: '<client>',
+        serverComponentRuntime: '<server>',
+        overrideMeta: false,
+      })
+
+      const r0: any = (routes as any)[0]
+      expect(r0.component).toBeTruthy()
+      expect(r0.components).toBeTruthy()
+      expect(r0.components).toContain('default:')
+      expect(r0.components).toContain('"left":')
+      expect(r0.components).toContain('/pages/foo/bar@left.vue')
+    })
+
+    it('does not emit `components` when only the default view is present', () => {
+      const pages: NuxtPage[] = [
+        {
+          name: 'foo-bar',
+          path: 'bar',
+          file: '/pages/foo/bar.vue',
+          components: {
+            default: '/pages/foo/bar.vue',
+          },
+        } as unknown as NuxtPage,
+      ]
+
+      const { routes } = normalizeRoutes(pages, new Set(), {
+        clientComponentRuntime: '<client>',
+        serverComponentRuntime: '<server>',
+        overrideMeta: false,
+      })
+
+      const r0: any = (routes as any)[0]
+      expect(r0.component).toBeTruthy()
+      expect(r0.components).toBeUndefined()
+    })
+  })
+
+  it('should consistently normalize routes when overriding meta', async () => {
+    const sorted = sortNormalizedResults(normalizedOverrideMetaResults)
+    await expect(sorted).toMatchFileSnapshot('./__snapshots__/pages-override-meta-enabled.test.ts.snap')
+  })
+})
+
+describe('pages:generateRouteKey', () => {
+  const defaultComponent = { type: {} }
+  const getRouteProps = (matchedRoute = {}) => ({
+    Component: defaultComponent,
+    route: {
+      meta: { key: 'route-meta-key' },
+      params: {
+        id: 'foo',
+        optional: 'bar',
+        array: ['a', 'b'],
+      },
+      matched: [
+        {
+          components: { default: {} },
+          meta: { key: 'other-meta-key' },
+        },
+        {
+          components: { default: defaultComponent.type },
+          meta: { key: 'matched-meta-key' },
+          ...matchedRoute,
+        },
+      ],
+    },
+  } as unknown as RouterViewSlotProps)
+
+  const tests: Array<{
+    description: string
+    route: RouterViewSlotProps
+    override?: string | ((route: RouteLocationNormalizedLoaded) => string)
+    output?: string | false
+    it?: TestAPI
+  }> = [
+    { description: 'should use a string override as the key', override: 'key', route: getRouteProps(), output: 'key' },
+    { description: 'should use the result of a function override as the key', override: route => route.meta.key as string, route: getRouteProps(), output: 'route-meta-key' },
+    {
+      description: 'should return `false` for a `false` override',
+      // @ts-expect-error testing behaviour with invalid prop
+      override: false,
+      route: getRouteProps(),
+      output: false,
+    },
+    {
+      description: 'should key an unkeyed dynamic route by its param value',
+      route: getRouteProps({
+        path: '/test/:id',
+        meta: {},
+      }),
+      output: '/test/foo',
+    },
+    {
+      description: 'should key an unkeyed dynamic route with a custom matcher by its param value',
+      route: getRouteProps({
+        path: '/test/:id(\\d+)',
+        meta: {},
+      }),
+      output: '/test/foo',
+    },
+    {
+      description: 'should key an optional param by its value',
+      route: getRouteProps({
+        path: '/test/:optional?',
+        meta: {},
+      }),
+      output: '/test/bar',
+    },
+    {
+      description: 'should key an optional param with a custom matcher by its value',
+      route: getRouteProps({
+        path: '/test/:optional(\\d+)?',
+        meta: {},
+      }),
+      output: '/test/bar',
+    },
+    {
+      description: 'should key an unmatched optional param as an empty segment',
+      route: getRouteProps({
+        path: '/test/:undefined(\\d+)?',
+        meta: {},
+      }),
+      output: '/test/',
+    },
+    {
+      description: 'should join the values of a one-or-more repeatable param',
+      route: getRouteProps({
+        path: '/:array+',
+        meta: {},
+      }),
+      output: '/a,b',
+    },
+    {
+      description: 'should join the values of a zero-or-more repeatable param',
+      route: getRouteProps({
+        path: '/test/:array*',
+        meta: {},
+      }),
+      output: '/test/a,b',
+    },
+    {
+      description: 'should key an unmatched zero-or-more repeatable param as an empty segment',
+      route: getRouteProps({
+        path: '/test/:other*',
+        meta: {},
+      }),
+      output: '/test/',
+    },
+  ]
+
+  for (const test of tests) {
+    const _it = test.it || it
+    _it(test.description, () => {
+      expect(generateRouteKey(test.route, test.override)).to.deep.equal(test.output)
+    })
+  }
+})
+
+describe('pages:relativizeToParent', () => {
+  const tests: Array<[parentFullPath: string, childPath: string, expected: string | undefined]> = [
+    ['/parent', '/parent/child', 'child'],
+    ['/parent/:id()', '/parent/:id/child', 'child'],
+    ['/parent/:id', '/parent/:id()/child', 'child'],
+    ['/parent/:id()+', '/parent/:id+/child', 'child'],
+    ['/parent/:id(\\d+)', '/parent/:id(\\d+)/child', 'child'],
+    ['/parent/:id()', '/parent/:id()/:childId?/child', ':childId?/child'],
+    ['/parent', 'relative/child', 'relative/child'],
+    ['/', '/child', 'child'],
+    ['/parent/:id()', '/parent/:id(\\d+)/child', undefined],
+    ['/parent', '/detached', undefined],
+    ['/parent', '/parent-sibling/child', undefined],
+    ['/parent/:id()', '/parent', undefined],
+  ]
+  it.each(tests)('should relativize %s + %s to %s', (parentFullPath, childPath, expected) => {
+    expect(relativizeToParent(parentFullPath, childPath)).toBe(expected)
+  })
+
+  const segment = fc.constantFrom(
+    'a', 'b', 'foo', 'foo-bar', 'foobar', '测试', '%E6%B5%8B', 'a.b', '(group)',
+    ':id', ':id()', ':id?', ':id+', ':id*', ':id(\\d+)', ':slug()', ':slug?', ':pathMatch(.*)*',
+  )
+  const routePath = fc.array(segment, { maxLength: 4 }).map(segments => '/' + segments.join('/'))
+  const parentPath = fc.oneof(routePath, routePath.map(path => path === '/' ? path : path + '/'))
+  const canonicalize = (path: string) => withoutTrailingSlash(path.replace(/:(\w+)\(\)([+*?]?)/g, ':$1$2')) || '/'
+  const splitSegments = (path: string) => {
+    const segments = canonicalize(path).split('/')
+    return segments.at(-1) === '' ? segments.slice(0, -1) : segments
+  }
+
+  it('should return a remainder that rejoins with the parent to give the child path', () => {
+    fc.assert(fc.property(parentPath, routePath, (parentFullPath, childPath) => {
+      const remainder = relativizeToParent(parentFullPath, childPath)
+      fc.pre(remainder !== undefined)
+      expect(canonicalize(joinURL(parentFullPath, remainder!))).toBe(canonicalize(childPath))
+    }), { numRuns: 1000 })
+  })
+
+  it('should always relativize a child path that extends the parent path', () => {
+    fc.assert(fc.property(parentPath, fc.array(segment, { minLength: 1, maxLength: 3 }), (parentFullPath, extraSegments) => {
+      const childPath = joinURL(parentFullPath, extraSegments.join('/'))
+      expect(relativizeToParent(parentFullPath, childPath)).toBe(extraSegments.join('/'))
+    }), { numRuns: 1000 })
+  })
+
+  it('should only return undefined for a child path detached from the parent', () => {
+    fc.assert(fc.property(parentPath, routePath, (parentFullPath, childPath) => {
+      const parentSegments = splitSegments(parentFullPath)
+      const childSegments = splitSegments(childPath)
+      const extendsParent = parentSegments.every((segment, index) => segment === childSegments[index])
+      expect(relativizeToParent(parentFullPath, childPath) !== undefined).toBe(extendsParent)
+    }), { numRuns: 1000 })
+  })
+
+  it('should resolve every route path in a page tree to a normalized absolute path', () => {
+    const page: fc.Arbitrary<NuxtPage> = fc.letrec<{ page: NuxtPage }>(tie => ({
+      page: fc.record({
+        path: fc.oneof(segment, segment.map(s => '/' + s)),
+        children: fc.oneof(fc.constant(undefined), fc.array(tie('page'), { maxLength: 2 })),
+      }),
+    })).page
+    fc.assert(fc.property(page, (page) => {
+      for (const path of resolveRoutePaths(page)) {
+        expect(path.startsWith('/')).toBe(true)
+        expect(path).not.toContain('//')
+      }
+    }), { numRuns: 1000 })
+  })
+})
+
+describe('page:extends', () => {
+  it('should preserve distinct metadata for multiple routes referencing the same file', async () => {
+    const files: NuxtPage[] = [
+      { path: 'home', file: `pages/index.vue` },
+      { path: 'home1', file: `pages/index.vue`, meta: { test: true } },
+      { path: 'home2', file: `pages/index.vue`, meta: { snap: true } },
+    ]
+    const vfs = Object.fromEntries(
+      files.map(file => [file.file, `
+            <script setup lang="ts">
+            definePageMeta({
+              hello: 'world'
+            })
+            </script>
+          `]),
+    ) as Record<string, string>
+    await augmentForNuxt(files, vfs)
+    expect(files).toEqual([
+      {
+        path: 'home',
+        file: `pages/index.vue`,
+      },
+      {
+        path: 'home1',
+        file: `pages/index.vue`,
+        meta: { test: true },
+      },
+      {
+        path: 'home2',
+        file: `pages/index.vue`,
+        meta: { snap: true },
+      },
+    ])
+    for (const file of files) {
+      expect(dynamicMetaFor(file)).toEqual(new Set(['meta']))
+    }
+  })
+
+  it('keeps an explicit route name/path when reusing a file with a `definePageMeta` name (#27358)', async () => {
+    const files: NuxtPage[] = [
+      { path: '/test', file: 'pages/test.vue' },
+      { path: '/testExtend', name: 'testExtend', file: 'pages/test.vue' },
+    ]
+    const vfs: Record<string, string> = {
+      'pages/test.vue': `
+        <script setup lang="ts">
+        definePageMeta({ name: 'test' })
+        </script>
+      `,
+    }
+    await augmentForNuxt(files, vfs)
+    // first route takes the file's name; the second keeps its own, else both are `test` -> dropped
+    expect(files[0]!.name).toBe('test')
+    expect(files[1]!.name).toBe('testExtend')
+    expect(files[1]!.path).toBe('/testExtend')
+  })
+})
+
+const pagesDir = 'pages'
+const layerDir = 'layer/pages'
+export const pageTests: Array<{
+  description: string
+  files?: Array<{ path: string, template?: string, meta?: Record<string, any> }>
+  output?: Array<NuxtPage & { dynamic?: string[] }>
+  it?: TestAPI
+  normalized?: Record<string, any>[]
+  error?: string
+}> = [
+  {
+    description: 'should generate correct routes for index pages',
+    files: [
+      { path: `${pagesDir}/index.vue` },
+      { path: `${pagesDir}/parent/index.vue` },
+      { path: `${pagesDir}/parent/child/index.vue` },
+    ],
+    output: [
+      {
+        name: 'index',
+        path: '/',
+        file: `${pagesDir}/index.vue`,
+        children: [],
+      },
+      {
+        name: 'parent',
+        path: '/parent',
+        file: `${pagesDir}/parent/index.vue`,
+        children: [],
+      },
+      {
+        name: 'parent-child',
+        path: '/parent/child',
+        file: `${pagesDir}/parent/child/index.vue`,
+        children: [],
+      },
+    ],
+  },
+  {
+    description: 'should generate correct routes for parent/child',
+    files: [
+      { path: `${pagesDir}/parent.vue` },
+      { path: `${pagesDir}/parent/child.vue` },
+    ],
+    output: [
+      {
+        name: 'parent',
+        path: '/parent',
+        file: `${pagesDir}/parent.vue`,
+        children: [
+          {
+            name: 'parent-child',
+            path: 'child',
+            file: `${pagesDir}/parent/child.vue`,
+            children: [],
+          },
+        ],
+      },
+    ],
+  },
+  {
+    description: 'should not generate colliding route names when hyphens are in file name',
+    files: [
+      { path: `${pagesDir}/parent/[child].vue` },
+      { path: `${pagesDir}/parent-[child].vue` },
+    ],
+    output: [
+      {
+        name: 'parent-child',
+        path: '/parent/:child()',
+        file: `${pagesDir}/parent/[child].vue`,
+        children: [],
+      },
+      {
+        name: 'parent-child',
+        path: '/parent-:child()',
+        file: `${pagesDir}/parent-[child].vue`,
+        children: [],
+      },
+    ],
+  },
+  {
+    description: 'should generate correct id for catchall (order 1)',
+    files: [
+      { path: `${pagesDir}/[...stories].vue` },
+      { path: `${pagesDir}/stories/[id].vue` },
+    ],
+    output: [
+      {
+        name: 'stories',
+        path: '/:stories(.*)*',
+        file: `${pagesDir}/[...stories].vue`,
+        children: [],
+      },
+      {
+        name: 'stories-id',
+        path: '/stories/:id()',
+        file: `${pagesDir}/stories/[id].vue`,
+        children: [],
+      },
+    ],
+  },
+  {
+    description: 'should generate correct id for catchall (order 2)',
+    files: [
+      { path: `${pagesDir}/stories/[id].vue` },
+      { path: `${pagesDir}/[...stories].vue` },
+    ],
+    output: [
+      {
+        name: 'stories-id',
+        path: '/stories/:id()',
+        file: `${pagesDir}/stories/[id].vue`,
+        children: [],
+      },
+      {
+        name: 'stories',
+        path: '/:stories(.*)*',
+        file: `${pagesDir}/[...stories].vue`,
+        children: [],
+      },
+    ],
+  },
+  {
+    description: 'should generate correct route for snake_case file',
+    files: [
+      { path: `${pagesDir}/snake_case.vue` },
+    ],
+    output: [
+      {
+        name: 'snake_case',
+        path: '/snake_case',
+        file: `${pagesDir}/snake_case.vue`,
+        children: [],
+      },
+    ],
+  },
+  {
+    description: 'should generate correct route for kebab-case file',
+    files: [{ path: `${pagesDir}/kebab-case.vue` }],
+    output: [
+      {
+        name: 'kebab-case',
+        path: '/kebab-case',
+        file: `${pagesDir}/kebab-case.vue`,
+        children: [],
+      },
+    ],
+  },
+  {
+    description: 'should generate correct dynamic routes',
+    files: [
+      { path: `${pagesDir}/index.vue` },
+      { path: `${pagesDir}/[slug].vue` },
+      { path: `${pagesDir}/[[foo]]` },
+      { path: `${pagesDir}/[[foo]]/index.vue` },
+      { path: `${pagesDir}/optional/[[opt]].vue` },
+      { path: `${pagesDir}/optional/prefix-[[opt]].vue` },
+      { path: `${pagesDir}/optional/[[opt]]-postfix.vue` },
+      { path: `${pagesDir}/optional/prefix-[[opt]]-postfix.vue` },
+      { path: `${pagesDir}/[bar]/index.vue` },
+      { path: `${pagesDir}/nonopt/[slug].vue` },
+      { path: `${pagesDir}/opt/[[slug]].vue` },
+      { path: `${pagesDir}/[[sub]]/route-[slug].vue` },
+    ],
+    output: [
+      {
+        children: [
+          {
+
+            name: 'foo',
+            path: '',
+            file: `${pagesDir}/[[foo]]/index.vue`,
+            children: [],
+          },
+        ],
+        file: `${pagesDir}/[[foo]]`,
+        path: '/:foo?',
+      },
+      {
+        name: 'index',
+        path: '/',
+        file: `${pagesDir}/index.vue`,
+        children: [],
+      },
+      {
+        children: [],
+        name: 'slug',
+        file: `${pagesDir}/[slug].vue`,
+        path: '/:slug()',
+      },
+      {
+        children: [],
+        name: 'bar',
+        file: `${pagesDir}/[bar]/index.vue`,
+        path: '/:bar()',
+      },
+      {
+        name: 'opt-slug',
+        path: '/opt/:slug?',
+        file: `${pagesDir}/opt/[[slug]].vue`,
+        children: [],
+      },
+      {
+        name: 'nonopt-slug',
+        path: '/nonopt/:slug()',
+        file: `${pagesDir}/nonopt/[slug].vue`,
+        children: [],
+      },
+      {
+        children: [],
+        path: '/optional/:opt?',
+        name: 'optional-opt',
+        file: `${pagesDir}/optional/[[opt]].vue`,
+      },
+      {
+        name: 'sub-route-slug',
+        path: '/:sub?/route-:slug()',
+        file: `${pagesDir}/[[sub]]/route-[slug].vue`,
+        children: [],
+      },
+      {
+        children: [],
+        path: '/optional/prefix-:opt?',
+        name: 'optional-prefix-opt',
+        file: `${pagesDir}/optional/prefix-[[opt]].vue`,
+      },
+
+      {
+        children: [],
+        path: '/optional/:opt?-postfix',
+        name: 'optional-opt-postfix',
+        file: `${pagesDir}/optional/[[opt]]-postfix.vue`,
+      },
+      {
+        children: [],
+        path: '/optional/prefix-:opt?-postfix',
+        name: 'optional-prefix-opt-postfix',
+        file: `${pagesDir}/optional/prefix-[[opt]]-postfix.vue`,
+      },
+    ],
+  },
+  {
+    description: 'should generate correct catch-all route',
+    files: [{ path: `${pagesDir}/[...slug].vue` }, { path: `${pagesDir}/index.vue` }, { path: `${pagesDir}/[...slug]/[id].vue` }],
+    output: [
+      {
+        name: 'index',
+        path: '/',
+        file: `${pagesDir}/index.vue`,
+        children: [],
+      },
+      {
+        name: 'slug',
+        path: '/:slug(.*)*',
+        file: `${pagesDir}/[...slug].vue`,
+        children: [
+          {
+            name: 'slug-id',
+            path: ':id()',
+            file: `${pagesDir}/[...slug]/[id].vue`,
+            children: [],
+          }],
+      },
+    ],
+  },
+  {
+    description: 'should throw unfinished param error for dynamic route',
+    files: [{ path: `${pagesDir}/[slug.vue` }],
+    error: 'Unfinished param "slug"',
+  },
+  {
+    description: 'should throw empty param error for dynamic route',
+    files: [
+      { path: `${pagesDir}/[].vue` },
+    ],
+    error: 'Empty param',
+  },
+  {
+    description: 'should only allow "_" & "." as special character for dynamic route',
+    files: [
+      { path: `${pagesDir}/[a1_1a].vue` },
+      { path: `${pagesDir}/[b2.2b].vue` },
+      { path: `${pagesDir}/[b2]_[2b].vue` },
+      { path: `${pagesDir}/[[c3@3c]].vue` },
+      { path: `${pagesDir}/[[d4-4d]].vue` },
+    ],
+    output: [
+      {
+        name: 'a1_1a',
+        path: '/:a1_1a()',
+        file: `${pagesDir}/[a1_1a].vue`,
+        children: [],
+      },
+      {
+        name: 'b2.2b',
+        path: '/:b2.2b()',
+        file: `${pagesDir}/[b2.2b].vue`,
+        children: [],
+      },
+      {
+        name: 'b2_2b',
+        path: '/:b2()_:2b()',
+        file: `${pagesDir}/[b2]_[2b].vue`,
+        children: [],
+      },
+      {
+        name: 'c33c',
+        path: '/:c33c?',
+        file: `${pagesDir}/[[c3@3c]].vue`,
+        children: [],
+      },
+      {
+        name: 'd44d',
+        path: '/:d44d?',
+        file: `${pagesDir}/[[d4-4d]].vue`,
+        children: [],
+      },
+    ],
+  },
+  {
+    description: 'should properly override route name if definePageMeta name override is defined.',
+    files: [
+      {
+        path: `${pagesDir}/index.vue`,
+        template: `
+            <script setup lang="ts">
+            definePageMeta({
+              name: 'home'
+            })
+            </script>
+          `,
+      },
+    ],
+    output: [
+      {
+        name: 'home',
+        path: '/',
+        file: `${pagesDir}/index.vue`,
+        children: [],
+      },
+    ],
+  },
+  {
+    description: 'should allow pages with `:` in their path',
+    files: [
+      { path: `${pagesDir}/test:name.vue` },
+    ],
+    output: [
+      {
+        name: 'test:name',
+        path: '/test\\:name',
+        file: `${pagesDir}/test:name.vue`,
+        children: [],
+      },
+    ],
+  },
+  {
+    description: 'should handle unicode and special characters in page paths',
+    files: [
+      { path: `${pagesDir}/测试.vue` },
+      { path: `${pagesDir}/文档.vue` },
+      { path: `${pagesDir}/文档/介绍.vue` },
+      { path: `${pagesDir}/خاص:جديد.vue` },
+    ],
+    output: [
+      { name: '测试', path: `/${encodeURIComponent('测试')}`, file: `${pagesDir}/测试.vue`, children: [] },
+      { name: '文档', path: `/${encodeURIComponent('文档')}`, file: `${pagesDir}/文档.vue`, children: [
+        { name: '文档-介绍', path: encodeURIComponent('介绍'), file: `${pagesDir}/文档/介绍.vue`, children: [] },
+      ] },
+      { name: 'خاص:جديد', path: `/${encodeURIComponent('خاص')}\\:${encodeURIComponent('جديد')}`, file: `${pagesDir}/خاص:جديد.vue`, children: [] },
+    ],
+  },
+  {
+    description: 'should escape special chars in static paths',
+    files: [
+      { path: `${pagesDir}/a&b.vue` },
+      { path: `${pagesDir}/a\\b.vue` },
+    ],
+    output: [
+      { name: 'a&b', path: '/a&b', file: `${pagesDir}/a&b.vue`, children: [] },
+      { name: 'a\\b', path: `/a${encodeURIComponent('\\')}b`, file: `${pagesDir}/a\\b.vue`, children: [] },
+    ],
+  },
+  {
+    description: 'should not merge required param as a child of optional param',
+    files: [
+      { path: `${pagesDir}/[[foo]].vue` },
+      { path: `${pagesDir}/[foo].vue` },
+    ],
+    output: [
+      {
+        name: 'foo',
+        path: '/:foo()',
+        file: `${pagesDir}/[foo].vue`,
+        children: [],
+      },
+      {
+        name: 'foo',
+        path: '/:foo?',
+        file: `${pagesDir}/[[foo]].vue`,
+        children: [
+        ],
+      },
+    ],
+  },
+  {
+    description: 'should correctly merge nested routes',
+    files: [
+      { path: `${pagesDir}/param.vue` },
+      { path: `${layerDir}/param/index.vue` },
+      { path: `${pagesDir}/param/index/index.vue` },
+      { path: `${layerDir}/param/index/sibling.vue` },
+      { path: `${pagesDir}/wrapper-expose/other.vue` },
+      { path: `${layerDir}/wrapper-expose/other/index.vue` },
+      { path: `${pagesDir}/wrapper-expose/other/sibling.vue` },
+      { path: `${pagesDir}/param/sibling.vue` },
+    ],
+    output: [
+      {
+        children: [
+          {
+            children: [
+              {
+                children: [],
+                file: `${pagesDir}/param/index/index.vue`,
+                name: 'param-index',
+                path: '',
+              },
+              {
+                children: [],
+                file: `${layerDir}/param/index/sibling.vue`,
+                name: 'param-index-sibling',
+                path: 'sibling',
+              },
+            ],
+            file: `${layerDir}/param/index.vue`,
+            path: '',
+          },
+          {
+            children: [],
+            file: `${pagesDir}/param/sibling.vue`,
+            name: 'param-sibling',
+            path: 'sibling',
+          },
+        ],
+        file: `${pagesDir}/param.vue`,
+        path: '/param',
+      },
+      {
+        children: [
+          {
+            children: [],
+            file: `${layerDir}/wrapper-expose/other/index.vue`,
+            name: 'wrapper-expose-other',
+            path: '',
+          },
+          {
+            children: [],
+            file: `${pagesDir}/wrapper-expose/other/sibling.vue`,
+            name: 'wrapper-expose-other-sibling',
+            path: 'sibling',
+          },
+        ],
+        file: `${pagesDir}/wrapper-expose/other.vue`,
+        path: '/wrapper-expose/other',
+      },
+    ],
+  },
+  {
+    description: 'should handle trailing slashes with index routes',
+    files: [
+      { path: `${pagesDir}/index/index.vue` },
+      { path: `${pagesDir}/index/index/all.vue` },
+    ],
+    output: [
+      {
+        children: [
+          {
+            children: [],
+            file: `${pagesDir}/index/index/all.vue`,
+            name: 'index-index-all',
+            path: 'all',
+          },
+        ],
+        file: `${pagesDir}/index/index.vue`,
+        name: 'index',
+        path: '/',
+      },
+    ],
+  },
+  {
+    description: 'should generate correct routes for nested pages',
+    files: [
+      { path: `${pagesDir}/page1/index.vue` },
+      { path: `${pagesDir}/page1/[id].vue` },
+      { path: `${pagesDir}/page1.vue` },
+    ],
+    output: [
+      {
+        children: [
+          {
+            children: [],
+            file: `${pagesDir}/page1/[id].vue`,
+            name: 'page1-id',
+            path: ':id()',
+          },
+          {
+            children: [],
+            file: `${pagesDir}/page1/index.vue`,
+            name: 'page1',
+            path: '',
+          },
+        ],
+        file: `${pagesDir}/page1.vue`,
+        path: '/page1',
+      },
+    ],
+  },
+  {
+    description: 'should use fallbacks when normalized with `overrideMeta: true`',
+    files: [
+      {
+        path: `${pagesDir}/index.vue`,
+        template: `
+            <script setup lang="ts">
+            const routeName = ref('home')
+            const routeAliases = ref(['sweet-home'])
+            definePageMeta({
+              name: routeName.value,
+              alias: routeAliases.value,
+              hello: 'world',
+              redirect: () => '/'
+            })
+            </script>
+          `,
+      },
+    ],
+    output: [
+      {
+        name: 'index',
+        path: '/',
+        file: `${pagesDir}/index.vue`,
+        dynamic: ['name', 'alias', 'redirect', 'meta'],
+        children: [],
+      },
+    ],
+  },
+  {
+    description: 'should extract serializable values and override fallback when normalized with `overrideMeta: true`',
+    files: [
+      {
+        path: `${pagesDir}/index.vue`,
+        template: `
+            <script setup lang="ts">
+            definePageMeta({
+              name: 'home',
+              alias: ['sweet-home'],
+              redirect: '/',
+              hello: 'world'
+            })
+            </script>
+          `,
+      },
+    ],
+    output: [
+      {
+        name: 'home',
+        path: '/',
+        file: `${pagesDir}/index.vue`,
+        alias: ['sweet-home'],
+        redirect: '/',
+        children: [],
+        dynamic: ['meta'],
+      },
+    ],
+  },
+  {
+    description: 'should handle unicode characters in alias paths',
+    files: [
+      {
+        path: `${pagesDir}/products.vue`,
+        template: `
+            <script setup lang="ts">
+            definePageMeta({
+              alias: ['/товары', '/produits', '/製品']
+            })
+            </script>
+          `,
+      },
+    ],
+    output: [
+      {
+        name: 'products',
+        path: '/products',
+        file: `${pagesDir}/products.vue`,
+        alias: ['/товары', '/produits', '/製品'],
+        children: [],
+      },
+    ],
+  },
+  {
+    description: 'route without file',
+    output: [
+      {
+        name: 'home',
+        path: '/',
+        alias: ['sweet-home'],
+        meta: { hello: 'world' },
+      },
+    ],
+  },
+  {
+    description: 'pushed route, skips generation from file',
+    output: [
+      {
+        name: 'pushed-route',
+        path: '/',
+        alias: ['pushed-route-alias'],
+        meta: { someMetaData: true },
+        file: `${pagesDir}/route-file.vue`,
+      },
+    ],
+  },
+  {
+    description: 'route.meta generated from file',
+    files: [
+      {
+        path: `${pagesDir}/page-with-meta.vue`,
+        meta: {
+          test: 1,
+        },
+      },
+    ],
+    output: [
+      {
+        name: 'page-with-meta',
+        path: '/page-with-meta',
+        file: `${pagesDir}/page-with-meta.vue`,
+        children: [],
+        meta: { test: 1 },
+      },
+    ],
+  },
+  {
+    description: 'should use more performant regexp when catchall is used in middle of path',
+    files: [
+      {
+        path: `${pagesDir}/[...id]/suffix.vue`,
+      },
+      {
+        path: `${pagesDir}/[...id]/index.vue`,
+      },
+    ],
+    output: [
+      {
+        name: 'id',
+        meta: undefined,
+        path: '/:id(.*)*',
+        file: `${pagesDir}/[...id]/index.vue`,
+        children: [],
+      },
+      {
+        name: 'id-suffix',
+        meta: undefined,
+        path: '/:id([^/]*)*/suffix',
+        file: `${pagesDir}/[...id]/suffix.vue`,
+        children: [],
+      },
+    ],
+  },
+  {
+    description: 'should merge route.meta with meta from file',
+    files: [
+      {
+        path: `${pagesDir}/page-with-meta.vue`,
+        meta: {
+          test: 1,
+          extracted: { foo: 'foo' },
+        },
+        template: `
+            <script setup lang="ts">
+            definePageMeta({
+              hello: 'world',
+              extracted: { bar: 'bar' },
+            })
+            </script>
+          `,
+      },
+    ],
+    output: [
+      {
+        name: 'page-with-meta',
+        path: '/page-with-meta',
+        file: `${pagesDir}/page-with-meta.vue`,
+        children: [],
+        meta: { test: 1, extracted: { foo: 'foo', bar: 'bar' } },
+        dynamic: ['meta'],
+      },
+    ],
+  },
+  {
+    description: 'route.meta props generate by file',
+    files: [
+      {
+        path: `${pagesDir}/page-with-props.vue`,
+        template: `
+            <script setup lang="ts">
+            definePageMeta({
+              props: true
+            })
+            </script>
+          `,
+      },
+    ],
+    output: [
+      {
+        name: 'page-with-props',
+        path: '/page-with-props',
+        file: `${pagesDir}/page-with-props.vue`,
+        children: [],
+        props: true,
+      },
+    ],
+  },
+  {
+    description: 'should handle route groups',
+    files: [
+      { path: `${pagesDir}/(foo)/index.vue` },
+      { path: `${pagesDir}/(foo)/about.vue` },
+      { path: `${pagesDir}/(bar)/about/index.vue` },
+      { path: `${pagesDir}/(bar)/about/(foo)/index.vue` },
+    ],
+    output: [
+      {
+        name: 'index',
+        path: '/',
+        file: `${pagesDir}/(foo)/index.vue`,
+        meta: { groups: ['foo'] },
+        children: [],
+      },
+      {
+        path: '/about',
+        file: `${pagesDir}/(foo)/about.vue`,
+        meta: { groups: ['foo'] },
+        children: [
+          {
+            path: '',
+            file: `${pagesDir}/(bar)/about/index.vue`,
+            meta: { groups: ['bar'] },
+            children: [
+              {
+                name: 'about',
+                path: '',
+                file: `${pagesDir}/(bar)/about/(foo)/index.vue`,
+                meta: { groups: ['bar', 'foo'] },
+                children: [],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+  {
+    description: 'should preserve named views from the `name@view.vue` filename convention',
+    files: [
+      { path: `${pagesDir}/foo.vue` },
+      { path: `${pagesDir}/foo/bar.vue` },
+      { path: `${pagesDir}/foo/bar@left.vue` },
+    ],
+    output: [
+      {
+        name: 'foo',
+        path: '/foo',
+        file: `${pagesDir}/foo.vue`,
+        children: [
+          {
+            name: 'foo-bar',
+            path: 'bar',
+            file: `${pagesDir}/foo/bar.vue`,
+            children: [],
+            components: {
+              default: `${pagesDir}/foo/bar.vue`,
+              left: `${pagesDir}/foo/bar@left.vue`,
+            },
+          },
+        ],
+      },
+    ],
+  },
+]

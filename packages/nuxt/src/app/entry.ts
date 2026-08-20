@@ -1,0 +1,119 @@
+import { createApp, createSSRApp, nextTick } from 'vue'
+import type { App } from 'vue'
+
+import '#build/fetch'
+import '#build/global-polyfills.mjs'
+
+import { applyPlugins, createNuxtApp } from './nuxt'
+import type { CreateOptions, NuxtSSRContext } from './nuxt'
+
+import { createError, createErrorFromThrown } from './composables/error'
+import { appDiagnostics } from './diagnostics/core'
+
+import '#build/css'
+import plugins from '#build/plugins'
+import RootComponent from '#build/root-component.mjs'
+import { appId, appSpaLoaderAttrs, multiApp, spaLoadingTemplateOutside, vueAppRootContainer } from '#build/nuxt.config.mjs'
+
+export type Entry = (ssrContext?: NuxtSSRContext) => Promise<App<Element>>
+
+declare const __VUE_OPTIONS_API__: boolean
+
+let entry: Entry
+
+if (import.meta.server) {
+  const propsCache = new WeakMap()
+  const emitsCache = new WeakMap()
+
+  entry = async function createNuxtAppServer (ssrContext: CreateOptions['ssrContext']) {
+    const vueApp = createApp(RootComponent)
+    if (!__VUE_OPTIONS_API__) {
+      const context = vueApp._context as typeof vueApp._context & { propsCache: typeof propsCache, emitsCache: typeof emitsCache }
+      context.propsCache = propsCache
+      context.emitsCache = emitsCache
+    }
+
+    const nuxt = createNuxtApp({ vueApp, ssrContext })
+
+    try {
+      await applyPlugins(nuxt, plugins)
+      await nuxt.hooks.callHook('app:created', vueApp)
+    } catch (error) {
+      await nuxt.hooks.callHook('app:error', error)
+      nuxt.payload.error ||= import.meta.dev ? createErrorFromThrown(error, { route: nuxt._route }) : createError(error as Error)
+    }
+    // TODO: remove _renderResponse in nuxt v5
+    if (ssrContext && (ssrContext['~renderResponse'] || ssrContext._renderResponse)) { throw new Error('skipping render') }
+
+    return vueApp
+  }
+}
+
+if (import.meta.client) {
+  // TODO: temporary webpack 5 HMR fix
+  // https://github.com/webpack/webpack-hot-middleware/issues/390
+  if (import.meta.dev && import.meta.webpackHot) {
+    import.meta.webpackHot.accept()
+  }
+
+  // eslint-disable-next-line prefer-const
+  let vueAppPromise: Promise<App<Element>>
+
+  entry = async function initApp () {
+    if (vueAppPromise) { return vueAppPromise }
+
+    const isSSR = Boolean(
+      (multiApp ? window.__NUXT__?.[appId] : window.__NUXT__)?.serverRendered ??
+      (multiApp ? document.querySelector(`[data-nuxt-data="${appId}"]`) as HTMLElement : document.getElementById('__NUXT_DATA__'))?.dataset.ssr === 'true',
+    )
+    const vueApp = isSSR ? createSSRApp(RootComponent) : createApp(RootComponent)
+
+    const nuxt = createNuxtApp({ vueApp })
+
+    async function handleVueError (error: any) {
+      await nuxt.callHook('app:error', error)
+      nuxt.payload.error ||= import.meta.dev ? createErrorFromThrown(error, { route: nuxt._route }) : createError(error)
+    }
+    // marker so nuxt-root.vue can skip re-invoking the default handler from
+    // its onErrorCaptured (which already calls `app:error` via showError)
+    ;(handleVueError as any).__nuxt_default = true
+
+    vueApp.config.errorHandler = handleVueError
+    // If the errorHandler is not overridden by the user, we unset it after the app is hydrated
+    nuxt.hook('app:suspense:resolve', () => {
+      if (vueApp.config.errorHandler === handleVueError) { vueApp.config.errorHandler = undefined }
+    })
+
+    if (spaLoadingTemplateOutside && !isSSR && appSpaLoaderAttrs.id) {
+      // Remove spa loader if present
+      nuxt.hook('app:suspense:resolve', () => {
+        document.getElementById(appSpaLoaderAttrs.id)?.remove()
+      })
+    }
+
+    try {
+      await applyPlugins(nuxt, plugins)
+    } catch (err) {
+      handleVueError(err)
+    }
+
+    try {
+      await nuxt.hooks.callHook('app:created', vueApp)
+      await nuxt.hooks.callHook('app:beforeMount', vueApp)
+      vueApp.mount(vueAppRootContainer)
+      await nuxt.hooks.callHook('app:mounted', vueApp)
+      await nextTick()
+    } catch (err) {
+      handleVueError(err)
+    }
+
+    return vueApp
+  }
+
+  vueAppPromise = entry().catch((error: unknown) => {
+    appDiagnostics.NUXT_E1009({ cause: error })
+    throw error
+  })
+}
+
+export default (ssrContext => entry(ssrContext)) as Entry

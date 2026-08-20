@@ -1,0 +1,94 @@
+{
+  "name": "@nuxt/schema",
+  "version": "4.6.2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuxt/nuxt.git",
+    "directory": "packages/schema"
+  },
+  "description": "Nuxt types and default configuration",
+  "homepage": "https://nuxt.com",
+  "license": "MIT",
+  "type": "module",
+  "types": "./src/index.ts",
+  "typesVersions": {
+    "*": {
+      "internal": [
+        "./dist/internal.d.mts"
+      ]
+    }
+  },
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts",
+    "./builder-env": "./src/builder-env.ts",
+    "./internal": "./src/internal.ts",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "schema",
+    "builder-env.d.ts",
+    "env.d.ts"
+  ],
+  "scripts": {
+    "prepack": "node ../../scripts/prepack.ts && tsdown",
+    "build": "tsdown",
+    "test:attw": "node ../../scripts/test-attw.ts"
+  },
+  "dependencies": {
+    "@vue/shared": "catalog:build",
+    "defu": "catalog:build",
+    "nostics": "catalog:build",
+    "pathe": "catalog:build",
+    "pkg-types": "catalog:build",
+    "std-env": "catalog:build"
+  },
+  "devDependencies": {
+    "@types/pug": "catalog:dev",
+    "@types/webpack-bundle-analyzer": "catalog:dev",
+    "@types/webpack-hot-middleware": "catalog:dev",
+    "@unhead/vue": "catalog:app-runtime",
+    "@vitejs/plugin-vue": "catalog:vue",
+    "@vitejs/plugin-vue-jsx": "catalog:dev",
+    "@vue/compiler-core": "catalog:dev",
+    "@vue/compiler-sfc": "catalog:vue",
+    "@vue/language-core": "catalog:dev",
+    "chokidar": "catalog:build",
+    "compatx": "catalog:build",
+    "css-minimizer-webpack-plugin": "catalog:webpack",
+    "esbuild": "catalog:dev",
+    "esbuild-loader": "catalog:webpack",
+    "h3": "catalog:dev",
+    "h3-next": "npm:h3@2.0.2",
+    "mini-css-extract-plugin": "catalog:webpack",
+    "ofetch": "catalog:app-runtime",
+    "oxc-transform": "catalog:dev",
+    "postcss": "catalog:build",
+    "rollup-plugin-visualizer": "catalog:dev",
+    "tsdown": "catalog:dev",
+    "unctx": "catalog:build",
+    "unimport": "catalog:build",
+    "untyped": "catalog:build",
+    "vite": "catalog:vite",
+    "vitest": "catalog:dev",
+    "vue": "catalog:app-runtime",
+    "vue-bundle-renderer": "catalog:build",
+    "vue-loader": "catalog:vue",
+    "vue-router": "catalog:app-runtime",
+    "webpack": "catalog:webpack",
+    "webpack-dev-middleware": "catalog:webpack"
+  },
+  "engines": {
+    "node": "^14.18.0 || >=16.10.0"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": "./dist/index.mjs",
+      "./builder-env": "./dist/builder-env.mjs",
+      "./internal": "./dist/internal.mjs",
+      "./package.json": "./package.json"
+    },
+    "types": "./dist/index.d.mts"
+  }
+}

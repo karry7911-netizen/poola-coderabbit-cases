@@ -1,0 +1,23 @@
+{
+  "private": true,
+  "type": "module",
+  "name": "fixture-basic-types",
+  "scripts": {
+    "build": "nuxt build",
+    "test:types": "nuxt prepare && npx vue-tsc -b --noEmit"
+  },
+  "dependencies": {
+    "hook-augmenting-module": "workspace:*",
+    "nuxt": "workspace:*",
+    "ofetch": "catalog:app-runtime",
+    "vue": "catalog:app-runtime",
+    "vue-router": "catalog:app-runtime"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3",
+    "vitest": "catalog:dev"
+  },
+  "engines": {
+    "node": "^22.22.3 || ^24.15.0 || >=26.0.0"
+  }
+}

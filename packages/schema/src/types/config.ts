@@ -1,0 +1,238 @@
+import type { KeepAliveProps, TransitionProps, AppConfig as VueAppConfig } from 'vue'
+import type { Plugin as VitePluginType, ServerOptions as ViteServerOptions, UserConfig as ViteUserConfig } from 'vite'
+import type { Configuration as WebpackConfiguration, WebpackPluginInstance as WebpackPluginInstanceType } from 'webpack'
+import type { Options as VuePluginOptions } from '@vitejs/plugin-vue'
+import type { Options as VueJsxPluginOptions } from '@vitejs/plugin-vue-jsx'
+import type { SchemaDefinition } from 'untyped'
+import type { RouteLocationNormalizedGeneric } from 'vue-router'
+import type { SnakeCase } from './case.ts'
+import type { NuxtConfigLayer, NuxtConfigLayerMeta } from './layers.ts'
+import type { ConfigSchema } from './schema.ts'
+import type { Nuxt } from './nuxt.ts'
+import type { AppHeadMetaObject } from './head.ts'
+
+export type { SchemaDefinition } from 'untyped'
+
+/**
+ * Bundler types re-exported for the utilities that extend a bundler's own configuration.
+ *
+ * Authoring a Vite or webpack plugin is not possible without the bundler's types, so these are a
+ * deliberate exception to Nuxt owning its public types: `@nuxt/kit` takes them from here rather
+ * than importing the bundlers itself.
+ */
+export type VitePlugin = VitePluginType
+export type WebpackConfig = WebpackConfiguration
+export type WebpackPluginInstance = WebpackPluginInstanceType
+
+// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
+type DeepPartial<T> = T extends Function ? T : T extends Record<string, any> ? { [P in keyof T]?: DeepPartial<T[P]> } : T
+
+export type UpperSnakeCase<S extends string> = Uppercase<SnakeCase<S>>
+
+const message: symbol = Symbol('message')
+export type RuntimeValue<T, B extends string> = T & { [message]?: B } | T
+type Overrideable<T extends Record<string, any>, Path extends string = ''> = {
+  [K in keyof T]?: K extends string
+    ? unknown extends T[K]
+      ? unknown
+      : T[K] extends Record<string, unknown>
+        ? RuntimeValue<Overrideable<T[K], `${Path}_${UpperSnakeCase<K>}`>, `You can override this value at runtime with NUXT${Path}_${UpperSnakeCase<K>}`>
+        : RuntimeValue<T[K], `You can override this value at runtime with NUXT${Path}_${UpperSnakeCase<K>}`>
+    : K extends number
+      ? T[K]
+      : never
+}
+
+// Runtime Config
+
+type RuntimeConfigNamespace = Record<string, unknown>
+
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+export interface PublicRuntimeConfig extends RuntimeConfigNamespace { }
+
+/** Runtime configuration of the app itself, set at build time from `app` and `buildId`. */
+export interface RuntimeConfigApp extends RuntimeConfigNamespace {
+  /** The base path the app is served from. */
+  baseURL: string
+  /** The folder name for the built site assets, relative to `baseURL` (or `cdnURL` if set). */
+  buildAssetsDir: string
+  /** An absolute URL the public folder is served from (production-only). */
+  cdnURL: string
+  /** Identifier of the current build, regenerated on every build. */
+  buildId: string
+}
+
+export interface RuntimeConfig extends RuntimeConfigNamespace {
+  /** The application's root secret, overridable at runtime with `NUXT_APP_SECRET`. */
+  appSecret: string
+  public: PublicRuntimeConfig
+  app: RuntimeConfigApp
+}
+
+// Avoid DeepPartial for some problematic config, including:
+// - the server builder's config interface (#31908)
+// - vite config interface (#4772)
+
+/**
+ * User configuration in `nuxt.config` file
+ */
+export interface NuxtConfig extends DeepPartial<Omit<ConfigSchema, 'components' | 'vue' | 'vite' | 'runtimeConfig' | 'webpack' | 'nitro'>> {
+  components?: ConfigSchema['components']
+  vue?: Omit<DeepPartial<ConfigSchema['vue']>, 'config'> & { config?: Partial<Filter<VueAppConfig, string | boolean>> }
+  vite?: ConfigSchema['vite']
+  nitro?: ConfigSchema['nitro']
+  runtimeConfig?: Overrideable<RuntimeConfig>
+  webpack?: DeepPartial<ConfigSchema['webpack']> & {
+    $client?: DeepPartial<ConfigSchema['webpack']>
+    $server?: DeepPartial<ConfigSchema['webpack']>
+  }
+
+  /**
+   * Experimental custom config schema
+   * @see [Nuxt Issue #15592](https://github.com/nuxt/nuxt/issues/15592)
+   */
+  $schema?: SchemaDefinition
+}
+
+/**
+ * Environment- and metadata-aware wrapper around a user configuration object, allowing
+ * `$production`/`$development`/`$test`/`$env` overrides and a `$meta` layer descriptor
+ * alongside the configuration itself.
+ */
+export type NuxtConfigInput<Config extends Record<string, any> = NuxtConfig> = Config & {
+  $test?: Config
+  $development?: Config
+  $production?: Config
+  $env?: Record<string, Config>
+  $meta?: NuxtConfigLayerMeta
+}
+
+export interface DefineNuxtConfig<Config extends Record<string, any> = NuxtConfig> {
+  (input: NuxtConfigInput<Config>): NuxtConfigInput<Config>
+}
+
+export interface NuxtBuilder {
+  bundle: (nuxt: Nuxt) => Promise<void>
+  /**
+   * Optional. If provided and the user opts in via `experimental.watcher: 'builder'`,
+   * Nuxt will call this instead of starting its own file watcher in dev mode,
+   * allowing the builder to reuse its own watcher.
+   *
+   * The builder is expected to register its own `nuxt.hook('close', ...)` to
+   * clean up any resources it allocates.
+   */
+  setupWatcher?: (nuxt: Nuxt) => Promise<void> | void
+}
+
+// Normalized Nuxt options available as `nuxt.options.*`
+export interface NuxtOptions extends Omit<ConfigSchema, 'vue' | 'sourcemap' | 'debug' | 'builder' | 'postcss' | 'webpack'> {
+  vue: Omit<ConfigSchema['vue'], 'config'> & { config?: Partial<Filter<VueAppConfig, string | boolean>> }
+  sourcemap: Required<Exclude<ConfigSchema['sourcemap'], boolean>>
+  debug: Required<Exclude<ConfigSchema['debug'], true>>
+  builder: '@nuxt/vite-builder' | '@nuxt/webpack-builder' | '@nuxt/rspack-builder' | NuxtBuilder
+  postcss: Omit<ConfigSchema['postcss'], 'order'> & { order: Exclude<ConfigSchema['postcss']['order'], string> }
+  webpack: ConfigSchema['webpack'] & {
+    $client: ConfigSchema['webpack']
+    $server: ConfigSchema['webpack']
+  }
+  _layers: readonly NuxtConfigLayer[]
+  $schema: SchemaDefinition
+}
+
+export interface ViteConfig extends Omit<ViteUserConfig, 'publicDir'> {
+  /** The path to the entrypoint for the Vite build. */
+  entry?: string
+  /**
+   * Options passed to @vitejs/plugin-vue.
+   * @see [@vitejs/plugin-vue](https://github.com/vitejs/vite-plugin-vue/tree/main/packages/plugin-vue)
+   */
+  vue?: VuePluginOptions
+
+  /**
+   * Options passed to @vitejs/plugin-vue-jsx.
+   * @see [@vitejs/plugin-vue-jsx.](https://github.com/vitejs/vite-plugin-vue/tree/main/packages/plugin-vue-jsx)
+   */
+  vueJsx?: VueJsxPluginOptions
+
+  /**
+   * Warmup vite entrypoint caches on dev startup.
+   *
+   * In dev mode Nuxt crawls the client entry's import graph once Nitro has built, transforming
+   * modules the browser is about to request. Set to `false` to skip this speculative work, which
+   * also disables Vite's own entry warmup.
+   * @default true
+   */
+  warmupEntry?: boolean
+
+  /**
+   * Use environment variables or top level `server` options to configure Nuxt server.
+   */
+  server?: Omit<ViteServerOptions, 'port' | 'host'>
+  /**
+   * Directly configuring the `vite.publicDir` option is not supported. Instead, set `dir.public`.
+   *
+   * You can read more in <https://nuxt.com/docs/4.x/api/nuxt-config#public>.
+   * @deprecated
+   */
+  publicDir?: never
+}
+
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+export interface ViteOptions extends ViteConfig {}
+
+// App Config
+export interface CustomAppConfig {
+  [key: string]: unknown
+}
+
+/**
+ * User-authored `app.config.ts` input.
+ */
+export interface AppConfigInput {
+  [key: string]: unknown
+  /** @deprecated reserved */
+  private?: never
+  /** @deprecated reserved */
+  nuxt?: never
+  /** @deprecated reserved */
+  nitro?: never
+  /** @deprecated reserved */
+  server?: never
+}
+
+// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
+export type Serializable<T> = T extends Function ? never : T extends Promise<infer U> ? Serializable<U> : T extends string & {} ? T : T extends Record<string, any> ? { [K in keyof T]: Serializable<T[K]> } : T
+
+type ValueOf<T> = T[keyof T]
+type Filter<T extends Record<string, any>, V> = Pick<T, ValueOf<{ [K in keyof T]: NonNullable<T[K]> extends V ? K : never }>>
+
+export interface NuxtAppConfig {
+  head: Serializable<AppHeadMetaObject>
+  layoutTransition: boolean | Serializable<TransitionProps>
+  pageTransition: boolean | Serializable<TransitionProps>
+  viewTransition?: ViewTransitionOptions['enabled'] | ViewTransitionOptions
+  keepalive: boolean | Serializable<KeepAliveProps>
+}
+
+export interface AppConfig {
+  [key: string]: unknown
+}
+
+/** App config available in shared and server contexts, excluding user `app.config` files. */
+export interface SharedAppConfig {
+  [key: string]: unknown
+}
+
+export interface ViewTransitionOptions {
+  enabled: boolean | 'always'
+  types?: string[]
+}
+
+type ViewTransitionTypesFn = (to: RouteLocationNormalizedGeneric, from: RouteLocationNormalizedGeneric) => string[]
+
+export interface ViewTransitionPageOptions {
+  enabled?: boolean | 'always'
+  types?: string[] | ViewTransitionTypesFn
+  toTypes?: string[] | ViewTransitionTypesFn
+  fromTypes?: string[] | ViewTransitionTypesFn
+}

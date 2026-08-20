@@ -1,0 +1,54 @@
+export { JS_ID_RE, VUE_NON_SCRIPT_BLOCK_RE, VUE_SCRIPT_ID_FILTER, isVue, parseModuleId } from '../../../nuxt/src/core/utils/plugins.ts'
+export { toVirtualId } from '../../../nuxt/src/core/utils/virtual.ts'
+
+// Copied from vue-bundle-renderer utils
+export const IS_CSS_RE = /\.(?:css|scss|sass|postcss|pcss|less|stylus|styl)(?:\?[^.]+)?$/
+
+export function isCSS (file: string) {
+  return IS_CSS_RE.test(file)
+}
+
+/** @since 3.9.0 */
+export function toArray<T> (value: T | T[]): T[] {
+  return Array.isArray(value) ? value : [value]
+}
+
+/**
+ * De-duplicate `dirs` and drop any dir nested inside another entry, keeping the first-seen order.
+ */
+export function removeNestedDirs (dirs: string[]): string[] {
+  const unique = new Set<string>()
+  for (const dir of dirs) {
+    if (dir) {
+      unique.add(dir)
+    }
+  }
+  return [...unique].filter((dir) => {
+    for (let i = dir.indexOf('/'); i !== -1; i = dir.indexOf('/', i + 1)) {
+      if (unique.has(dir.slice(0, i))) {
+        return false
+      }
+    }
+    return true
+  })
+}
+
+// eslint-disable-next-line no-control-regex -- control characters are exactly what is being stripped
+const INVALID_FILENAME_CHAR_RE = /[\u0000-\u001F"#$&*+,/:;<=>?@[\]^`{|}\u007F]+/g
+const URI_ESCAPE_RE = /%../g
+const QUERY_RE = /\?.*$/
+const PATH_SEPARATOR_RE = /[/\\]/
+const WINDOWS_DRIVE_RE = /^([A-Z])_\//i
+
+/**
+ * Replace characters that are not safe in a file name (or that would be interpreted as a
+ * URI escape) with `_`, preserving a leading Windows drive letter.
+ */
+export function sanitizeFilePath (filePath = ''): string {
+  return filePath
+    .replace(QUERY_RE, '')
+    .split(PATH_SEPARATOR_RE)
+    .map(segment => segment.replace(INVALID_FILENAME_CHAR_RE, '_').replace(URI_ESCAPE_RE, '_'))
+    .join('/')
+    .replace(WINDOWS_DRIVE_RE, '$1:/')
+}

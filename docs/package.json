@@ -1,0 +1,23 @@
+{
+  "name": "@nuxt/docs",
+  "version": "4.6.2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuxt/nuxt.git",
+    "directory": "docs"
+  },
+  "homepage": "https://nuxt.com",
+  "description": "Documentation for Nuxt in raw markdown",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "prepack": "node ../scripts/prepack.ts"
+  },
+  "exports": {
+    "./*": "./*"
+  },
+  "files": [
+    "**/*.md",
+    "**/*.yml"
+  ]
+}

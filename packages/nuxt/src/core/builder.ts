@@ -1,0 +1,433 @@
+import { existsSync } from 'node:fs'
+import type { EventType } from '@parcel/watcher'
+import type { FSWatcher } from 'chokidar'
+import { watch as chokidarWatch } from 'chokidar'
+import { createIsIgnored, directoryToURL, getAddDependencyCommand, getLayerDirectories, importModule, isIgnored, recoverThrottledChanges, useNuxt, writeTypes } from '@nuxt/kit'
+import { buildDiagnostics } from '@nuxt/kit/internal'
+import { debounce } from 'perfect-debounce'
+import { dirname, join, normalize, relative, resolve } from 'pathe'
+
+import { isDirectory } from '../utils.ts'
+import { generateApp as _generateApp, createApp, invalidateAppStructure } from './app.ts'
+import { checkForExternalConfigurationFiles } from './external-config-files.ts'
+import { createChangedFileFilter } from './template-dependencies.ts'
+import { cleanupCaches, getVueHash } from './cache.ts'
+import type { Nuxt, NuxtBuilder, NuxtHooks } from 'nuxt/schema'
+
+export async function build (nuxt: Nuxt): Promise<void> {
+  await ensureGeneratedTsConfigs(nuxt)
+
+  nuxt._perf?.startPhase('app:generate')
+  const app = createApp(nuxt)
+  nuxt.apps.default = app
+
+  let closing = false
+  const writes = new Set<Promise<unknown>>()
+  const track = async <T> (run: () => Promise<T>) => {
+    if (closing) { return }
+    const p = run()
+    writes.add(p)
+    try { await p } finally { writes.delete(p) }
+  }
+  const generateApp = debounce(() => _generateApp(nuxt, app), undefined, { leading: true })
+  await generateApp()
+  nuxt._perf?.endPhase('app:generate')
+
+  const builder = nuxt.options._prepare ? undefined : await resolveBuilder(nuxt)
+
+  if (nuxt.options.dev) {
+    nuxt.hook('close', async () => {
+      closing = true
+      generateApp.cancel()
+      await Promise.allSettled(writes)
+    })
+    if (!nuxt.options._prepare) {
+      if (nuxt.options.experimental.watcher === 'builder' && builder?.setupWatcher) {
+        await builder.setupWatcher(nuxt)
+      } else {
+        if (nuxt.options.experimental.watcher === 'builder') {
+          buildDiagnostics.NUXT_B1020()
+        }
+        watch(nuxt)
+      }
+    }
+    nuxt.hook('builder:watch', async (event, relativePath) => {
+      if (event !== 'change') {
+        invalidateAppStructure(nuxt)
+      }
+
+      // Unset mainComponent and errorComponent if app or error component is changed
+      if (event === 'add' || event === 'unlink') {
+        const path = resolve(nuxt.options.srcDir, relativePath)
+        for (const dirs of getLayerDirectories(nuxt)) {
+          const relativePath = relative(dirs.app, path)
+          if (/^app\./i.test(relativePath)) {
+            app.mainComponent = undefined
+            break
+          }
+          if (/^error\./i.test(relativePath)) {
+            app.errorComponent = undefined
+            break
+          }
+        }
+      }
+
+      // Recompile app templates
+      if (event === 'change' && app.templates.length) {
+        const filter = createChangedFileFilter(nuxt, app, resolve(nuxt.options.srcDir, relativePath))
+        if (!filter) { return }
+        await track(() => _generateApp(nuxt, app, { filter }))
+        return
+      }
+
+      await track(() => generateApp())
+    })
+    nuxt.hook('builder:generateApp', (options) => {
+      // Bypass debounce if we are selectively invalidating templates
+      if (options) { return track(() => _generateApp(nuxt, app, options)) }
+      // An unfiltered request is a request to rebuild everything, including scans
+      invalidateAppStructure(nuxt)
+      return track(() => generateApp())
+    })
+  }
+
+  if (!nuxt.options._prepare && !nuxt.options.dev && nuxt.options.experimental.buildCache) {
+    const { restoreCache, collectCache } = await getVueHash(nuxt)
+    if (await restoreCache()) {
+      await nuxt.callHook('build:done')
+      await nuxt.callHook('close', nuxt)
+      return
+    }
+    nuxt.hooks.hookOnce('build:done', () => collectCache())
+    nuxt.hooks.hookOnce('close', () => cleanupCaches(nuxt))
+  }
+
+  await nuxt.callHook('build:before')
+  if (nuxt.options._prepare) {
+    nuxt.hook('prepare:types', () => nuxt.close())
+    return
+  }
+
+  if (nuxt.options.dev && !nuxt.options.test) {
+    nuxt.hooks.hookOnce('build:done', () => {
+      checkForExternalConfigurationFiles()
+        .catch(e => buildDiagnostics.NUXT_B1014({ cause: e }))
+    })
+  }
+
+  nuxt._perf?.startPhase('build:bundle')
+  await builder?.bundle(nuxt)
+  nuxt._perf?.endPhase('build:bundle')
+
+  // release hooks that will never fire again.
+  if (!nuxt.options.dev && nuxt.options.experimental.clearBuildHooks) {
+    clearBuildHooks(nuxt)
+  }
+
+  // allow GC to reclaim any now-unreferenced bundler memory
+  if (!nuxt.options.dev && typeof globalThis.gc === 'function') {
+    nuxt._perf?.startPhase('build:gc')
+    globalThis.gc()
+    nuxt._perf?.endPhase('build:gc')
+  }
+
+  await nuxt.callHook('build:done')
+
+  if (!nuxt.options.dev) {
+    await nuxt.callHook('close', nuxt)
+  }
+}
+
+const generatedTsConfigs = ['tsconfig.json', 'tsconfig.app.json', 'tsconfig.server.json', 'tsconfig.node.json', 'tsconfig.shared.json']
+
+/**
+ * The project `tsconfig.json` references the generated configurations. Tools that
+ * resolve them (such as tsconfck, which Vite uses to load compiler options) throw if
+ * a referenced project is missing and cache that failure for the lifetime of the
+ * process, so a bundler that starts before typegen has run keeps failing until it is
+ * restarted.
+ *
+ * Typegen normally runs before the build, so this only generates types when a
+ * referenced configuration is genuinely missing. A stub is not enough: whatever is on
+ * disk when the bundler first reads it is the configuration it uses for the rest of
+ * the session.
+ */
+async function ensureGeneratedTsConfigs (nuxt: Nuxt) {
+  if (nuxt.options._prepare) { return }
+  if (generatedTsConfigs.every(name => existsSync(join(nuxt.options.typesDir || nuxt.options.buildDir, name)))) { return }
+  await writeTypes(nuxt).catch(() => {})
+}
+
+const watchEvents: Record<EventType, 'add' | 'addDir' | 'change' | 'unlink' | 'unlinkDir'> = {
+  create: 'add',
+  delete: 'unlink',
+  update: 'change',
+}
+
+async function watch (nuxt: Nuxt) {
+  if (nuxt.options.experimental.watcher === 'parcel') {
+    const success = await createParcelWatcher()
+    if (success) { return }
+  }
+
+  if (nuxt.options.experimental.watcher === 'chokidar') {
+    return createWatcher()
+  }
+
+  return createGranularWatcher()
+}
+
+function createWatcher () {
+  const nuxt = useNuxt()
+  const isIgnored = createIsIgnored(nuxt)
+
+  const layerDirs = getLayerDirectories(nuxt)
+  const paths: string[] = []
+  for (const layer of layerDirs) {
+    paths.push(layer.app)
+    // Only add server if it's not inside app (avoid double-watching)
+    if (!layer.server.startsWith(layer.app.replace(/\/?$/, '/'))) {
+      paths.push(layer.server)
+    }
+  }
+
+  const watcher = chokidarWatch(paths, {
+    ...nuxt.options.watchers.chokidar,
+    ignoreInitial: true,
+    ignored: [isIgnored, /[\\/]node_modules[\\/]/],
+  })
+
+  const restartPaths = new Set<string>()
+  const srcDir = nuxt.options.srcDir.replace(/\/?$/, '/')
+  for (const pattern of nuxt.options.watch) {
+    if (typeof pattern !== 'string') { continue }
+    const path = resolve(nuxt.options.srcDir, pattern)
+    if (!path.startsWith(srcDir)) {
+      restartPaths.add(path)
+    }
+  }
+
+  watcher.add([...restartPaths])
+
+  watcher.on('all', (event, path) => {
+    if (event === 'all' || event === 'ready' || event === 'error' || event === 'raw') {
+      return
+    }
+    nuxt.callHook('builder:watch', event, normalize(path))
+  })
+
+  const disposeRecovery = recoverThrottledChanges(watcher)
+  nuxt.hook('close', () => {
+    disposeRecovery()
+    return watcher?.close()
+  })
+}
+
+function createGranularWatcher () {
+  const nuxt = useNuxt()
+  const isIgnored = createIsIgnored(nuxt)
+
+  if (nuxt.options.debug && nuxt.options.debug.watchers) {
+    // eslint-disable-next-line no-console
+    console.time('[nuxt] builder:chokidar:watch')
+  }
+
+  let pending = 0
+
+  const ignoredDirs = new Set([...nuxt.options.modulesDir, nuxt.options.buildDir])
+  const pathsToWatch = resolvePathsToWatch(nuxt)
+  for (const dir of pathsToWatch) {
+    pending++
+    const watcher = chokidarWatch(dir, { ...nuxt.options.watchers.chokidar, ignoreInitial: false, depth: 0, ignored: [isIgnored, /[\\/]node_modules[\\/]/] })
+    const watchers: Record<string, FSWatcher> = {}
+    const disposers = new Map<string, () => void>()
+
+    watcher.on('all', (event, path) => {
+      if (event === 'all' || event === 'ready' || event === 'error' || event === 'raw') {
+        return
+      }
+      path = normalize(path)
+      if (!pending) {
+        nuxt.callHook('builder:watch', event, path)
+      }
+      if (event === 'unlinkDir' && path in watchers) {
+        watchers[path]?.close()
+        disposers.get(path)?.()
+        disposers.delete(path)
+        delete watchers[path]
+      }
+      if (event === 'addDir' && path !== dir && !ignoredDirs.has(path) && !pathsToWatch.has(path) && !(path in watchers) && !isIgnored(path)) {
+        const pathWatcher = watchers[path] = chokidarWatch(path, { ...nuxt.options.watchers.chokidar, ignored: [isIgnored] })
+        pathWatcher.on('all', (event, p) => {
+          if (event === 'all' || event === 'ready' || event === 'error' || event === 'raw') {
+            return
+          }
+          nuxt.callHook('builder:watch', event, normalize(p))
+        })
+        const disposePathRecovery = recoverThrottledChanges(pathWatcher)
+        disposers.set(path, disposePathRecovery)
+        nuxt.hook('close', () => {
+          disposePathRecovery()
+          return pathWatcher?.close()
+        })
+      }
+    })
+    const disposeRecovery = recoverThrottledChanges(watcher)
+    watcher.on('ready', () => {
+      pending--
+      if (nuxt.options.debug && nuxt.options.debug.watchers && !pending) {
+        // eslint-disable-next-line no-console
+        console.timeEnd('[nuxt] builder:chokidar:watch')
+      }
+    })
+    nuxt.hook('close', () => {
+      disposeRecovery()
+      for (const dispose of disposers.values()) { dispose() }
+      disposers.clear()
+      return watcher?.close()
+    })
+  }
+}
+
+async function createParcelWatcher () {
+  const nuxt = useNuxt()
+  if (nuxt.options.debug && nuxt.options.debug.watchers) {
+    // eslint-disable-next-line no-console
+    console.time('[nuxt] builder:parcel:watch')
+  }
+  let subscribe: typeof import('@parcel/watcher').subscribe
+  try {
+    ({ subscribe } = await importModule<typeof import('@parcel/watcher')>('@parcel/watcher', { url: [nuxt.options.rootDir, ...nuxt.options.modulesDir].map(d => directoryToURL(d)) }))
+  } catch {
+    buildDiagnostics.NUXT_B1015({ installCommand: await getAddDependencyCommand('@parcel/watcher', nuxt.options.rootDir, { dev: true }) })
+    return false
+  }
+  try {
+    const pathsToWatch = resolvePathsToWatch(nuxt, { parentDirectories: true })
+    for (const dir of pathsToWatch) {
+      if (!await isDirectory(dir)) { continue }
+      const subscription = await subscribe(dir, (err, events) => {
+        if (err) { return }
+        for (const event of events) {
+          if (isIgnored(event.path)) { continue }
+          nuxt.callHook('builder:watch', watchEvents[event.type], normalize(event.path))
+        }
+      }, {
+        ignore: [
+          ...nuxt.options.ignore,
+          'node_modules',
+        ],
+      })
+      nuxt.hook('close', () => subscription.unsubscribe())
+    }
+    if (nuxt.options.debug && nuxt.options.debug.watchers) {
+      // eslint-disable-next-line no-console
+      console.timeEnd('[nuxt] builder:parcel:watch')
+    }
+    return true
+  } catch {
+    buildDiagnostics.NUXT_B1016()
+    return false
+  }
+}
+
+async function resolveBuilder (nuxt: Nuxt): Promise<NuxtBuilder> {
+  const source = typeof nuxt.options.builder === 'string'
+    ? await loadBuilder(nuxt, nuxt.options.builder)
+    : nuxt.options.builder
+
+  // Wrap `bundle` so the `build:error` hook fires for any builder, including
+  // user-supplied ones, without each caller having to remember to do it.
+  return {
+    ...source,
+    async bundle (nuxt) {
+      try {
+        await source.bundle(nuxt)
+      } catch (error: any) {
+        await nuxt.callHook('build:error', error)
+        throw error
+      }
+    },
+  }
+}
+
+async function loadBuilder (nuxt: Nuxt, builder: string): Promise<NuxtBuilder> {
+  try {
+    // prefer our own dependency tree before walking up from rootDir
+    if (builder === '@nuxt/vite-builder') {
+      return await import(builder)
+    }
+    return await importModule(builder, { url: [new URL(import.meta.url), directoryToURL(nuxt.options.rootDir)] })
+  } catch (err: any) {
+    throw buildDiagnostics.NUXT_B1017({ builder, installCommand: await getAddDependencyCommand(builder, nuxt.options.rootDir, { dev: true }), cause: err })
+  }
+}
+
+const hooksToClear: Array<keyof NuxtHooks> = [
+  // config-phase hooks that fire before the build starts
+  'vite:extend',
+  'vite:extendConfig',
+  'vite:configResolved',
+  'vite:compiled',
+  'webpack:config',
+  'webpack:configResolved',
+  'webpack:compile',
+  'webpack:compiled',
+  'webpack:change',
+  'webpack:error',
+  'webpack:done',
+  'webpack:progress',
+  'rspack:config',
+  'rspack:configResolved',
+  'rspack:compile',
+  'rspack:compiled',
+  'rspack:change',
+  'rspack:error',
+  'rspack:done',
+  // manifest hook - fires after build
+  'build:manifest',
+  // builder hooks
+  'builder:watch',
+  'builder:generateApp',
+  'app:templatesGenerated',
+]
+
+function clearBuildHooks (nuxt: Nuxt): void {
+  if ('clearHook' in nuxt.hooks) {
+    for (const name of hooksToClear) {
+      nuxt.hooks.clearHook(name)
+    }
+  }
+}
+
+function resolvePathsToWatch (nuxt: Nuxt, opts: { parentDirectories?: boolean } = {}): Set<string> {
+  const pathsToWatch = new Set<string>()
+  for (const dirs of getLayerDirectories(nuxt)) {
+    if (!isIgnored(dirs.app)) {
+      pathsToWatch.add(dirs.app)
+    }
+    // Only add server if it's not inside app (avoid double-watching)
+    if (!isIgnored(dirs.server) && !dirs.server.startsWith(dirs.app.replace(/\/?$/, '/'))) {
+      pathsToWatch.add(dirs.server)
+    }
+  }
+  for (const pattern of nuxt.options.watch) {
+    if (typeof pattern !== 'string') { continue }
+    const path = opts?.parentDirectories
+      ? join(dirname(resolve(nuxt.options.srcDir, pattern)), '')
+      : resolve(nuxt.options.srcDir, pattern)
+    let shouldAdd = true
+    for (const w of [...pathsToWatch]) {
+      if (w.startsWith(path)) {
+        pathsToWatch.delete(w)
+      }
+      if (path.startsWith(w)) {
+        shouldAdd = false
+      }
+    }
+    if (shouldAdd) {
+      pathsToWatch.add(path)
+    }
+  }
+  return pathsToWatch
+}

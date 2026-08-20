@@ -1,0 +1,148 @@
+import { defu } from 'defu'
+import { applyDefaults } from 'untyped'
+import type { ModuleDefinition, ModuleOptions, ModuleSetupReturn, Nuxt, NuxtModule, NuxtOptions, ResolvedModuleOptions } from '@nuxt/schema'
+import { tryUseNuxt, useNuxt } from '../context.ts'
+import { checkNuxtCompatibility } from '../compatibility.ts'
+import { kitDiagnostics } from '../diagnostics/kit-api.ts'
+
+/**
+ * Define a Nuxt module, automatically merging defaults with user provided options, installing
+ * any hooks that are provided, and calling an optional setup function for full control.
+ */
+export function defineNuxtModule<TOptions extends ModuleOptions> (
+  definition: ModuleDefinition<TOptions, Partial<TOptions>, false> | NuxtModule<TOptions, Partial<TOptions>, false>,
+): NuxtModule<TOptions, TOptions, false>
+
+export function defineNuxtModule<TOptions extends ModuleOptions> (): {
+  with: <TOptionsDefaults extends Partial<TOptions>> (
+    definition: ModuleDefinition<TOptions, TOptionsDefaults, true> | NuxtModule<TOptions, TOptionsDefaults, true>,
+  ) => NuxtModule<TOptions, TOptionsDefaults, true>
+}
+
+export function defineNuxtModule<TOptions extends ModuleOptions> (
+  definition?: ModuleDefinition<TOptions, Partial<TOptions>, false> | NuxtModule<TOptions, Partial<TOptions>, false>,
+) {
+  if (definition) {
+    return _defineNuxtModule(definition)
+  }
+
+  return {
+    with: <TOptionsDefaults extends Partial<TOptions>>(
+      definition: ModuleDefinition<TOptions, TOptionsDefaults, true> | NuxtModule<TOptions, TOptionsDefaults, true>,
+    ) => _defineNuxtModule(definition),
+  }
+}
+
+function _defineNuxtModule<
+  TOptions extends ModuleOptions,
+  TOptionsDefaults extends Partial<TOptions>,
+  TWith extends boolean,
+> (
+  definition: ModuleDefinition<TOptions, TOptionsDefaults, TWith> | NuxtModule<TOptions, TOptionsDefaults, TWith>,
+): NuxtModule<TOptions, TOptionsDefaults, TWith> {
+  if (typeof definition === 'function') {
+    return _defineNuxtModule<TOptions, TOptionsDefaults, TWith>({ setup: definition })
+  }
+
+  // Normalize definition and meta
+  const module: ModuleDefinition<TOptions, TOptionsDefaults, TWith> & Required<Pick<ModuleDefinition<TOptions, TOptionsDefaults, TWith>, 'meta'>> = defu(definition, { meta: {} })
+
+  module.meta.configKey ||= module.meta.name
+
+  // Resolves module options from inline options, [configKey] in nuxt.config, defaults and schema
+  async function getOptions (inlineOptions?: Partial<TOptions>, nuxt: Nuxt = useNuxt()): Promise<
+    TWith extends true
+      ? ResolvedModuleOptions<TOptions, TOptionsDefaults>
+      : TOptions
+  > {
+    const nuxtConfigOptionsKey = module.meta.configKey || module.meta.name
+
+    const nuxtConfigOptions: Partial<TOptions> = nuxtConfigOptionsKey && nuxtConfigOptionsKey in nuxt.options ? nuxt.options[nuxtConfigOptionsKey as keyof NuxtOptions] as Partial<TOptions> : {}
+
+    const optionsDefaults: TOptionsDefaults =
+      module.defaults instanceof Function
+        ? await module.defaults(nuxt)
+        : module.defaults ?? {} as TOptionsDefaults
+
+    let options = defu(inlineOptions, nuxtConfigOptions, optionsDefaults)
+
+    if (module.schema) {
+      options = await applyDefaults(module.schema, options) as any
+    }
+
+    // @ts-expect-error ignore type mismatch when calling `defineNuxtModule` without `.with()`
+    return Promise.resolve(options)
+  }
+
+  function getModuleDependencies (nuxt: Nuxt = useNuxt()) {
+    if (typeof module.moduleDependencies === 'function') {
+      return module.moduleDependencies(nuxt)
+    }
+    return module.moduleDependencies
+  }
+
+  // Module format is always a simple function
+  async function normalizedModule (inlineOptions: Partial<TOptions>, nuxt = tryUseNuxt()!): Promise<ModuleSetupReturn> {
+    if (!nuxt) {
+      throw kitDiagnostics.NUXT_B8012({ name: module.meta.name || 'module' })
+    }
+
+    // Avoid duplicate installs
+    const uniqueKey = module.meta.name || module.meta.configKey
+    if (uniqueKey) {
+      nuxt.options._requiredModules ||= {}
+      if (nuxt.options._requiredModules[uniqueKey]) {
+        return false
+      }
+      nuxt.options._requiredModules[uniqueKey] = true
+    }
+
+    // Check compatibility constraints
+    if (module.meta.compatibility) {
+      const issues = await checkNuxtCompatibility(module.meta.compatibility, nuxt)
+      if (issues.length) {
+        const errorMessage = `Module \`${module.meta.name}\` is disabled due to incompatibility issues:\n${issues.toString()}`
+        if (nuxt.options.experimental.enforceModuleCompatibility) {
+          const error = new Error(errorMessage)
+          error.name = 'ModuleCompatibilityError'
+          throw error
+        }
+        kitDiagnostics.NUXT_B8013({ message: errorMessage })
+        return
+      }
+    }
+
+    // Resolve module and options
+    const _options = await getOptions(inlineOptions, nuxt)
+
+    // Register hooks
+    if (module.hooks) {
+      nuxt.hooks.addHooks(module.hooks)
+    }
+
+    // Call setup
+    const moduleName = uniqueKey || module.meta.name || '<no name>'
+    nuxt._perf?.startPhase(`module:${moduleName}`)
+    let res: ModuleSetupReturn
+    try {
+      res = await module.setup?.call(null as any, _options, nuxt) ?? {}
+    } finally {
+      nuxt._perf?.endPhase(`module:${moduleName}`)
+    }
+
+    // Check if module is ignored
+    if (res === false) { return false }
+
+    return res
+  }
+
+  // Define getters for options and meta
+  normalizedModule.getMeta = () => Promise.resolve(module.meta)
+  normalizedModule.getOptions = getOptions
+  normalizedModule.getModuleDependencies = getModuleDependencies
+
+  normalizedModule.onInstall = module.onInstall
+  normalizedModule.onUpgrade = module.onUpgrade
+
+  return normalizedModule as NuxtModule<TOptions, TOptionsDefaults, TWith>
+}

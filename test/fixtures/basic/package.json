@@ -1,0 +1,27 @@
+{
+  "private": true,
+  "type": "module",
+  "name": "fixture-basic",
+  "scripts": {
+    "build": "nuxt build"
+  },
+  "dependencies": {
+    "@nuxt/rspack-builder": "workspace:*",
+    "@nuxt/webpack-builder": "workspace:*",
+    "nuxt": "workspace:*"
+  },
+  "devDependencies": {
+    "@babel/plugin-proposal-decorators": "catalog:dev",
+    "@babel/plugin-syntax-jsx": "catalog:dev",
+    "@vue/devtools-api": "catalog:dev",
+    "defu": "catalog:build",
+    "nested-dep": "file:./deps/nested-dep",
+    "postcss": "catalog:build",
+    "ufo": "catalog:build",
+    "unplugin": "catalog:build",
+    "vue": "catalog:app-runtime"
+  },
+  "engines": {
+    "node": "^22.22.3 || ^24.15.0 || >=26.0.0"
+  }
+}

@@ -1,0 +1,115 @@
+{
+  "name": "@nuxt/vite-builder",
+  "version": "4.6.2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuxt/nuxt.git",
+    "directory": "packages/vite"
+  },
+  "description": "Vite bundler for Nuxt",
+  "homepage": "https://nuxt.com",
+  "license": "MIT",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "imports": {
+    "#ssr-sourcemap": "./src/ssr-sourcemap.ts",
+    "#vite-node": "./src/vite-node.ts",
+    "#vite-node-entry": "./src/vite-node-entry.ts",
+    "#vite-node-runner": "./src/vite-node-runner.ts",
+    "#vite-node-warmup": "./src/vite-node-warmup.ts"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "prepack": "node ../../scripts/prepack.ts && tsdown",
+    "build": "tsdown",
+    "test:attw": "node ../../scripts/test-attw.ts"
+  },
+  "dependencies": {
+    "@nuxt/kit": "workspace:*",
+    "@vitejs/plugin-vue": "catalog:vue",
+    "@vitejs/plugin-vue-jsx": "catalog:dev",
+    "autoprefixer": "catalog:build",
+    "clickable-path": "catalog:build",
+    "consola": "catalog:build",
+    "cssnano": "catalog:build",
+    "defu": "catalog:build",
+    "escape-string-regexp": "catalog:build",
+    "exsolve": "catalog:build",
+    "generic-names": "catalog:build",
+    "get-port-please": "catalog:build",
+    "js-tokens": "catalog:build",
+    "knitwork": "catalog:build",
+    "mocked-exports": "catalog:build",
+    "my-bad": "catalog:nitro-runtime",
+    "pathe": "catalog:build",
+    "pkg-types": "catalog:build",
+    "postcss": "catalog:build",
+    "rolldown-string": "catalog:vite",
+    "seroval": "catalog:build",
+    "std-env": "catalog:build",
+    "ufo": "catalog:build",
+    "unenv": "catalog:build",
+    "vite": "catalog:vite",
+    "vite-node": "catalog:vite",
+    "vite-plugin-checker": "catalog:vite",
+    "vue-bundle-renderer": "catalog:build"
+  },
+  "devDependencies": {
+    "@babel/plugin-proposal-decorators": "catalog:dev",
+    "@babel/plugin-syntax-jsx": "catalog:dev",
+    "@nuxt/schema": "workspace:*",
+    "h3": "1.15.11",
+    "h3-next": "npm:h3@2.0.2",
+    "nitropack": "catalog:dev",
+    "rolldown": "catalog:vite",
+    "rollup": "catalog:dev",
+    "rollup-plugin-visualizer": "catalog:dev",
+    "tsdown": "catalog:dev",
+    "vue": "catalog:app-runtime"
+  },
+  "peerDependencies": {
+    "@babel/plugin-proposal-decorators": "^7.25.0 || ^8.0.0",
+    "@babel/plugin-syntax-jsx": "^7.25.0 || ^8.0.0",
+    "nuxt": "workspace:*",
+    "rolldown": "^1.0.0",
+    "rollup-plugin-visualizer": "^6.0.0 || ^7.0.1",
+    "vue": "^3.3.4"
+  },
+  "peerDependenciesMeta": {
+    "@babel/plugin-proposal-decorators": {
+      "optional": true
+    },
+    "@babel/plugin-syntax-jsx": {
+      "optional": true
+    },
+    "rolldown": {
+      "optional": true
+    },
+    "rollup-plugin-visualizer": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": "^22.22.3 || ^24.15.0 || >=26.0.0"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": "./dist/index.mjs",
+      "./package.json": "./package.json"
+    },
+    "imports": {
+      "#ssr-sourcemap": "./dist/ssr-sourcemap.mjs",
+      "#vite-node": "./dist/vite-node.mjs",
+      "#vite-node-entry": "./dist/vite-node-entry.mjs",
+      "#vite-node-runner": "./dist/vite-node-runner.mjs",
+      "#vite-node-warmup": "./dist/vite-node-warmup.mjs"
+    },
+    "types": "./dist/index.d.mts"
+  }
+}
