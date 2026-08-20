@@ -9,9 +9,10 @@ explicit ``ensure_secure_url`` to call before every aiohttp request.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from ipaddress import ip_address
-from typing import Optional
-from urllib.parse import urlparse
+from typing import Any, AsyncIterator, Optional
+from urllib.parse import urljoin, urlparse
 
 # Hostnames considered safe to talk to over plain HTTP.
 _LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
@@ -110,3 +111,77 @@ def ensure_secure_url(url: str, *, context: Optional[str] = None) -> None:
         "Plain HTTP to any other host is rejected to prevent MITM attacks "
         "and SSRF into internal services."
     )
+
+
+# HTTP statuses where the server expects the client to re-issue the request
+# against the URL given in the ``Location`` header. 303 forces a GET; the
+# rest preserve the original method.
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+@asynccontextmanager
+async def safe_request_with_redirects(
+    session: Any,
+    method: str,
+    url: str,
+    *,
+    context: str,
+    max_redirects: int = 5,
+    **kwargs: Any,
+) -> AsyncIterator[Any]:
+    ensure_secure_url(url, context=context)
+    # We control redirect behavior ourselves; refuse to let callers override.
+    kwargs.pop("allow_redirects", None)
+
+    current_url = url
+    current_method = method
+    hops = 0
+    final_response = None
+
+    try:
+        while True:
+            response = await session.request(
+                current_method,
+                current_url,
+                allow_redirects=False,
+                **kwargs,
+            )
+            if response.status not in _REDIRECT_STATUSES:
+                final_response = response
+                break
+
+            location = response.headers.get("Location")
+            if not location:
+                # 3xx with no Location header — nothing to follow. Let
+                # the caller handle the unusual response.
+                final_response = response
+                break
+
+            if hops >= max_redirects:
+                response.release()
+                raise RuntimeError(
+                    f"Too many redirects (>{max_redirects}) during {context} "
+                    f"starting from {url!r}."
+                )
+
+            next_url = urljoin(current_url, location)
+            try:
+                ensure_secure_url(
+                    next_url, context=f"{context} (redirect target)"
+                )
+            except Exception:
+                response.release()
+                raise
+
+            response.release()
+            if response.status == 303:
+                current_method = "GET"
+                kwargs.pop("json", None)
+                kwargs.pop("data", None)
+            current_url = next_url
+            hops += 1
+
+        yield final_response
+    finally:
+        if final_response is not None:
+            final_response.release()
