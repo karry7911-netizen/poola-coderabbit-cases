@@ -2526,6 +2526,9 @@ func (s *Server) jsLeaderServerRemoveRequest(sub *subscription, c *client, _ *Ac
 		s.Warnf(badAPIRequestT, msg)
 		return
 	}
+	if acc != s.SystemAccount() {
+		return
+	}
 
 	js, cc := s.getJetStreamCluster()
 	if js == nil || cc == nil || cc.meta == nil {
@@ -2649,6 +2652,10 @@ func (s *Server) jsLeaderServerStreamMoveRequest(sub *subscription, c *client, _
 
 	accName := tokenAt(subject, 6)
 	streamName := tokenAt(subject, 7)
+
+	if acc.GetName() != accName && acc != s.SystemAccount() {
+		return
+	}
 
 	var resp = JSApiStreamUpdateResponse{ApiResponse: ApiResponse{Type: JSApiStreamUpdateResponseType}}
 
@@ -2806,6 +2813,10 @@ func (s *Server) jsLeaderServerStreamCancelMoveRequest(sub *subscription, c *cli
 
 	accName := tokenAt(subject, 6)
 	streamName := tokenAt(subject, 7)
+
+	if acc.GetName() != accName && acc != s.SystemAccount() {
+		return
+	}
 
 	targetAcc, ok := s.accounts.Load(accName)
 	if !ok {
