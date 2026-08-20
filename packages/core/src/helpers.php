@@ -1,0 +1,137 @@
+<?php
+
+declare(strict_types=1);
+
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Number;
+use Shopper\Core\Models\Currency;
+use Shopper\Core\Models\Order;
+use Shopper\Core\Models\Setting;
+
+if (! function_exists('generate_number')) {
+    function generate_number(): string
+    {
+        /** @var ?Order $lastOrder */
+        $lastOrder = Order::query()->orderBy('id', 'desc')
+            ->limit(1)
+            ->first();
+
+        $generator = config('shopper.orders.generator');
+
+        $last = $lastOrder ? $lastOrder->id : 0;
+        $next = $generator['start_sequence_from'] + $last;
+
+        $separator = $generator['separator'];
+        $sequence = mb_str_pad((string) $next, $generator['pad_length'], $generator['pad_string'], \STR_PAD_LEFT);
+
+        $parts = [];
+
+        if ($generator['prefix']) {
+            $parts[] = $generator['prefix'];
+        }
+
+        if ($generator['date_format']) {
+            $parts[] = date($generator['date_format']);
+        }
+
+        $parts[] = $sequence;
+
+        return implode($separator, $parts);
+    }
+}
+
+if (! function_exists('shopper_setting')) {
+    function shopper_setting(string $key, bool $withCache = true): mixed
+    {
+        return Cache::remember(
+            "shopper-setting.{$key}",
+            $withCache ? 3600 * 24 : 1,
+            fn () => Setting::query()->where('key', $key)->first()?->value,
+        );
+    }
+}
+
+if (! function_exists('shopper_table')) {
+    function shopper_table(string $table): string
+    {
+        if (config('shopper.core.table_prefix') !== '') {
+            return config('shopper.core.table_prefix').$table;
+        }
+
+        return $table;
+    }
+}
+
+if (! function_exists('shopper_currency')) {
+    function shopper_currency(): string
+    {
+        $currencyId = shopper_setting('default_currency_id');
+
+        if (! $currencyId) {
+            return 'USD';
+        }
+
+        return Cache::remember(
+            'shopper-setting.default_currency',
+            now()->addHour(),
+            fn (): string => Currency::query()
+                ->where('id', $currencyId)
+                ->value('code') ?? 'USD',
+        );
+    }
+}
+
+if (! function_exists('shopper_money_format')) {
+    function shopper_money_format(int $amount, ?string $currency = null): string
+    {
+        $currency = $currency ?? shopper_currency();
+
+        return (string) Number::currency(
+            number: is_no_division_currency($currency) ? $amount : $amount / 100,
+            in: $currency,
+            locale: app()->getLocale()
+        );
+    }
+}
+
+if (! function_exists('useTryCatch')) {
+    /**
+     * @return array<array-key, mixed>
+     */
+    function useTryCatch(Closure $closure, ?Closure $catchable = null): array
+    {
+        $result = null;
+        $throwable = null;
+
+        $catch = $catchable ?? fn (Throwable $exception): Throwable => $exception;
+
+        try {
+            $result = $closure();
+        } catch (Throwable $exception) {
+            $throwable = $catch($exception);
+        }
+
+        return [$throwable, $result];
+    }
+}
+
+if (! function_exists('zero_decimal_currencies')) {
+    /**
+     * @return array<int, string>
+     */
+    function zero_decimal_currencies(): array
+    {
+        return [
+            'BIF', 'CLP', 'DJF', 'GNF', 'HTG', 'JPY', 'KMF', 'KRW',
+            'MGA', 'PYG', 'RWF', 'VND', 'VUV', 'XAF', 'XAG', 'XAU',
+            'XDR', 'XOF', 'XPF',
+        ];
+    }
+}
+
+if (! function_exists('is_no_division_currency')) {
+    function is_no_division_currency(string $currency): bool
+    {
+        return in_array($currency, zero_decimal_currencies());
+    }
+}

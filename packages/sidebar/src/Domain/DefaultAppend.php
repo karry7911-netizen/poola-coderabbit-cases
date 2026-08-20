@@ -1,0 +1,109 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Shopper\Sidebar\Domain;
+
+use BackedEnum;
+use Illuminate\Contracts\Container\Container;
+use Serializable;
+use Shopper\Sidebar\Contracts\Builder\Append;
+use Shopper\Sidebar\Traits\AuthorizableTrait;
+use Shopper\Sidebar\Traits\CacheableTrait;
+use Shopper\Sidebar\Traits\RouteableTrait;
+
+class DefaultAppend implements Append, Serializable
+{
+    use AuthorizableTrait;
+    use CacheableTrait;
+    use RouteableTrait;
+
+    protected ?string $name = null;
+
+    protected string $icon = 'untitledui-plus';
+
+    protected string $iconClass = '';
+
+    protected string $type = 'blade';
+
+    protected ?string $class = null;
+
+    /** @var string[] */
+    protected array $cacheables = [
+        'name',
+        'url',
+        'icon',
+        'type',
+    ];
+
+    public function __construct(protected Container $container) {}
+
+    public function __serialize(): array
+    {
+        return [
+            'name' => $this->name,
+            'url' => $this->url,
+            'icon' => $this->icon,
+            'type' => $this->type,
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    public function __unserialize(array $data): void
+    {
+        $this->name = $data['name'];
+        $this->url = $data['url'];
+        $this->icon = $data['icon'];
+        $this->type = $data['type'];
+    }
+
+    public function getName(): string
+    {
+        return $this->name;
+    }
+
+    public function setName(string $name): Append
+    {
+        $this->name = $name;
+
+        return $this;
+    }
+
+    public function getClass(): string
+    {
+        return $this->class;
+    }
+
+    public function setClass(string $className): Append
+    {
+        $this->class = $className;
+
+        return $this;
+    }
+
+    public function getIcon(): string
+    {
+        return $this->icon;
+    }
+
+    public function setIcon(string|BackedEnum $icon, string $type = 'blade', string $iconClass = ''): Append
+    {
+        $this->icon = $icon instanceof BackedEnum ? $icon->value : $icon;
+        $this->type = $type;
+        $this->iconClass = $iconClass;
+
+        return $this;
+    }
+
+    public function getIconClass(): string
+    {
+        return $this->iconClass;
+    }
+
+    public function iconSvg(): bool
+    {
+        return $this->type === 'svg';
+    }
+}

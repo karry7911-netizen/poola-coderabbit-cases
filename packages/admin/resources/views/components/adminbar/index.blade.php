@@ -1,0 +1,40 @@
+<div
+    x-data="{
+        barOpen: $persist(false).as('shopper.adminBarOPen'),
+        visible: false,
+        iframeOpen: false,
+        buttonCollapsed: false,
+        section: '',
+        iframeURL: 'about:blank',
+    }"
+    wire:ignore
+    x-init="
+        $watch('iframeOpen', (newValue) => {
+            if (! newValue) {
+                section = ''
+                iframeURL = 'about:blank'
+            }
+        })
+    "
+    x-on:keyup.escape.window="iframeOpen=false"
+    class="fixed top-0 left-0 isolate z-50 text-white dark:text-gray-900"
+    x-cloak
+>
+    <x-shopper::adminbar.bar />
+    <x-shopper::adminbar.tab />
+
+    <div x-show="iframeOpen" class="relative z-20 flex h-dvh w-dvw items-center justify-center">
+        <div :class="{ 'pl-10.5 py-1 pr-5': barOpen }" class="absolute size-full">
+            <div
+                class="h-full rounded-md bg-gray-900/5 p-2 ring-1 ring-gray-900/20 ring-inset lg:rounded-xl lg:p-2.5 dark:bg-gray-100/30 dark:ring-gray-100/10"
+            >
+                <iframe :src="iframeURL" class="size-full rounded-md bg-gray-900 dark:bg-gray-50" border="0"></iframe>
+            </div>
+        </div>
+    </div>
+    <div
+        x-show="iframeOpen"
+        x-on:click="iframeOpen=false"
+        class="fixed inset-0 z-10 h-full w-full bg-black/10"
+    ></div>
+</div>

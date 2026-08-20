@@ -1,0 +1,158 @@
+{
+  "name": "shopper/shopper",
+  "description": "Shopper Monorepo",
+  "license": "MIT",
+  "keywords": [
+    "e-commerce",
+    "TALLStack",
+    "Laravel",
+    "store"
+  ],
+  "authors": [
+    {
+      "name": "Arthur Monney",
+      "email": "monneylobe@gmail.com",
+      "role": "Developer"
+    }
+  ],
+  "require": {
+    "php": "^8.3",
+    "ext-intl": "*",
+    "composer-runtime-api": "^2.1",
+    "bacon/bacon-qr-code": "^2.0|^3.1",
+    "blade-ui-kit/blade-heroicons": "^2.7",
+    "codeat3/blade-phosphor-icons": "^2.4",
+    "codewithdennis/filament-select-tree": "^4.1",
+    "danharrin/livewire-rate-limiting": "^1.3|^2.2",
+    "filament/filament": "^4.11",
+    "filament/spatie-laravel-media-library-plugin": "^4.11",
+    "gehrisandro/tailwind-merge-laravel": "^1.3",
+    "ivanmitrikeski/laravel-shipping": "^1.0",
+    "jaocero/radio-deck": "^3.1",
+    "jenssegers/agent": "^2.6",
+    "laravelcm/livewire-slide-overs": "^2.1",
+    "laravel/framework": "^11.28|^12.0|^13.0",
+    "leandrocfe/filament-apex-charts": "^5.1",
+    "livewire/blaze": "^1.0",
+    "mckenziearts/filament-untitledui-icons": "^1.2",
+    "milon/barcode": "^11.0|^12.0|^13.0",
+    "pragmarx/google2fa": "^8.0|^9.0",
+    "shopper/core": "self.version",
+    "spatie/laravel-medialibrary": "^11.5",
+    "spatie/laravel-package-tools": "^1.9",
+    "spatie/laravel-permission": "^6.24|^7.0",
+    "staudenmeir/laravel-adjacency-list": "^1.0",
+    "stevebauman/location": "^7.6",
+    "stripe/stripe-php": "^19.0"
+  },
+  "require-dev": {
+    "larastan/larastan": "^3.8",
+    "laravel/pint": "^1.16",
+    "mockery/mockery": "^1.4",
+    "nunomaduro/collision": "^7.10.0|^8.1.1",
+    "orchestra/testbench": "^8.20|^9.0|^10.0|^11.0",
+    "pestphp/pest": "^3.8|^4.0",
+    "pestphp/pest-plugin-laravel": "^3.0|^4.0",
+    "pestphp/pest-plugin-livewire": "^3.0|^4.0",
+    "pestphp/pest-plugin-type-coverage": "^3.6|^4.0",
+    "rector/rector": "^2.3",
+    "symplify/monorepo-builder": "^11.0"
+  },
+  "autoload": {
+    "files": [
+      "packages/admin/src/helpers.php",
+      "packages/core/src/helpers.php",
+      "packages/sidebar/src/helpers.php"
+    ],
+    "psr-4": {
+      "Shopper\\": [
+        "packages/admin/src",
+        "packages/cart/src",
+        "packages/core/src",
+        "packages/sidebar/src",
+        "packages/shipping/src",
+        "packages/payment/src"
+      ],
+      "Shopper\\Cart\\": "packages/cart/src",
+      "Shopper\\Core\\": "packages/core/src",
+      "Shopper\\Core\\Database\\Factories\\": "packages/core/database/factories",
+      "Shopper\\Core\\Database\\Seeders\\": "packages/core/database/seeders",
+      "Shopper\\Database\\Seeders\\": "packages/admin/database/seeders",
+      "Shopper\\Payment\\": "packages/payment/src",
+      "Shopper\\Shipping\\": "packages/shipping/src",
+      "Shopper\\Sidebar\\": "packages/sidebar/src",
+      "Shopper\\Stripe\\": "packages/stripe/src",
+      "Shopper\\Upgrade\\": "packages/upgrade/src"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Tests\\": "tests",
+      "Tests\\Database\\Seeders\\": "tests/database/seeders"
+    }
+  },
+  "replace": {
+    "shopper/cart": "self.version",
+    "shopper/core": "self.version",
+    "shopper/framework": "self.version",
+    "shopper/payment": "self.version",
+    "shopper/shipping": "self.version",
+    "shopper/sidebar": "self.version",
+    "shopper/stripe": "self.version",
+    "shopper/upgrade": "self.version"
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "Shopper\\ShopperServiceProvider",
+        "Shopper\\Cart\\CartServiceProvider",
+        "Shopper\\Core\\CoreServiceProvider",
+        "Shopper\\Payment\\PaymentServiceProvider",
+        "Shopper\\Shipping\\ShippingServiceProvider",
+        "Shopper\\Sidebar\\SidebarServiceProvider",
+        "Shopper\\Stripe\\StripeServiceProvider",
+        "Shopper\\Upgrade\\UpgradeServiceProvider"
+      ]
+    }
+  },
+  "scripts": {
+    "cs": [
+      "refactor",
+      "lint",
+      "npx run prettier"
+    ],
+    "lint": "pint",
+    "refactor": "rector",
+    "test:lint": "pint --test",
+    "test:refactor": "./vendor/bin/rector --dry-run",
+    "test:unit": "pest --colors=always --coverage --parallel --min=80",
+    "test:sqlite": "pest --configuration=phpunit.sqlite.xml --colors=always --parallel",
+    "test:mysql": "pest --configuration=phpunit.mysql.xml --colors=always --parallel",
+    "test:pgsql": "pest --configuration=phpunit.pgsql.xml --colors=always --parallel",
+    "test:types": "phpstan analyse --ansi --memory-limit=-1",
+    "test:type-coverage": "pest --type-coverage --min=90 --memory-limit=-1",
+    "test:all-databases": [
+      "@test:sqlite",
+      "@test:mysql",
+      "@test:pgsql"
+    ],
+    "test": [
+      "@test:type-coverage",
+      "@test:types",
+      "@test:sqlite"
+    ]
+  },
+  "config": {
+    "sort-packages": true,
+    "allow-plugins": {
+      "composer/package-versions-deprecated": true,
+      "pestphp/pest-plugin": true,
+      "phpstan/extension-installer": true
+    },
+    "audit": {
+      "abandoned": "ignore"
+    }
+  },
+  "minimum-stability": "dev",
+  "prefer-stable": true
+}
