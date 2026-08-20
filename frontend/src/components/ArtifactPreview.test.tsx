@@ -1,0 +1,141 @@
+/*
+ * Copyright 2021 The Kubeflow Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the 'License');
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an 'AS IS' BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { render, screen, waitFor } from '@testing-library/react';
+import { CommonTestWrapper } from 'src/TestWrapper';
+import { Apis } from '../lib/Apis';
+import { expectErrors, testBestPractices } from '../TestUtils';
+import ArtifactPreview from './ArtifactPreview';
+
+testBestPractices();
+describe('ArtifactPreview', () => {
+  it('handles undefined artifact', () => {
+    render(
+      <CommonTestWrapper>
+        <ArtifactPreview value={undefined} />
+      </CommonTestWrapper>,
+    );
+    screen.getByText('Can not retrieve storage path from artifact uri: undefined');
+  });
+
+  it('handles null artifact', () => {
+    render(
+      <CommonTestWrapper>
+        <ArtifactPreview value={null as any} />
+      </CommonTestWrapper>,
+    );
+    screen.getByText('Can not retrieve storage path from artifact uri: null');
+  });
+
+  it('handles unsupported path artifact', () => {
+    const expectError = expectErrors();
+    render(
+      <CommonTestWrapper>
+        <ArtifactPreview value={'i am random path'} />
+      </CommonTestWrapper>,
+    );
+    screen.getByText('Can not retrieve storage path from artifact uri: i am random path');
+    expectError();
+  });
+
+  it('handles invalid artifact: no bucket', async () => {
+    vi.spyOn(Apis, 'readFile').mockRejectedValue(new Error('server error: no bucket'));
+
+    render(
+      <CommonTestWrapper>
+        <ArtifactPreview value={'minio://'} namespace={'kubeflow'} />
+      </CommonTestWrapper>,
+    );
+    await waitFor(() => screen.getByText('Error in retrieving artifact preview.'));
+  });
+
+  it('handles gcs artifact', async () => {
+    vi.spyOn(Apis, 'readFile').mockResolvedValue('gcs preview');
+    render(
+      <CommonTestWrapper>
+        <ArtifactPreview value={'gs://bucket/key'} />
+      </CommonTestWrapper>,
+    );
+    await waitFor(() => screen.getByText('gs://bucket/key'));
+    await waitFor(() => screen.getByText('gcs preview'));
+  });
+
+  it('handles minio artifact with namespace', async () => {
+    vi.spyOn(Apis, 'readFile').mockResolvedValueOnce('minio content');
+    render(
+      <CommonTestWrapper>
+        <ArtifactPreview value={'minio://bucket/key'} namespace={'kubeflow'} />
+      </CommonTestWrapper>,
+    );
+    await waitFor(() => screen.getByText('minio://bucket/key'));
+    const downloadLink = screen.getByRole('link', { name: 'minio://bucket/key' });
+    expect(downloadLink).toHaveAttribute(
+      'href',
+      'artifacts/get?source=minio&namespace=kubeflow&bucket=bucket&key=key&download=true',
+    );
+    expect(downloadLink).toHaveAttribute('download');
+    expect(screen.getAllByRole('link')).toHaveLength(1);
+  });
+
+  it('carries providerInfo from the session map into the download link', async () => {
+    vi.spyOn(Apis, 'readFile').mockResolvedValueOnce('s3 content');
+    const sessionMap = new Map([['s3://bucket/key', '{"Provider":"s3"}']]);
+    render(
+      <CommonTestWrapper>
+        <ArtifactPreview value={'s3://bucket/key'} namespace={'kubeflow'} sessionMap={sessionMap} />
+      </CommonTestWrapper>,
+    );
+    await waitFor(() => screen.getByRole('link', { name: 's3://bucket/key' }));
+    expect(screen.getByRole('link', { name: 's3://bucket/key' })).toHaveAttribute(
+      'href',
+      'artifacts/get?source=s3&namespace=kubeflow&providerInfo=%7B%22Provider%22%3A%22s3%22%7D&bucket=bucket&key=key&download=true',
+    );
+    expect(screen.getAllByRole('link')).toHaveLength(1);
+  });
+
+  it('handles artifact that previews with maxlines', async () => {
+    const data = `012\n345\n678\n910`;
+    vi.spyOn(Apis, 'readFile').mockResolvedValueOnce(data);
+    render(
+      <CommonTestWrapper>
+        <ArtifactPreview
+          value={'minio://bucket/key'}
+          namespace={'kubeflow'}
+          maxbytes={data.length}
+          maxlines={2}
+        />
+      </CommonTestWrapper>,
+    );
+    await waitFor(() => screen.getByText('minio://bucket/key'));
+    await waitFor(() => screen.getByText(`012 345 ...`));
+  });
+
+  it('handles artifact that previews with maxbytes', async () => {
+    const data = `012\n345\n678\n910`;
+    vi.spyOn(Apis, 'readFile').mockResolvedValueOnce(data);
+    render(
+      <CommonTestWrapper>
+        <ArtifactPreview
+          value={'minio://bucket/key'}
+          namespace={'kubeflow'}
+          maxbytes={data.length - 5}
+        />
+      </CommonTestWrapper>,
+    );
+    await waitFor(() => screen.getByText('minio://bucket/key'));
+    await waitFor(() => screen.getByText(`012 345 67 ...`));
+  });
+});

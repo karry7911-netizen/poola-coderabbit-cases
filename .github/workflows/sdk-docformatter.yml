@@ -1,0 +1,36 @@
+name: KFP SDK Docformatter Test
+
+on:
+  push:
+    branches: [master]
+
+  pull_request:
+    paths:
+      - 'sdk/python/**'
+      - 'test/presubmit-docformatter-sdk.sh'
+      - '.github/workflows/sdk-docformatter.yml'
+      - '.github/actions/setup-python-pip-cache/**'
+      - '!**/*.md'
+      - '!**/OWNERS'
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-docformatter-kfp-sdk:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: ./.github/actions/setup-python-pip-cache
+        with:
+          python-version: 3.9
+          cache-scope: sdk-docformatter
+          cache-dependency-hash: ${{ hashFiles('sdk/python/requirements-dev.txt') }}
+
+      - name: Run docformatter tests
+        run: ./test/presubmit-docformatter-sdk.sh

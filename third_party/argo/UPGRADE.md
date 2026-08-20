@@ -1,0 +1,98 @@
+# Upgrading Argo Workflows
+
+Kubeflow Pipelines regularly upgrades the version of Argo Workflows provided.  See below for
+documentation on the steps required to perform this upgrade
+
+## Planned KFP 3.0 support boundary
+
+Argo Workflows 3.x remains supported for KFP 2.x, but is deprecated and will not be supported by
+Kubeflow Pipelines 3.0. Before the KFP 3.0 release, replace the 3.x compatibility lane with the
+oldest supported 4.x release, update the public compatibility matrix and operator upgrade
+documentation, and verify the resulting minimum and maximum versions through the API and end-to-end
+CI matrices. Track this work in
+[the KFP 3.0 compatibility issue](https://github.com/kubeflow/pipelines/issues/14139).
+
+## Upgrade Argo Workflows
+
+Instructions:
+
+1. Set version of argo you want to upgrade to, for example:
+
+    ```bash
+    ARGO_TAG=v4.1.2
+    ```
+
+    When updating the retained compatibility release, also update
+    [COMPATIBILITY_VERSION](./COMPATIBILITY_VERSION).
+
+1. Run the `update` target of the [Makefile](./Makefile) in this directory
+    ```bash
+    cd ./third_party/argo  # From repo root, if not already there
+    echo "${ARGO_TAG}" > VERSION
+    make update
+    ```
+1. Update the minor versions listed in the compatibility matrix in
+   [README.md](../../README.md) when either supported release line changes.
+
+1. Verify all instances of the argo version have been updated.
+    * A simple search such as `grep -R "vX.Y.Z" .` from repo root usually is good enough
+
+1. Verify backend images still build by running `make image_all` from the `backend` directory
+    * It would be a good idea to tag and push these images to a dev repo for use in testing
+
+1. Validate the changes
+    * Deploy KFP to a test environment, update the `image` used for the APIServer to the one built in the step above
+    * Verify the API Server and WorkflowController pods come up, can run Pipelines, etc.
+    * Fix any other issues caused by the upgrade.
+
+1. Commit these changes to a PR.
+
+NOTE: At this time, release.sh is a no-op included only for maintaining consistency with other third-party dependencies
+
+## Upgrade Argo Workflows
+
+### Upgrade All References of Argo Workflows
+
+To upgrade to a new Argo version, including manifests, code dependencies, tests, and documentation:
+
+1. Update the version in [VERSION](./VERSION)
+2. Run `make update` to automatically update all references of the Argo Workflows dependency
+3. Test the new configuration with your KFP deployment
+
+The update includes the GitHub CI matrices, runtime image preload list, and
+their documented versions.
+
+### Update Argo Workflows Manifests
+
+To upgrade just the manifests used for Argo Workflows:
+
+1. Update the version in [VERSION](./VERSION)
+2. Run `make update_manifests` to automatically update all remote Git references to the new version
+3. Test the new configuration with your KFP deployment
+
+
+### Update Argo Workflows in Backend Code
+
+To upgrade just the backend code and package references to a new Argo version:
+
+1. Update the version in [VERSION](./VERSION)
+2. Run `make update_backend` to automatically update all remote Git references to the new version
+3. Test the new configuration with your KFP deployment
+
+
+### Update Argo Workflows in Tests
+
+To upgrade just the test references to a new Argo version:
+
+1. Update the version in [VERSION](./VERSION)
+2. Run `make update_tests` to automatically update all remote Git references to the new version
+3. Test the new configuration with your KFP deployment
+
+
+### Update Argo Workflows in Docs
+
+To upgrade just the doc references to a new Argo version:
+
+1. Update the version in [VERSION](./VERSION)
+2. Run `make update_docs` to automatically update all remote Git references to the new version
+3. Test the new configuration with your KFP deployment

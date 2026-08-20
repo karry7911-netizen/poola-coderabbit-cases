@@ -1,0 +1,2754 @@
+// Copyright 2018 The Kubeflow Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package storage
+
+import (
+	"database/sql"
+	"fmt"
+	"sort"
+	"testing"
+
+	sq "github.com/Masterminds/squirrel"
+	api "github.com/kubeflow/pipelines/backend/api/v1beta1/go_client"
+	"github.com/kubeflow/pipelines/backend/src/apiserver/filter"
+	"github.com/kubeflow/pipelines/backend/src/apiserver/list"
+	"github.com/kubeflow/pipelines/backend/src/apiserver/model"
+	"github.com/kubeflow/pipelines/backend/src/common/util"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"k8s.io/apimachinery/pkg/util/json"
+)
+
+const (
+	defaultFakeRunId      = "123e4567-e89b-12d3-a456-426655440020"
+	defaultFakeRunIdTwo   = "123e4567-e89b-12d3-a456-426655440021"
+	defaultFakeRunIdThree = "123e4567-e89b-12d3-a456-426655440023"
+)
+
+func testLargeTextPtr(s string) *model.LargeText {
+	lt := model.LargeText(s)
+	return &lt
+}
+
+type RunMetricSorter []*model.RunMetric
+
+func (r RunMetricSorter) Len() int           { return len(r) }
+func (r RunMetricSorter) Less(i, j int) bool { return r[i].Name < r[j].Name }
+func (r RunMetricSorter) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
+
+func initializeRunStore() (*DB, *RunStore) {
+	db := NewFakeDBOrFatal()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	expStore = NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpIdTwo, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp2"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	run1 := &model.Run{
+		UUID:         "1",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run1",
+		DisplayName:  "run1",
+		StorageState: model.StorageStateAvailable,
+		Namespace:    "n1",
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          1,
+			ScheduledAtInSec:        1,
+			Conditions:              "Running",
+			State:                   model.RuntimeStateRunning,
+			WorkflowRuntimeManifest: "workflow1",
+		},
+		PipelineSpec: model.PipelineSpec{
+			RuntimeConfig: model.RuntimeConfig{
+				Parameters:   `[{"name":"param2","value":"world1"}]`,
+				PipelineRoot: "gs://my-bucket/path/to/root/run1",
+			},
+		},
+	}
+	run2 := &model.Run{
+		UUID:         "2",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run2",
+		DisplayName:  "run2",
+		StorageState: model.StorageStateAvailable,
+		Namespace:    "n2",
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          2,
+			ScheduledAtInSec:        2,
+			Conditions:              "Succeeded",
+			State:                   model.RuntimeStateSucceeded,
+			WorkflowRuntimeManifest: "workflow1",
+		},
+		PipelineSpec: model.PipelineSpec{
+			RuntimeConfig: model.RuntimeConfig{
+				Parameters:   `[{"name":"param2","value":"world2"}]`,
+				PipelineRoot: "gs://my-bucket/path/to/root/run2",
+			},
+		},
+	}
+
+	run3 := &model.Run{
+		UUID:         "3",
+		ExperimentId: defaultFakeExpIdTwo,
+		K8SName:      "run3",
+		DisplayName:  "run3",
+		Namespace:    "n3",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          3,
+			ScheduledAtInSec:        3,
+			Conditions:              "Succeeded",
+			State:                   model.RuntimeStateSucceeded,
+			WorkflowRuntimeManifest: "workflow3",
+		},
+		PipelineSpec: model.PipelineSpec{
+			RuntimeConfig: model.RuntimeConfig{
+				Parameters:   `[{"name":"param2","value":"world3"}]`,
+				PipelineRoot: "gs://my-bucket/path/to/root/run3",
+			},
+		},
+	}
+	runStore.CreateRun(run1)
+	runStore.CreateRun(run2)
+	runStore.CreateRun(run3)
+
+	metric1 := &model.RunMetric{
+		RunUUID:     "1",
+		NodeID:      "node1",
+		Name:        "dummymetric",
+		NumberValue: 1.0,
+		Format:      "PERCENTAGE",
+	}
+	metric2 := &model.RunMetric{
+		RunUUID:     "2",
+		NodeID:      "node2",
+		Name:        "dummymetric",
+		NumberValue: 2.0,
+		Format:      "PERCENTAGE",
+	}
+	runStore.CreateMetric(metric1)
+	runStore.CreateMetric(metric2)
+
+	return db, runStore
+}
+
+func TestListRuns_Pagination(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	expectedFirstPageRuns := []*model.Run{
+		{
+			UUID:         "1",
+			ExperimentId: defaultFakeExpId,
+			K8SName:      "run1",
+			DisplayName:  "run1",
+			Namespace:    "n1",
+			StorageState: model.StorageStateAvailable,
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:          1,
+				ScheduledAtInSec:        1,
+				Conditions:              "Running",
+				State:                   model.RuntimeStateRunning,
+				WorkflowRuntimeManifest: "workflow1",
+				StateHistory: []*model.RuntimeStatus{
+					{
+						UpdateTimeInSec: 1,
+						State:           model.RuntimeStateRunning,
+					},
+				},
+			},
+			Metrics: []*model.RunMetric{
+				{
+					RunUUID:     "1",
+					NodeID:      "node1",
+					Name:        "dummymetric",
+					NumberValue: 1.0,
+					Format:      "PERCENTAGE",
+				},
+			},
+			PipelineSpec: model.PipelineSpec{
+				RuntimeConfig: model.RuntimeConfig{
+					Parameters:   "[{\"name\":\"param2\",\"value\":\"world1\"}]",
+					PipelineRoot: "gs://my-bucket/path/to/root/run1",
+				},
+			},
+		},
+	}
+	expectedFirstPageRuns[0] = expectedFirstPageRuns[0].ToV1()
+
+	expectedSecondPageRuns := []*model.Run{
+		{
+			UUID:         "2",
+			ExperimentId: defaultFakeExpId,
+			K8SName:      "run2",
+			DisplayName:  "run2",
+			Namespace:    "n2",
+			StorageState: model.StorageStateAvailable,
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:          2,
+				ScheduledAtInSec:        2,
+				Conditions:              "Succeeded",
+				State:                   model.RuntimeStateSucceeded,
+				WorkflowRuntimeManifest: "workflow1",
+				StateHistory: []*model.RuntimeStatus{
+					{
+						UpdateTimeInSec: 2,
+						State:           model.RuntimeStateSucceeded,
+					},
+				},
+			},
+			Metrics: []*model.RunMetric{
+				{
+					RunUUID:     "2",
+					NodeID:      "node2",
+					Name:        "dummymetric",
+					NumberValue: 2.0,
+					Format:      "PERCENTAGE",
+				},
+			},
+			PipelineSpec: model.PipelineSpec{
+				RuntimeConfig: model.RuntimeConfig{
+					Parameters:   "[{\"name\":\"param2\",\"value\":\"world2\"}]",
+					PipelineRoot: "gs://my-bucket/path/to/root/run2",
+				},
+			},
+		},
+	}
+	expectedSecondPageRuns[0] = expectedSecondPageRuns[0].ToV1()
+
+	opts, err := list.NewOptions(&model.Run{}, 1, "", nil)
+	assert.Nil(t, err)
+
+	runs, total_size, nextPageToken, err := runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}}, opts)
+	runs[0] = runs[0].ToV1()
+	assert.Nil(t, err)
+	assert.Equal(t, 2, total_size)
+	assert.Equal(t, expectedFirstPageRuns, runs, "Unexpected Run listed")
+	assert.NotEmpty(t, nextPageToken)
+
+	opts, err = list.NewOptionsFromToken(nextPageToken, 1)
+	assert.Nil(t, err)
+	runs, total_size, nextPageToken, err = runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}}, opts)
+	runs[0] = runs[0].ToV1()
+	assert.Nil(t, err)
+	assert.Equal(t, 2, total_size)
+	assert.Equal(t, expectedSecondPageRuns, runs, "Unexpected Run listed")
+	assert.Empty(t, nextPageToken)
+}
+
+func TestListRuns_Pagination_WithSortingOnMetrics(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	expectedFirstPageRuns := []*model.Run{
+		{
+			UUID:         "1",
+			ExperimentId: defaultFakeExpId,
+			K8SName:      "run1",
+			DisplayName:  "run1",
+			Namespace:    "n1",
+			StorageState: model.StorageStateAvailable,
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:          1,
+				ScheduledAtInSec:        1,
+				Conditions:              "Running",
+				State:                   model.RuntimeStateRunning,
+				WorkflowRuntimeManifest: "workflow1",
+				StateHistory: []*model.RuntimeStatus{
+					{
+						UpdateTimeInSec: 1,
+						State:           model.RuntimeStateRunning,
+					},
+				},
+			},
+			Metrics: []*model.RunMetric{
+				{
+					RunUUID:     "1",
+					NodeID:      "node1",
+					Name:        "dummymetric",
+					NumberValue: 1.0,
+					Format:      "PERCENTAGE",
+				},
+			},
+			PipelineSpec: model.PipelineSpec{
+				RuntimeConfig: model.RuntimeConfig{
+					Parameters:   "[{\"name\":\"param2\",\"value\":\"world1\"}]",
+					PipelineRoot: "gs://my-bucket/path/to/root/run1",
+				},
+			},
+		},
+	}
+	expectedFirstPageRuns[0] = expectedFirstPageRuns[0].ToV1()
+	expectedSecondPageRuns := []*model.Run{
+		{
+			UUID:         "2",
+			ExperimentId: defaultFakeExpId,
+			K8SName:      "run2",
+			DisplayName:  "run2",
+			StorageState: model.StorageStateAvailable,
+			Namespace:    "n2",
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:          2,
+				ScheduledAtInSec:        2,
+				Conditions:              "Succeeded",
+				State:                   model.RuntimeStateSucceeded,
+				WorkflowRuntimeManifest: "workflow1",
+				StateHistory: []*model.RuntimeStatus{
+					{
+						UpdateTimeInSec: 2,
+						State:           model.RuntimeStateSucceeded,
+					},
+				},
+			},
+			Metrics: []*model.RunMetric{
+				{
+					RunUUID:     "2",
+					NodeID:      "node2",
+					Name:        "dummymetric",
+					NumberValue: 2.0,
+					Format:      "PERCENTAGE",
+				},
+			},
+			PipelineSpec: model.PipelineSpec{
+				RuntimeConfig: model.RuntimeConfig{
+					Parameters:   "[{\"name\":\"param2\",\"value\":\"world2\"}]",
+					PipelineRoot: "gs://my-bucket/path/to/root/run2",
+				},
+			},
+		},
+	}
+	expectedSecondPageRuns[0] = expectedSecondPageRuns[0].ToV1()
+
+	// Sort in asc order
+	opts, err := list.NewOptions(&model.Run{}, 1, "metric:dummymetric", nil)
+	assert.Nil(t, err)
+
+	runs, total_size, nextPageToken, err := runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}}, opts)
+	runs[0] = runs[0].ToV1()
+	assert.Nil(t, err)
+	assert.Equal(t, 2, total_size)
+	assert.Equal(t, expectedFirstPageRuns, runs, "Unexpected Run listed")
+	assert.NotEmpty(t, nextPageToken)
+
+	opts, err = list.NewOptionsFromToken(nextPageToken, 1)
+	assert.Nil(t, err)
+	runs, total_size, nextPageToken, err = runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}}, opts)
+	runs[0] = runs[0].ToV1()
+	assert.Nil(t, err)
+	assert.Equal(t, 2, total_size)
+	assert.Equal(t, expectedSecondPageRuns, runs, "Unexpected Run listed")
+	assert.Empty(t, nextPageToken)
+
+	// Sort in desc order
+	opts, err = list.NewOptions(&model.Run{}, 1, "metric:dummymetric desc", nil)
+	assert.Nil(t, err)
+
+	runs, total_size, nextPageToken, err = runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}}, opts)
+	runs[0] = runs[0].ToV1()
+	assert.Nil(t, err)
+	assert.Equal(t, 2, total_size)
+	assert.Equal(t, expectedSecondPageRuns, runs, "Unexpected Run listed")
+	assert.NotEmpty(t, nextPageToken)
+
+	opts, err = list.NewOptionsFromToken(nextPageToken, 1)
+	assert.Nil(t, err)
+	runs, total_size, nextPageToken, err = runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}}, opts)
+	runs[0] = runs[0].ToV1()
+	assert.Nil(t, err)
+	assert.Equal(t, 2, total_size)
+	assert.Equal(t, expectedFirstPageRuns, runs, "Unexpected Run listed")
+	assert.Empty(t, nextPageToken)
+}
+
+func TestListRuns_MetricSortInjectionSafe(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	// A malicious sortBy value attempting SQL injection through the metric name.
+	// The payload has no spaces so it passes format validation and reaches SQL
+	// generation. Prior to the fix, opts.SortByFieldName was concatenated directly
+	// into SQL structure (alias and JOIN predicate). After the fix, the metric name
+	// is passed as a bind parameter and the SQL alias is the fixed string
+	// "sort_metric_value", so this must execute without error.
+	maliciousSort := "metric:';DROP/**/TABLE/**/run_metrics;--"
+	opts, err := list.NewOptions(&model.Run{}, 10, maliciousSort, nil)
+	assert.Nil(t, err)
+
+	runs, _, _, err := runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}}, opts)
+	assert.Nil(t, err, "SQL injection payload must not cause a query error")
+	// Runs are returned but without a matching metric value (NULL join), so
+	// ordering is stable but no metric value is injected into SQL structure.
+	assert.NotNil(t, runs)
+
+	// Verify the run_metrics table was NOT dropped by confirming a normal
+	// metric-sort query still works.
+	opts2, err := list.NewOptions(&model.Run{}, 10, "metric:dummymetric", nil)
+	assert.Nil(t, err)
+	_, _, _, err = runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}},
+		opts2)
+	assert.Nil(t, err, "run_metrics table must still exist after injection attempt")
+}
+
+// TestListRuns_HyphenatedMetricSort verifies that metric names containing
+// hyphens (e.g. "log-loss") can be used for pagination across multiple pages.
+// This is a regression test for a bug where token.unmarshal() validated
+// SortByFieldName with a SQL identifier regex that rejects "-", causing page-2
+// requests with hyphenated metric names to fail with "Invalid sort field name".
+func TestListRuns_HyphenatedMetricSort(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	// Seed runs 1 and 2 with the hyphenated metric so pagination produces a page token.
+	runStore.CreateMetric(&model.RunMetric{RunUUID: "1", NodeID: "node1", Name: "log-loss", NumberValue: 0.5, Format: "RAW"})
+	runStore.CreateMetric(&model.RunMetric{RunUUID: "2", NodeID: "node2", Name: "log-loss", NumberValue: 0.3, Format: "RAW"})
+
+	// Page 1: metric:log-loss — must not error even though "log-loss" contains "-".
+	opts, err := list.NewOptions(&model.Run{}, 1, "metric:log-loss", nil)
+	assert.Nil(t, err, "NewOptions must accept hyphenated metric name")
+
+	_, total, nextPageToken, err := runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}},
+		opts)
+	assert.Nil(t, err, "page-1 ListRuns must succeed with hyphenated metric name")
+	assert.Equal(t, 2, total)
+	assert.NotEmpty(t, nextPageToken, "must produce a page token when there are 2 runs")
+
+	// Page 2: the page token carries SortByFieldName="log-loss". Unmarshalling
+	// it must succeed (i.e. the identifier regex must NOT be applied to metric names).
+	opts2, err := list.NewOptionsFromToken(nextPageToken, 1)
+	assert.Nil(t, err, "NewOptionsFromToken must not reject hyphenated metric name in pageToken")
+	_, _, _, err = runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}},
+		opts2)
+	assert.Nil(t, err, "page-2 ListRuns must succeed with hyphenated metric name in pageToken")
+}
+
+func TestListRuns_TotalSizeWithNoFilter(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	opts, _ := list.NewOptions(&model.Run{}, 4, "", nil)
+
+	// No filter
+	runs, total_size, _, err := runStore.ListRuns(&model.FilterContext{}, opts)
+	assert.Nil(t, err)
+	assert.Equal(t, 3, len(runs))
+	assert.Equal(t, 3, total_size)
+}
+
+func TestListRuns_TotalSizeWithFilter(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	// Add a filter
+	filterProto := &api.Filter{
+		Predicates: []*api.Predicate{
+			{
+				Key: "name",
+				Op:  api.Predicate_IN,
+				Value: &api.Predicate_StringValues{
+					StringValues: &api.StringValues{
+						Values: []string{"run1", "run3"},
+					},
+				},
+			},
+		},
+	}
+	newFilter, _ := filter.New(filterProto)
+	opts, _ := list.NewOptions(&model.Run{}, 4, "", newFilter)
+	runs, total_size, _, err := runStore.ListRuns(&model.FilterContext{}, opts)
+	assert.Nil(t, err)
+	assert.Equal(t, 2, len(runs))
+	assert.Equal(t, 2, total_size)
+}
+
+func TestListRuns_SkipCount(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	opts, _ := list.NewOptions(&model.Run{}, 4, "", nil)
+	opts.SkipCount = true
+
+	runs, totalSize, _, err := runStore.ListRuns(&model.FilterContext{}, opts)
+	assert.Nil(t, err)
+	assert.Equal(t, 3, len(runs))
+	assert.Equal(t, -1, totalSize)
+}
+
+func TestListRuns_DoesNotSkipCountByDefault(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	// SkipCount left unset (false), matching every caller before this option existed.
+	opts, _ := list.NewOptions(&model.Run{}, 4, "", nil)
+
+	runs, totalSize, _, err := runStore.ListRuns(&model.FilterContext{}, opts)
+	assert.Nil(t, err)
+	assert.Equal(t, 3, len(runs))
+	assert.Equal(t, 3, totalSize)
+}
+
+func TestListRuns_Pagination_Descend(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	expectedFirstPageRuns := []*model.Run{
+		{
+			UUID:         "2",
+			ExperimentId: defaultFakeExpId,
+			K8SName:      "run2",
+			DisplayName:  "run2",
+			Namespace:    "n2",
+			StorageState: model.StorageStateAvailable,
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:          2,
+				ScheduledAtInSec:        2,
+				Conditions:              "Succeeded",
+				State:                   model.RuntimeStateSucceeded,
+				WorkflowRuntimeManifest: "workflow1",
+				StateHistory: []*model.RuntimeStatus{
+					{
+						UpdateTimeInSec: 2,
+						State:           model.RuntimeStateSucceeded,
+					},
+				},
+			},
+			Metrics: []*model.RunMetric{
+				{
+					RunUUID:     "2",
+					NodeID:      "node2",
+					Name:        "dummymetric",
+					NumberValue: 2.0,
+					Format:      "PERCENTAGE",
+				},
+			},
+			PipelineSpec: model.PipelineSpec{
+				RuntimeConfig: model.RuntimeConfig{
+					Parameters:   "[{\"name\":\"param2\",\"value\":\"world2\"}]",
+					PipelineRoot: "gs://my-bucket/path/to/root/run2",
+				},
+			},
+		},
+	}
+	expectedFirstPageRuns[0] = expectedFirstPageRuns[0].ToV1()
+	expectedSecondPageRuns := []*model.Run{
+		{
+			UUID:         "1",
+			ExperimentId: defaultFakeExpId,
+			K8SName:      "run1",
+			DisplayName:  "run1",
+			Namespace:    "n1",
+			StorageState: model.StorageStateAvailable,
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:          1,
+				ScheduledAtInSec:        1,
+				Conditions:              "Running",
+				State:                   model.RuntimeStateRunning,
+				WorkflowRuntimeManifest: "workflow1",
+				StateHistory: []*model.RuntimeStatus{
+					{
+						UpdateTimeInSec: 1,
+						State:           model.RuntimeStateRunning,
+					},
+				},
+			},
+			Metrics: []*model.RunMetric{
+				{
+					RunUUID:     "1",
+					NodeID:      "node1",
+					Name:        "dummymetric",
+					NumberValue: 1.0,
+					Format:      "PERCENTAGE",
+				},
+			},
+			PipelineSpec: model.PipelineSpec{
+				RuntimeConfig: model.RuntimeConfig{
+					Parameters:   "[{\"name\":\"param2\",\"value\":\"world1\"}]",
+					PipelineRoot: "gs://my-bucket/path/to/root/run1",
+				},
+			},
+		},
+	}
+	expectedSecondPageRuns[0] = expectedSecondPageRuns[0].ToV1()
+
+	opts, err := list.NewOptions(&model.Run{}, 1, "id desc", nil)
+	assert.Nil(t, err)
+	runs, total_size, nextPageToken, err := runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}}, opts)
+	for i, run := range runs {
+		runs[i] = run.ToV1()
+		fmt.Printf("%+v\n", run)
+	}
+
+	assert.Nil(t, err)
+	assert.Equal(t, 2, total_size)
+	assert.Equal(t, expectedFirstPageRuns, runs, "Unexpected Run listed")
+	assert.NotEmpty(t, nextPageToken)
+
+	opts, err = list.NewOptionsFromToken(nextPageToken, 1)
+	assert.Nil(t, err)
+	runs, total_size, nextPageToken, err = runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}}, opts)
+	runs[0] = runs[0].ToV1()
+	assert.Nil(t, err)
+	assert.Equal(t, 2, total_size)
+	assert.Equal(t, expectedSecondPageRuns, runs, "Unexpected Run listed")
+	assert.Empty(t, nextPageToken)
+}
+
+func TestListRuns_Pagination_LessThanPageSize(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	expectedRuns := []*model.Run{
+		{
+			UUID:         "1",
+			ExperimentId: defaultFakeExpId,
+			K8SName:      "run1",
+			DisplayName:  "run1",
+			Namespace:    "n1",
+
+			StorageState: model.StorageStateAvailable,
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:          1,
+				ScheduledAtInSec:        1,
+				State:                   model.RuntimeStateRunning,
+				Conditions:              "Running",
+				WorkflowRuntimeManifest: "workflow1",
+				StateHistory: []*model.RuntimeStatus{
+					{
+						UpdateTimeInSec: 1,
+						State:           model.RuntimeStateRunning,
+					},
+				},
+			},
+			Metrics: []*model.RunMetric{
+				{
+					RunUUID:     "1",
+					NodeID:      "node1",
+					Name:        "dummymetric",
+					NumberValue: 1.0,
+					Format:      "PERCENTAGE",
+				},
+			},
+			PipelineSpec: model.PipelineSpec{
+				RuntimeConfig: model.RuntimeConfig{
+					Parameters:   "[{\"name\":\"param2\",\"value\":\"world1\"}]",
+					PipelineRoot: "gs://my-bucket/path/to/root/run1",
+				},
+			},
+		},
+		{
+			UUID:         "2",
+			ExperimentId: defaultFakeExpId,
+			K8SName:      "run2",
+			DisplayName:  "run2",
+			Namespace:    "n2",
+
+			StorageState: model.StorageStateAvailable,
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:          2,
+				ScheduledAtInSec:        2,
+				State:                   model.RuntimeStateSucceeded,
+				Conditions:              "Succeeded",
+				WorkflowRuntimeManifest: "workflow1",
+				StateHistory: []*model.RuntimeStatus{
+					{
+						UpdateTimeInSec: 2,
+						State:           model.RuntimeStateSucceeded,
+					},
+				},
+			},
+			Metrics: []*model.RunMetric{
+				{
+					RunUUID:     "2",
+					NodeID:      "node2",
+					Name:        "dummymetric",
+					NumberValue: 2.0,
+					Format:      "PERCENTAGE",
+				},
+			},
+			PipelineSpec: model.PipelineSpec{
+				RuntimeConfig: model.RuntimeConfig{
+					Parameters:   "[{\"name\":\"param2\",\"value\":\"world2\"}]",
+					PipelineRoot: "gs://my-bucket/path/to/root/run2",
+				},
+			},
+		},
+	}
+	expectedRuns[0] = expectedRuns[0].ToV1()
+	expectedRuns[1] = expectedRuns[1].ToV1()
+
+	opts, err := list.NewOptions(&model.Run{}, 10, "", nil)
+	assert.Nil(t, err)
+	runs, total_size, nextPageToken, err := runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}}, opts)
+
+	runs[0] = runs[0].ToV1()
+	runs[1] = runs[1].ToV1()
+	assert.Nil(t, err)
+	assert.Equal(t, 2, total_size)
+	assert.Equal(t, expectedRuns, runs, "Unexpected Run listed")
+	assert.Empty(t, nextPageToken)
+}
+
+func TestListRunsError(t *testing.T) {
+	db, runStore := initializeRunStore()
+	db.Close()
+
+	opts, err := list.NewOptions(&model.Run{}, 1, "", nil)
+	_, _, _, err = runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}}, opts)
+	assert.Equal(t, codes.Internal, err.(*util.UserError).ExternalStatusCode(),
+		"Expected to throw an internal error")
+}
+
+func TestGetRun(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	expectedRun := &model.Run{
+		UUID:         "1",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run1",
+		DisplayName:  "run1",
+		Namespace:    "n1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			WorkflowRuntimeManifest: "workflow1",
+			CreatedAtInSec:          1,
+			ScheduledAtInSec:        1,
+			Conditions:              "Running",
+			State:                   model.RuntimeStateRunning,
+			StateHistory: []*model.RuntimeStatus{
+				{
+					UpdateTimeInSec: 1,
+					State:           model.RuntimeStateRunning,
+				},
+			},
+		},
+		Metrics: []*model.RunMetric{
+			{
+				RunUUID:     "1",
+				NodeID:      "node1",
+				Name:        "dummymetric",
+				NumberValue: 1.0,
+				Format:      "PERCENTAGE",
+			},
+		},
+		PipelineSpec: model.PipelineSpec{
+			RuntimeConfig: model.RuntimeConfig{
+				Parameters:   "[{\"name\":\"param2\",\"value\":\"world1\"}]",
+				PipelineRoot: "gs://my-bucket/path/to/root/run1",
+			},
+		},
+	}
+
+	runDetail, err := runStore.GetRun("1")
+	assert.Nil(t, err)
+	assert.Equal(t, expectedRun.ToV1(), runDetail.ToV1())
+}
+
+func TestGetRun_NotFoundError(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	_, err := runStore.GetRun("notfound")
+	assert.Equal(t, codes.NotFound, err.(*util.UserError).ExternalStatusCode(),
+		"Expected not to find the run")
+}
+
+func TestGetRun_InternalError(t *testing.T) {
+	db, runStore := initializeRunStore()
+	db.Close()
+
+	_, err := runStore.GetRun("1")
+	assert.Equal(t, codes.Internal, err.(*util.UserError).ExternalStatusCode(),
+		"Expected get run to return internal error")
+}
+
+func TestCreateAndUpdateRun_UpdateSuccess(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	expectedRun := &model.Run{
+		UUID:         "1",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run1",
+		DisplayName:  "run1",
+		Namespace:    "n1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          1,
+			ScheduledAtInSec:        1,
+			Conditions:              "Running",
+			State:                   model.RuntimeStateRunning,
+			WorkflowRuntimeManifest: "workflow1",
+			StateHistory: []*model.RuntimeStatus{
+				{
+					UpdateTimeInSec: 1,
+					State:           model.RuntimeStateRunning,
+				},
+			},
+		},
+		Metrics: []*model.RunMetric{
+			{
+				RunUUID:     "1",
+				NodeID:      "node1",
+				Name:        "dummymetric",
+				NumberValue: 1.0,
+				Format:      "PERCENTAGE",
+			},
+		},
+		PipelineSpec: model.PipelineSpec{
+			RuntimeConfig: model.RuntimeConfig{
+				Parameters:   "[{\"name\":\"param2\",\"value\":\"world1\"}]",
+				PipelineRoot: "gs://my-bucket/path/to/root/run1",
+			},
+		},
+	}
+
+	runDetail, err := runStore.GetRun("1")
+	assert.Nil(t, err)
+	assert.Equal(t, expectedRun.ToV1(), runDetail.ToV1())
+
+	runDetail = &model.Run{
+		UUID:         "1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			FinishedAtInSec:         100,
+			WorkflowRuntimeManifest: "workflow1_done",
+			Conditions:              "Succeeded",
+			ScheduledAtInSec:        200, // This is will be ignored
+			State:                   model.RuntimeStateSucceeded,
+		},
+	}
+
+	err = runStore.UpdateRun(runDetail)
+	assert.Nil(t, err)
+
+	expectedRun = &model.Run{
+		UUID:         "1",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run1",
+		DisplayName:  "run1",
+		Namespace:    "n1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          1,
+			ScheduledAtInSec:        1,
+			FinishedAtInSec:         100,
+			Conditions:              "Succeeded",
+			State:                   model.RuntimeStateSucceeded,
+			WorkflowRuntimeManifest: "workflow1_done",
+			StateHistory: []*model.RuntimeStatus{
+				{
+					UpdateTimeInSec: 4,
+					State:           model.RuntimeStateSucceeded,
+				},
+			},
+		},
+		Metrics: []*model.RunMetric{
+			{
+				RunUUID:     "1",
+				NodeID:      "node1",
+				Name:        "dummymetric",
+				NumberValue: 1.0,
+				Format:      "PERCENTAGE",
+			},
+		},
+		PipelineSpec: model.PipelineSpec{
+			RuntimeConfig: model.RuntimeConfig{
+				Parameters:   "[{\"name\":\"param2\",\"value\":\"world1\"}]",
+				PipelineRoot: "gs://my-bucket/path/to/root/run1",
+			},
+		},
+	}
+
+	runDetail, err = runStore.GetRun("1")
+	assert.Nil(t, err)
+	assert.Equal(t, expectedRun.ToV1(), runDetail.ToV1())
+}
+
+func TestUpdateRunIfRuntimeManifestsUnchangedRejectsStaleManifest(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	_, err := runStore.CreateRun(&model.Run{
+		UUID:         "manifest-cas-run",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "manifest-cas-run",
+		DisplayName:  "manifest-cas-run",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          1,
+			Conditions:              "Running",
+			State:                   model.RuntimeStateRunning,
+			WorkflowRuntimeManifest: "legacy-manifest",
+		},
+	})
+	require.NoError(t, err)
+
+	staleRun, err := runStore.GetRun("manifest-cas-run")
+	require.NoError(t, err)
+	currentRun, err := runStore.GetRun("manifest-cas-run")
+	require.NoError(t, err)
+	currentRun.WorkflowRuntimeManifest = "adopted-manifest"
+	require.NoError(t, runStore.UpdateRun(currentRun))
+
+	staleRun.WorkflowRuntimeManifest = "replacement-manifest"
+	updated, err := runStore.UpdateRunIfRuntimeManifestsUnchanged(
+		staleRun,
+		"legacy-manifest",
+		staleRun.PipelineRuntimeManifest,
+	)
+	require.NoError(t, err)
+	assert.False(t, updated)
+	persistedRun, err := runStore.GetRun("manifest-cas-run")
+	require.NoError(t, err)
+	assert.Equal(t, model.LargeText("adopted-manifest"), persistedRun.WorkflowRuntimeManifest)
+
+	persistedRun.WorkflowRuntimeManifest = "next-manifest"
+	updated, err = runStore.UpdateRunIfRuntimeManifestsUnchanged(
+		persistedRun,
+		"adopted-manifest",
+		persistedRun.PipelineRuntimeManifest,
+	)
+	require.NoError(t, err)
+	assert.True(t, updated)
+	persistedRun, err = runStore.GetRun("manifest-cas-run")
+	require.NoError(t, err)
+	assert.Equal(t, model.LargeText("next-manifest"), persistedRun.WorkflowRuntimeManifest)
+}
+
+func TestUpdateRunIfRuntimeManifestsUnchangedRejectsRecreatedRun(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	const runID = "runtime-manifest-aba-run"
+	_, err := runStore.CreateRun(&model.Run{
+		UUID:         runID,
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "original-workflow",
+		DisplayName:  "original-run",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          1,
+			Conditions:              "Pending",
+			State:                   model.RuntimeStatePending,
+			WorkflowRuntimeManifest: "",
+			PipelineRuntimeManifest: "original-runtime-manifest",
+		},
+	})
+	require.NoError(t, err)
+	staleRun, err := runStore.GetRun(runID)
+	require.NoError(t, err)
+
+	require.NoError(t, runStore.DeleteRun(runID))
+	_, err = runStore.CreateRun(&model.Run{
+		UUID:         runID,
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "replacement-workflow",
+		DisplayName:  "replacement-run",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          2,
+			Conditions:              "Pending",
+			State:                   model.RuntimeStatePending,
+			WorkflowRuntimeManifest: "",
+			PipelineRuntimeManifest: "replacement-runtime-manifest",
+		},
+	})
+	require.NoError(t, err)
+	replacementBeforeReport, err := runStore.GetRun(runID)
+	require.NoError(t, err)
+
+	staleRun.K8SName = "stale-terminal-workflow"
+	staleRun.State = model.RuntimeStateSucceeded
+	staleRun.Conditions = "Succeeded"
+	staleRun.WorkflowRuntimeManifest = "stale-terminal-manifest"
+	updated, err := runStore.UpdateRunIfRuntimeManifestsUnchanged(
+		staleRun,
+		"",
+		"original-runtime-manifest",
+	)
+	require.NoError(t, err)
+	assert.False(t, updated)
+
+	replacementAfterReport, err := runStore.GetRun(runID)
+	require.NoError(t, err)
+	assert.Equal(t, replacementBeforeReport, replacementAfterReport)
+}
+
+func TestCreateAndUpdateRun_CreateSuccess(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	// Checking that the run is not yet in the DB
+	_, err := runStore.GetRun("2000")
+	assert.NotNil(t, err)
+
+	runDetail := &model.Run{
+		UUID:         "2000",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "MY_NAME",
+		Namespace:    "MY_NAMESPACE",
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          11,
+			Conditions:              "Running",
+			State:                   model.RuntimeStateRunning,
+			WorkflowRuntimeManifest: "workflow_runtime_spec",
+		},
+		PipelineSpec: model.PipelineSpec{
+			WorkflowSpecManifest: "workflow_spec",
+		},
+	}
+
+	err = runStore.UpdateRun(runDetail)
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "Run 2000 not found")
+	_, err = runStore.CreateRun(runDetail)
+	assert.Nil(t, err)
+	expectedRun := &model.Run{
+		UUID:         "2000",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "MY_NAME",
+		Namespace:    "MY_NAMESPACE",
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          11,
+			Conditions:              "Running",
+			State:                   model.RuntimeStateRunning,
+			WorkflowRuntimeManifest: "workflow_runtime_spec",
+			StateHistory: []*model.RuntimeStatus{
+				{
+					UpdateTimeInSec: 4,
+					State:           model.RuntimeStateRunning,
+				},
+			},
+		},
+		PipelineSpec: model.PipelineSpec{
+			WorkflowSpecManifest: "workflow_spec",
+		},
+		StorageState: model.StorageStateAvailable,
+	}
+
+	runDetail, err = runStore.GetRun("2000")
+	assert.Nil(t, err)
+	assert.Equal(t, expectedRun.ToV1(), runDetail.ToV1())
+}
+
+func TestCreateAndUpdateRun_UpdateNotFound(t *testing.T) {
+	db, runStore := initializeRunStore()
+	db.Close()
+
+	run := &model.Run{
+		RunDetails: model.RunDetails{
+			WorkflowRuntimeManifest: "workflow1_done",
+			Conditions:              "Succeeded",
+			State:                   model.RuntimeStateSucceeded,
+		},
+	}
+	_, err := runStore.CreateRun(run)
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "Failed to create a new transaction to create run")
+	err = runStore.UpdateRun(&model.Run{DisplayName: "Test display name"})
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "transaction creation failed")
+}
+
+func TestCreateOrUpdateRun_NoStorageStateValue(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	runDetail := &model.Run{
+		UUID:         "1000",
+		K8SName:      "run1",
+		ExperimentId: defaultFakeExpId,
+		Namespace:    "n1",
+		RunDetails: model.RunDetails{
+			WorkflowRuntimeManifest: "workflow1",
+			CreatedAtInSec:          1,
+			ScheduledAtInSec:        1,
+			Conditions:              "Running",
+			State:                   model.RuntimeStateRunning,
+		},
+	}
+
+	run, err := runStore.CreateRun(runDetail)
+	assert.Nil(t, err)
+	assert.Equal(t, model.StorageStateAvailable, run.StorageState)
+}
+
+func TestCreateOrUpdateRun_DuplicateUUID(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	runDetail := &model.Run{
+		UUID:         "1",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run1",
+		StorageState: "bad value",
+		Namespace:    "n1",
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          1,
+			ScheduledAtInSec:        1,
+			Conditions:              "Running",
+			WorkflowRuntimeManifest: "workflow1",
+			State:                   model.RuntimeStateRunning,
+		},
+		Metrics: []*model.RunMetric{
+			{
+				RunUUID:     "1",
+				NodeID:      "node1",
+				Name:        "dummymetric",
+				NumberValue: 1.0,
+				Format:      "PERCENTAGE",
+			},
+		},
+	}
+
+	_, err := runStore.CreateRun(runDetail)
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "UNIQUE constraint failed: run_details.UUID")
+}
+
+func TestUpdateRun_RunNotExist(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	err := runStore.UpdateRun(&model.Run{UUID: "not-exist", RunDetails: model.RunDetails{State: model.RuntimeStateSucceeded}})
+	assert.NotNil(t, err)
+	assert.True(t, util.IsUserErrorCodeMatch(err, codes.NotFound))
+	assert.Contains(t, err.Error(), "not found")
+}
+
+func TestTerminateRun(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	err := runStore.TerminateRun("1")
+	assert.Nil(t, err)
+
+	expectedRun := &model.Run{
+		UUID:         "1",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run1",
+		DisplayName:  "run1",
+		Namespace:    "n1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          1,
+			ScheduledAtInSec:        1,
+			Conditions:              "Terminating",
+			WorkflowRuntimeManifest: "workflow1",
+			State:                   model.RuntimeStateCancelling,
+			StateHistory: []*model.RuntimeStatus{
+				{
+					UpdateTimeInSec: 1,
+					State:           model.RuntimeStateRunning,
+				},
+			},
+		},
+		Metrics: []*model.RunMetric{
+			{
+				RunUUID:     "1",
+				NodeID:      "node1",
+				Name:        "dummymetric",
+				NumberValue: 1.0,
+				Format:      "PERCENTAGE",
+			},
+		},
+		PipelineSpec: model.PipelineSpec{
+			RuntimeConfig: model.RuntimeConfig{
+				Parameters:   "[{\"name\":\"param2\",\"value\":\"world1\"}]",
+				PipelineRoot: "gs://my-bucket/path/to/root/run1",
+			},
+		},
+	}
+
+	runDetail, err := runStore.GetRun("1")
+	assert.Nil(t, err)
+	assert.Equal(t, expectedRun.ToV1(), runDetail.ToV1())
+}
+
+func TestTerminateRun_RunDoesNotExist(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	err := runStore.TerminateRun("does-not-exist")
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "Row not found")
+}
+
+func TestTerminateRun_RunHasAlreadyFinished(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	err := runStore.TerminateRun("2")
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "Row not found")
+}
+
+func TestCreateMetric_Success(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	metric := &model.RunMetric{
+		RunUUID:     "1",
+		NodeID:      "node1",
+		Name:        "acurracy",
+		NumberValue: 0.77,
+		Format:      "PERCENTAGE",
+	}
+	runStore.CreateMetric(metric)
+
+	runDetail, err := runStore.GetRun("1")
+	assert.Nil(t, err, "Got error: %+v", err)
+	sort.Sort(RunMetricSorter(runDetail.Metrics))
+	assert.Equal(t, []*model.RunMetric{
+		metric,
+		{
+			RunUUID:     "1",
+			NodeID:      "node1",
+			Name:        "dummymetric",
+			NumberValue: 1.0,
+			Format:      "PERCENTAGE",
+		},
+	}, runDetail.Metrics)
+}
+
+func TestCreateMetric_DupReports_Fail(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	metric1 := &model.RunMetric{
+		RunUUID:     "1",
+		NodeID:      "node1",
+		Name:        "acurracy",
+		NumberValue: 0.77,
+		Format:      "PERCENTAGE",
+	}
+	metric2 := &model.RunMetric{
+		RunUUID:     "1",
+		NodeID:      "node1",
+		Name:        "acurracy",
+		NumberValue: 0.88,
+		Format:      "PERCENTAGE",
+	}
+	runStore.CreateMetric(metric1)
+
+	err := runStore.CreateMetric(metric2)
+	_, ok := err.(*util.UserError)
+	assert.True(t, ok)
+}
+
+func TestGetRun_InvalidMetricPayload_Ignore(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+	sql, args, _ := sq.
+		Insert("run_metrics").
+		SetMap(sq.Eq{
+			"RunUUID":     "1",
+			"NodeID":      "node1",
+			"Name":        "accuracy",
+			"NumberValue": 0.88,
+			"Format":      "RAW",
+			"Payload":     "{ invalid; json,",
+		}).ToSql()
+	db.Exec(sql, args...)
+
+	run, err := runStore.GetRun("1")
+	assert.Nil(t, err, "Got error: %+v", err)
+	assert.Empty(t, run.Metrics)
+}
+
+func TestListRuns_WithMetrics(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+	metric1 := &model.RunMetric{
+		RunUUID:     "1",
+		NodeID:      "node1",
+		Name:        "acurracy",
+		NumberValue: 0.77,
+		Format:      "PERCENTAGE",
+	}
+	metric2 := &model.RunMetric{
+		RunUUID:     "1",
+		NodeID:      "node2",
+		Name:        "logloss",
+		NumberValue: -1.2,
+		Format:      "RAW",
+	}
+	metric3 := &model.RunMetric{
+		RunUUID:     "2",
+		NodeID:      "node2",
+		Name:        "logloss",
+		NumberValue: -1.3,
+		Format:      "RAW",
+	}
+	runStore.CreateMetric(metric1)
+	runStore.CreateMetric(metric2)
+	runStore.CreateMetric(metric3)
+
+	expectedRuns := []*model.Run{
+		{
+			UUID:         "1",
+			ExperimentId: defaultFakeExpId,
+			K8SName:      "run1",
+			DisplayName:  "run1",
+			Namespace:    "n1",
+			StorageState: model.StorageStateAvailable,
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:          1,
+				ScheduledAtInSec:        1,
+				Conditions:              "Running",
+				State:                   model.RuntimeStateRunning,
+				WorkflowRuntimeManifest: "workflow1",
+				StateHistory: []*model.RuntimeStatus{
+					{
+						UpdateTimeInSec: 1,
+						State:           model.RuntimeStateRunning,
+					},
+				},
+			},
+			PipelineSpec: model.PipelineSpec{
+				RuntimeConfig: model.RuntimeConfig{
+					Parameters:   "[{\"name\":\"param2\",\"value\":\"world1\"}]",
+					PipelineRoot: "gs://my-bucket/path/to/root/run1",
+				},
+			},
+			Metrics: []*model.RunMetric{
+				{
+					RunUUID:     "1",
+					NodeID:      "node1",
+					Name:        "dummymetric",
+					NumberValue: 1.0,
+					Format:      "PERCENTAGE",
+				},
+				metric1,
+				metric2,
+			},
+		},
+		{
+			UUID:         "2",
+			ExperimentId: defaultFakeExpId,
+			K8SName:      "run2",
+			DisplayName:  "run2",
+			Namespace:    "n2",
+			StorageState: model.StorageStateAvailable,
+
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:          2,
+				ScheduledAtInSec:        2,
+				Conditions:              "Succeeded",
+				State:                   model.RuntimeStateSucceeded,
+				WorkflowRuntimeManifest: "workflow1",
+				StateHistory: []*model.RuntimeStatus{
+					{
+						UpdateTimeInSec: 2,
+						State:           model.RuntimeStateSucceeded,
+					},
+				},
+			},
+			PipelineSpec: model.PipelineSpec{
+				RuntimeConfig: model.RuntimeConfig{
+					Parameters:   "[{\"name\":\"param2\",\"value\":\"world2\"}]",
+					PipelineRoot: "gs://my-bucket/path/to/root/run2",
+				},
+			},
+			Metrics: []*model.RunMetric{
+				{
+					RunUUID:     "2",
+					NodeID:      "node2",
+					Name:        "dummymetric",
+					NumberValue: 2.0,
+					Format:      "PERCENTAGE",
+				},
+				metric3,
+			},
+		},
+	}
+	expectedRuns[0] = expectedRuns[0].ToV1()
+	expectedRuns[1] = expectedRuns[1].ToV1()
+
+	opts, err := list.NewOptions(&model.Run{}, 2, "id", nil)
+	assert.Nil(t, err)
+	runs, total_size, _, err := runStore.ListRuns(&model.FilterContext{}, opts)
+	runs[0] = runs[0].ToV1()
+	runs[1] = runs[1].ToV1()
+	assert.Equal(t, 3, total_size)
+	assert.Nil(t, err)
+	for _, run := range expectedRuns {
+		sort.Sort(RunMetricSorter(run.Metrics))
+	}
+	for _, run := range runs {
+		sort.Sort(RunMetricSorter(run.Metrics))
+	}
+	assert.Equal(t, expectedRuns, runs, "Unexpected Run listed")
+}
+
+func TestArchiveRun(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+	resourceReferenceStore := NewResourceReferenceStore(db, nil)
+	// Check resource reference exists
+	r, err := resourceReferenceStore.GetResourceReference("1", model.RunResourceType, model.ExperimentResourceType)
+	assert.Nil(t, err)
+	assert.Equal(t, r.ReferenceUUID, defaultFakeExpId)
+
+	// Archive run
+	err = runStore.ArchiveRun("1")
+	assert.Nil(t, err)
+	run, getRunErr := runStore.GetRun("1")
+	assert.Nil(t, getRunErr)
+	assert.Equal(t, run.StorageState, model.StorageStateArchived)
+
+	// Check resource reference wasn't deleted
+	_, err = resourceReferenceStore.GetResourceReference("1", model.RunResourceType, model.ExperimentResourceType)
+	assert.Nil(t, err)
+}
+
+func TestArchiveRun_InternalError(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	db.Close()
+
+	err := runStore.ArchiveRun("1")
+	assert.Equal(t, codes.Internal, err.(*util.UserError).ExternalStatusCode(),
+		"Expected archive run to return internal error")
+}
+
+func TestUnarchiveRun(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+	resourceReferenceStore := NewResourceReferenceStore(db, nil)
+	// Check resource reference exists
+	r, err := resourceReferenceStore.GetResourceReference("1", model.RunResourceType, model.ExperimentResourceType)
+	assert.Nil(t, err)
+	assert.Equal(t, r.ReferenceUUID, defaultFakeExpId)
+
+	// Archive run
+	err = runStore.ArchiveRun("1")
+	assert.Nil(t, err)
+	run, getRunErr := runStore.GetRun("1")
+	assert.Nil(t, getRunErr)
+	assert.Equal(t, run.StorageState, model.StorageStateArchived)
+
+	// Unarchive it back
+	err = runStore.UnarchiveRun("1")
+	assert.Nil(t, err)
+	run, getRunErr = runStore.GetRun("1")
+	assert.Nil(t, getRunErr)
+	assert.Equal(t, run.StorageState, model.StorageStateAvailable)
+
+	// Check resource reference wasn't deleted
+	_, err = resourceReferenceStore.GetResourceReference("1", model.RunResourceType, model.ExperimentResourceType)
+	assert.Nil(t, err)
+}
+
+func TestUnarchiveRun_InternalError(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	db.Close()
+
+	err := runStore.UnarchiveRun("1")
+	assert.Equal(t, codes.Internal, err.(*util.UserError).ExternalStatusCode(),
+		"Expected unarchive run to return internal error")
+}
+
+func TestArchiveRun_IncludedInRunList(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	// Archive run
+	err := runStore.ArchiveRun("1")
+	assert.Nil(t, err)
+	run, getRunErr := runStore.GetRun("1")
+	assert.Nil(t, getRunErr)
+	assert.Equal(t, run.StorageState, model.StorageStateArchived)
+
+	expectedRuns := []*model.Run{
+		{
+			UUID:         "1",
+			ExperimentId: defaultFakeExpId,
+			K8SName:      "run1",
+			DisplayName:  "run1",
+			Namespace:    "n1",
+			StorageState: model.StorageStateArchived,
+
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:          1,
+				ArchivedAtInSec:         4,
+				ScheduledAtInSec:        1,
+				Conditions:              "Running",
+				State:                   model.RuntimeStateRunning,
+				WorkflowRuntimeManifest: "workflow1",
+				StateHistory: []*model.RuntimeStatus{
+					{
+						UpdateTimeInSec: 1,
+						State:           model.RuntimeStateRunning,
+					},
+				},
+			},
+			Metrics: []*model.RunMetric{
+				{
+					RunUUID:     "1",
+					NodeID:      "node1",
+					Name:        "dummymetric",
+					NumberValue: 1.0,
+					Format:      "PERCENTAGE",
+				},
+			},
+			PipelineSpec: model.PipelineSpec{
+				RuntimeConfig: model.RuntimeConfig{
+					Parameters:   "[{\"name\":\"param2\",\"value\":\"world1\"}]",
+					PipelineRoot: "gs://my-bucket/path/to/root/run1",
+				},
+			},
+		},
+	}
+	expectedRuns[0] = expectedRuns[0].ToV1()
+	opts, err := list.NewOptions(&model.Run{}, 1, "", nil)
+	runs, total_size, nextPageToken, err := runStore.ListRuns(
+		&model.FilterContext{ReferenceKey: &model.ReferenceKey{Type: model.ExperimentResourceType, ID: defaultFakeExpId}}, opts)
+	runs[0] = runs[0].ToV1()
+	assert.Nil(t, err)
+	assert.Equal(t, 2, total_size)
+	assert.Equal(t, expectedRuns, runs)
+	assert.NotEmpty(t, nextPageToken)
+}
+
+func TestDeleteRun(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+	resourceReferenceStore := NewResourceReferenceStore(db, nil)
+	// Check resource reference exists
+	r, err := resourceReferenceStore.GetResourceReference("1", model.RunResourceType, model.ExperimentResourceType)
+	assert.Nil(t, err)
+	assert.Equal(t, r.ReferenceUUID, defaultFakeExpId)
+
+	// Delete run
+	err = runStore.DeleteRun("1")
+	assert.Nil(t, err)
+	_, err = runStore.GetRun("1")
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "Run 1 not found")
+
+	// Check resource reference deleted
+	_, err = resourceReferenceStore.GetResourceReference("1", model.RunResourceType, model.ExperimentResourceType)
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+func TestDeleteRun_InternalError(t *testing.T) {
+	db, runStore := initializeRunStore()
+	db.Close()
+
+	err := runStore.DeleteRun("1")
+	assert.Equal(t, codes.Internal, err.(*util.UserError).ExternalStatusCode(),
+		"Expected delete run to return internal error")
+}
+
+func TestDeleteRun_CleansUpTasksAndMetrics(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+	taskStore := NewTaskStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpIdTwo, nil))
+
+	run := &model.Run{
+		UUID:         defaultFakeRunId,
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run1",
+		DisplayName:  "run1",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:  1,
+			FinishedAtInSec: 100,
+			State:           model.RuntimeStateSucceeded,
+			Conditions:      "Succeeded",
+		},
+	}
+	runStore.CreateRun(run)
+
+	runStore.CreateMetric(&model.RunMetric{
+		RunUUID:     defaultFakeRunId,
+		NodeID:      "node1",
+		Name:        "accuracy",
+		NumberValue: 0.95,
+		Format:      "RAW",
+	})
+
+	taskStore.CreateTask(&model.Task{
+		Namespace:    "ns1",
+		PipelineName: "pipeline1",
+		RunID:        defaultFakeRunId,
+		PodName:      "pod1",
+		State:        model.RuntimeStateSucceeded,
+	})
+
+	// Verify rows exist before deletion.
+	var metricCount int
+	err := db.QueryRow("SELECT COUNT(*) FROM run_metrics WHERE RunUUID = ?", defaultFakeRunId).Scan(&metricCount)
+	require.Nil(t, err)
+	assert.Equal(t, 1, metricCount)
+
+	var taskCount int
+	err = db.QueryRow("SELECT COUNT(*) FROM tasks WHERE RunUUID = ?", defaultFakeRunId).Scan(&taskCount)
+	require.Nil(t, err)
+	assert.Equal(t, 1, taskCount)
+
+	// Delete the run.
+	err = runStore.DeleteRun(defaultFakeRunId)
+	assert.Nil(t, err)
+
+	// Verify all dependent rows are gone.
+	err = db.QueryRow("SELECT COUNT(*) FROM run_metrics WHERE RunUUID = ?", defaultFakeRunId).Scan(&metricCount)
+	require.Nil(t, err)
+	assert.Equal(t, 0, metricCount)
+
+	err = db.QueryRow("SELECT COUNT(*) FROM tasks WHERE RunUUID = ?", defaultFakeRunId).Scan(&taskCount)
+	require.Nil(t, err)
+	assert.Equal(t, 0, taskCount)
+
+	_, err = runStore.GetRun(defaultFakeRunId)
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+func TestParseMetrics(t *testing.T) {
+	expectedModelRunMetrics := []*model.RunMetric{
+		{
+			RunUUID:     "run-1",
+			Name:        "metric-1",
+			NodeID:      "node-1",
+			NumberValue: 0.88,
+			Format:      "RAW",
+		},
+	}
+	metricsByte, _ := json.Marshal(expectedModelRunMetrics)
+	metricsString := string(metricsByte)
+	metricsNullString := sql.NullString{
+		Valid:  true,
+		String: metricsString,
+	}
+	parsedMetrics, err := parseMetrics(metricsNullString)
+	assert.Nil(t, err)
+	assert.Equal(t, expectedModelRunMetrics, parsedMetrics)
+}
+
+func TestParseRuntimeConfig(t *testing.T) {
+	expectedRuntimeConfig := model.RuntimeConfig{
+		Parameters:   `[{"name":"param2","value":"world1"}]`,
+		PipelineRoot: "gs://my-bucket/path/to/root/run1",
+	}
+	parametersNullString := sql.NullString{
+		Valid:  true,
+		String: `[{"name":"param2","value":"world1"}]`,
+	}
+	pipelineRootNullString := sql.NullString{
+		Valid:  true,
+		String: "gs://my-bucket/path/to/root/run1",
+	}
+	actualRuntimeConfig := parseRuntimeConfig(parametersNullString, pipelineRootNullString)
+	assert.Equal(t, expectedRuntimeConfig, actualRuntimeConfig)
+}
+
+func TestParseResourceReferences(t *testing.T) {
+	expectedResourceReferences := []*model.ResourceReference{
+		{
+			ResourceUUID: "2", ResourceType: model.RunResourceType,
+			ReferenceUUID: defaultFakeExpId, ReferenceName: "e1",
+			ReferenceType: model.ExperimentResourceType, Relationship: model.CreatorRelationship,
+		},
+	}
+	resourceReferencesBytes, _ := json.Marshal(expectedResourceReferences)
+	resourceReferencesString := string(resourceReferencesBytes)
+	resourceReferencesNullString := sql.NullString{
+		Valid:  true,
+		String: resourceReferencesString,
+	}
+	actualResourceReferences, err := parseResourceReferences(resourceReferencesNullString)
+	assert.Nil(t, err)
+	assert.Equal(t, expectedResourceReferences, actualResourceReferences)
+}
+
+func TestRunAPIFieldMap(t *testing.T) {
+	for _, modelField := range (&model.Run{}).APIToModelFieldMap() {
+		assert.Contains(t, runColumns, modelField)
+	}
+}
+
+func TestGetRunByRecurringRunIdAndDisplayName(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	// Create the run without RecurringRunId to avoid the resource-reference FK
+	// check, then patch JobUUID directly so the column is set as the query expects.
+	runWithRecurring := &model.Run{
+		UUID:         "recurring-run-uuid",
+		DisplayName:  "scheduled-run-trigger-1",
+		K8SName:      "scheduled-run-k8s",
+		Namespace:    "n1",
+		StorageState: model.StorageStateAvailable,
+		ExperimentId: defaultFakeExpId,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec: 10,
+			State:          model.RuntimeStatePending,
+		},
+	}
+	_, err := runStore.CreateRun(runWithRecurring)
+	assert.Nil(t, err)
+	_, err = db.Exec(`UPDATE run_details SET JobUUID = ? WHERE UUID = ?`, "job-uuid-1", "recurring-run-uuid")
+	assert.Nil(t, err)
+
+	tests := []struct {
+		name           string
+		recurringRunID string
+		displayName    string
+		wantUUID       string
+	}{
+		{
+			name:           "found with matching recurring run id and display name",
+			recurringRunID: "job-uuid-1",
+			displayName:    "scheduled-run-trigger-1",
+			wantUUID:       "recurring-run-uuid",
+		},
+		{
+			name:           "not found when recurring run id does not match",
+			recurringRunID: "different-job-uuid",
+			displayName:    "scheduled-run-trigger-1",
+			wantUUID:       "",
+		},
+		{
+			name:           "not found when display name does not match",
+			recurringRunID: "job-uuid-1",
+			displayName:    "different-display-name",
+			wantUUID:       "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uuid, err := runStore.GetRunByRecurringRunIDAndDisplayName(tt.recurringRunID, tt.displayName)
+			assert.Nil(t, err)
+			assert.Equal(t, tt.wantUUID, uuid)
+		})
+	}
+}
+
+func TestCreateRun_DuplicateRecurringRunIsIdempotent(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer db.Close()
+
+	// Recurring-run triggers compute a deterministic UUID, so a concurrent trigger
+	// reuses the same primary key. Created without RecurringRunId to avoid the
+	// resource-reference FK check, then JobUUID is patched to mark it recurring.
+	const sharedUUID = "deterministic-run-uuid"
+	firstRun := &model.Run{
+		UUID:         sharedUUID,
+		DisplayName:  "scheduled-run-trigger-1",
+		K8SName:      "scheduled-run-k8s",
+		Namespace:    "n1",
+		StorageState: model.StorageStateAvailable,
+		ExperimentId: defaultFakeExpId,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec: 10,
+			State:          model.RuntimeStatePending,
+		},
+	}
+	_, err := runStore.CreateRun(firstRun)
+	assert.Nil(t, err)
+	_, err = db.Exec(`UPDATE run_details SET JobUUID = ? WHERE UUID = ?`, "job-uuid-1", sharedUUID)
+	assert.Nil(t, err)
+
+	// A second trigger races in with the same deterministic UUID and RecurringRunId.
+	// The duplicate primary-key insert must resolve to the existing run, not error.
+	secondRun := &model.Run{
+		UUID:           sharedUUID,
+		DisplayName:    "scheduled-run-trigger-1",
+		RecurringRunId: "job-uuid-1",
+		K8SName:        "scheduled-run-k8s",
+		Namespace:      "n1",
+		StorageState:   model.StorageStateAvailable,
+		ExperimentId:   defaultFakeExpId,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec: 11,
+			State:          model.RuntimeStatePending,
+		},
+	}
+	returned, err := runStore.CreateRun(secondRun)
+	assert.Nil(t, err)
+	assert.Equal(t, sharedUUID, returned.UUID)
+	assert.Equal(t, "scheduled-run-trigger-1", returned.DisplayName)
+	// The original CreatedAtInSec is preserved, proving no overwrite occurred.
+	assert.Equal(t, int64(10), returned.CreatedAtInSec)
+
+	// Only one row exists for this recurring run + display name.
+	existingUUID, err := runStore.GetRunByRecurringRunIDAndDisplayName("job-uuid-1", "scheduled-run-trigger-1")
+	assert.Nil(t, err)
+	assert.Equal(t, sharedUUID, existingUUID)
+}
+func TestCreateRunWithPluginsFields(t *testing.T) {
+	const runUUID = "plugins-run-1"
+	db, runStore := initializeRunStore()
+	defer func() { require.NoError(t, db.Close()) }()
+
+	run := &model.Run{
+		UUID:         runUUID,
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "plugins-run",
+		DisplayName:  "plugins-run",
+		Namespace:    "n1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          100,
+			Conditions:              "Running",
+			State:                   model.RuntimeStateRunning,
+			WorkflowRuntimeManifest: "workflow1",
+			PluginsInputString:      testLargeTextPtr(`{"mlflow":{"experiment_name":"my-exp"}}`),
+			PluginsOutputString:     testLargeTextPtr(`{"mlflow":{"entries":{"root_run_id":{"value":"abc123"}},"state":"PLUGIN_SUCCEEDED","stateMessage":"ok"}}`),
+		},
+	}
+	_, err := runStore.CreateRun(run)
+	require.NoError(t, err)
+
+	got, err := runStore.GetRun(runUUID)
+	require.NoError(t, err)
+	require.NotNil(t, got.PluginsInputString)
+	assert.Equal(t, model.LargeText(`{"mlflow":{"experiment_name":"my-exp"}}`), *got.PluginsInputString)
+	require.NotNil(t, got.PluginsOutputString)
+	assert.Equal(t, model.LargeText(`{"mlflow":{"entries":{"root_run_id":{"value":"abc123"}},"state":"PLUGIN_SUCCEEDED","stateMessage":"ok"}}`), *got.PluginsOutputString)
+}
+
+func TestCreateRunWithEmptyPluginsFieldsWritesNull(t *testing.T) {
+	const runUUID = "empty-plugins-1"
+	db, runStore := initializeRunStore()
+	defer func() { require.NoError(t, db.Close()) }()
+
+	run := &model.Run{
+		UUID:         runUUID,
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "empty-plugins-run",
+		DisplayName:  "empty-plugins-run",
+		Namespace:    "n1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          100,
+			Conditions:              "Running",
+			State:                   model.RuntimeStateRunning,
+			WorkflowRuntimeManifest: "workflow1",
+		},
+	}
+	_, err := runStore.CreateRun(run)
+	require.NoError(t, err)
+
+	got, err := runStore.GetRun(runUUID)
+	require.NoError(t, err)
+	assert.Nil(t, got.PluginsInputString, "nil plugins_input should round-trip as nil")
+	assert.Nil(t, got.PluginsOutputString, "nil plugins_output should round-trip as nil")
+
+	// Verify at the DB level that the columns are NULL, not empty strings.
+	// The read path only sets the field when sql.NullString.Valid is true,
+	// so a non-zero value here would mean '' was written instead of NULL.
+	var pluginsInput, pluginsOutput sql.NullString
+	row := db.QueryRow("SELECT PluginsInput, PluginsOutput FROM run_details WHERE UUID = ?", runUUID)
+	err = row.Scan(&pluginsInput, &pluginsOutput)
+	require.NoError(t, err)
+	assert.False(t, pluginsInput.Valid, "PluginsInput column should be NULL, not empty string")
+	assert.False(t, pluginsOutput.Valid, "PluginsOutput column should be NULL, not empty string")
+}
+
+func TestUpdateRunPreservesPluginsFields(t *testing.T) {
+	const runUUID = "preserve-plugins-1"
+	db, runStore := initializeRunStore()
+	defer func() { require.NoError(t, db.Close()) }()
+
+	run := &model.Run{
+		UUID:         runUUID,
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "preserve-run",
+		DisplayName:  "preserve-run",
+		Namespace:    "n1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          100,
+			Conditions:              "Running",
+			State:                   model.RuntimeStateRunning,
+			WorkflowRuntimeManifest: "workflow1",
+			PluginsInputString:      testLargeTextPtr(`{"mlflow":{"experiment_name":"preserved"}}`),
+			PluginsOutputString:     testLargeTextPtr(`{"mlflow":{"state":"PLUGIN_RUNNING"}}`),
+		},
+	}
+	_, err := runStore.CreateRun(run)
+	require.NoError(t, err)
+
+	run.State = model.RuntimeStateSucceeded
+	run.Conditions = "Succeeded"
+	err = runStore.UpdateRun(run)
+	require.NoError(t, err)
+
+	got, err := runStore.GetRun(runUUID)
+	require.NoError(t, err)
+	require.NotNil(t, got.PluginsInputString)
+	assert.Equal(t, model.LargeText(`{"mlflow":{"experiment_name":"preserved"}}`), *got.PluginsInputString)
+	require.NotNil(t, got.PluginsOutputString)
+	assert.Equal(t, model.LargeText(`{"mlflow":{"state":"PLUGIN_RUNNING"}}`), *got.PluginsOutputString)
+	assert.Equal(t, model.RuntimeStateSucceeded, got.State)
+}
+
+func TestUpdateRunPluginsOutputOnly(t *testing.T) {
+	const runUUID = "plugins-output-only-1"
+	db, runStore := initializeRunStore()
+	defer func() { require.NoError(t, db.Close()) }()
+
+	run := &model.Run{
+		UUID:         runUUID,
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "plugins-output-run",
+		DisplayName:  "plugins-output-run",
+		Namespace:    "n1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          100,
+			Conditions:              "Running",
+			State:                   model.RuntimeStateRunning,
+			WorkflowRuntimeManifest: "original-manifest",
+			PluginsInputString:      testLargeTextPtr(`{"mlflow":{"experiment_name":"my-exp"}}`),
+			PluginsOutputString:     testLargeTextPtr(`{"mlflow":{"state":"PLUGIN_RUNNING"}}`),
+		},
+	}
+	_, err := runStore.CreateRun(run)
+	require.NoError(t, err)
+
+	// Update only PluginsOutput — core fields must remain untouched.
+	updatedOutput := testLargeTextPtr(`{"mlflow":{"state":"PLUGIN_SUCCEEDED","stateMessage":""}}`)
+	err = runStore.UpdateRunPluginsOutput(runUUID, updatedOutput)
+	require.NoError(t, err)
+
+	got, err := runStore.GetRun(runUUID)
+	require.NoError(t, err)
+
+	// Core fields should be unchanged.
+	assert.Equal(t, model.RuntimeStateRunning, got.State)
+	assert.Equal(t, "Running", got.Conditions)
+	assert.Equal(t, model.LargeText("original-manifest"), got.WorkflowRuntimeManifest)
+
+	// PluginsInput should be unchanged.
+	require.NotNil(t, got.PluginsInputString)
+	assert.Equal(t, model.LargeText(`{"mlflow":{"experiment_name":"my-exp"}}`), *got.PluginsInputString)
+
+	// PluginsOutput should be updated.
+	require.NotNil(t, got.PluginsOutputString)
+	assert.Equal(t, model.LargeText(`{"mlflow":{"state":"PLUGIN_SUCCEEDED","stateMessage":""}}`), *got.PluginsOutputString)
+}
+
+func TestUpdateRunPluginsOutputNotFound(t *testing.T) {
+	db, runStore := initializeRunStore()
+	defer func() { require.NoError(t, db.Close()) }()
+
+	output := testLargeTextPtr(`{"mlflow":{"state":"PLUGIN_FAILED"}}`)
+	err := runStore.UpdateRunPluginsOutput("non-existent-run-id", output)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+func TestListRunsReturnsPluginsFields(t *testing.T) {
+	const runName = "list-run"
+	db, runStore := initializeRunStore()
+	defer func() { require.NoError(t, db.Close()) }()
+
+	run := &model.Run{
+		UUID:         "list-plugins-1",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      runName,
+		DisplayName:  runName,
+		Namespace:    "n1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          200,
+			Conditions:              "Running",
+			State:                   model.RuntimeStateRunning,
+			WorkflowRuntimeManifest: "workflow1",
+			PluginsInputString:      testLargeTextPtr(`{"mlflow":{"experiment_name":"list-exp"}}`),
+			PluginsOutputString:     testLargeTextPtr(`{"mlflow":{"state":"PLUGIN_RUNNING"}}`),
+		},
+	}
+	_, err := runStore.CreateRun(run)
+	require.NoError(t, err)
+
+	filterProto := &api.Filter{
+		Predicates: []*api.Predicate{
+			{
+				Key:   "name",
+				Op:    api.Predicate_EQUALS,
+				Value: &api.Predicate_StringValue{StringValue: runName},
+			},
+		},
+	}
+	newFilter, err := filter.New(filterProto)
+	require.NoError(t, err)
+	opts, err := list.NewOptions(&model.Run{}, 10, "id", newFilter)
+	require.NoError(t, err)
+	runs, _, _, err := runStore.ListRuns(&model.FilterContext{}, opts)
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	require.NotNil(t, runs[0].PluginsInputString)
+	assert.Equal(t, model.LargeText(`{"mlflow":{"experiment_name":"list-exp"}}`), *runs[0].PluginsInputString)
+	require.NotNil(t, runs[0].PluginsOutputString)
+	assert.Equal(t, model.LargeText(`{"mlflow":{"state":"PLUGIN_RUNNING"}}`), *runs[0].PluginsOutputString)
+}
+
+func TestArchiveExpiredRuns_ArchivesTerminalRunsPastCutoff(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	// Run that finished 100 seconds ago (epoch=100) with terminal state SUCCEEDED.
+	succeededRun := &model.Run{
+		UUID:         "run-succeeded",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-succeeded",
+		DisplayName:  "run-succeeded",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:  1,
+			FinishedAtInSec: 100,
+			State:           model.RuntimeStateSucceeded,
+			Conditions:      "Succeeded",
+		},
+	}
+	// Run that finished 200 seconds ago with terminal state FAILED.
+	failedRun := &model.Run{
+		UUID:         "run-failed",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-failed",
+		DisplayName:  "run-failed",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:  1,
+			FinishedAtInSec: 200,
+			State:           model.RuntimeStateFailed,
+			Conditions:      "Failed",
+		},
+	}
+	// Run that is still RUNNING — should NOT be archived.
+	runningRun := &model.Run{
+		UUID:         "run-running",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-running",
+		DisplayName:  "run-running",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec: 1,
+			State:          model.RuntimeStateRunning,
+			Conditions:     "Running",
+		},
+	}
+
+	runStore.CreateRun(succeededRun)
+	runStore.CreateRun(failedRun)
+	runStore.CreateRun(runningRun)
+
+	// Cutoff at epoch 300 — both terminal runs finished before 300.
+	archived, err := runStore.ArchiveExpiredRuns(300, 100)
+	assert.Nil(t, err)
+	assert.Equal(t, int64(2), archived)
+
+	// Verify the two terminal runs are now ARCHIVED.
+	run, err := runStore.GetRun("run-succeeded")
+	assert.Nil(t, err)
+	assert.Equal(t, model.StorageStateArchived, run.StorageState)
+
+	run, err = runStore.GetRun("run-failed")
+	assert.Nil(t, err)
+	assert.Equal(t, model.StorageStateArchived, run.StorageState)
+
+	// Verify the running run is still AVAILABLE.
+	run, err = runStore.GetRun("run-running")
+	assert.Nil(t, err)
+	assert.Equal(t, model.StorageStateAvailable, run.StorageState)
+}
+
+func TestArchiveExpiredRuns_NoCandidates(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	// Run that finished AFTER the cutoff — should NOT be archived.
+	recentRun := &model.Run{
+		UUID:         "run-recent",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-recent",
+		DisplayName:  "run-recent",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:  1,
+			FinishedAtInSec: 500,
+			State:           model.RuntimeStateSucceeded,
+			Conditions:      "Succeeded",
+		},
+	}
+	runStore.CreateRun(recentRun)
+
+	// Cutoff at epoch 300 — run finished at 500 so it's not expired.
+	archived, err := runStore.ArchiveExpiredRuns(300, 100)
+	assert.Nil(t, err)
+	assert.Equal(t, int64(0), archived)
+
+	run, err := runStore.GetRun("run-recent")
+	assert.Nil(t, err)
+	assert.Equal(t, model.StorageStateAvailable, run.StorageState)
+}
+
+func TestArchiveExpiredRuns_RespectsAlreadyArchived(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	// Already archived run — should NOT be re-archived (no-op).
+	archivedRun := &model.Run{
+		UUID:         "run-already-archived",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-already-archived",
+		DisplayName:  "run-already-archived",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateArchived,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:  1,
+			FinishedAtInSec: 100,
+			State:           model.RuntimeStateSucceeded,
+			Conditions:      "Succeeded",
+		},
+	}
+	runStore.CreateRun(archivedRun)
+
+	archived, err := runStore.ArchiveExpiredRuns(300, 100)
+	assert.Nil(t, err)
+	assert.Equal(t, int64(0), archived)
+}
+
+func TestArchiveExpiredRuns_BatchSizeLimitsResults(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	// Create 3 expired terminal runs.
+	for i := 1; i <= 3; i++ {
+		runStore.CreateRun(&model.Run{
+			UUID:         fmt.Sprintf("run-batch-%d", i),
+			ExperimentId: defaultFakeExpId,
+			K8SName:      fmt.Sprintf("run-batch-%d", i),
+			DisplayName:  fmt.Sprintf("run-batch-%d", i),
+			Namespace:    "ns1",
+			StorageState: model.StorageStateAvailable,
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:  1,
+				FinishedAtInSec: int64(i * 10),
+				State:           model.RuntimeStateSucceeded,
+				Conditions:      "Succeeded",
+			},
+		})
+	}
+
+	// Batch size 2 — only 2 should be archived.
+	archived, err := runStore.ArchiveExpiredRuns(300, 2)
+	assert.Nil(t, err)
+	assert.Equal(t, int64(2), archived)
+}
+
+func TestDeleteExpiredArchivedRuns_DeletesArchivedRunsAndDependentTables(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+	taskStore := NewTaskStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpIdTwo, nil))
+
+	// Create an archived run that finished in the past.
+	archivedRun := &model.Run{
+		UUID:         "run-to-delete",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-to-delete",
+		DisplayName:  "run-to-delete",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateArchived,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:  1,
+			FinishedAtInSec: 100,
+			State:           model.RuntimeStateSucceeded,
+			Conditions:      "Succeeded",
+		},
+	}
+	runStore.CreateRun(archivedRun)
+
+	// Seed run_metrics.
+	runStore.CreateMetric(&model.RunMetric{
+		RunUUID:     "run-to-delete",
+		NodeID:      "node1",
+		Name:        "accuracy",
+		NumberValue: 0.95,
+		Format:      "RAW",
+	})
+
+	// Seed a task row.
+	taskStore.CreateTask(&model.Task{
+		Namespace:    "ns1",
+		PipelineName: "pipeline1",
+		RunID:        "run-to-delete",
+		PodName:      "pod1",
+		State:        model.RuntimeStateSucceeded,
+	})
+
+	// Also create a run that should NOT be deleted (available, not archived).
+	survivorRun := &model.Run{
+		UUID:         "run-survivor",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-survivor",
+		DisplayName:  "run-survivor",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:  1,
+			FinishedAtInSec: 100,
+			State:           model.RuntimeStateSucceeded,
+			Conditions:      "Succeeded",
+		},
+	}
+	runStore.CreateRun(survivorRun)
+
+	// Delete archived runs with cutoff at 300.
+	deleted, err := runStore.DeleteExpiredArchivedRuns(300, 100)
+	assert.Nil(t, err)
+	assert.Equal(t, int64(1), deleted)
+
+	// Verify the archived run is deleted.
+	_, err = runStore.GetRun("run-to-delete")
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "not found")
+
+	// Verify the survivor run still exists.
+	run, err := runStore.GetRun("run-survivor")
+	assert.Nil(t, err)
+	assert.Equal(t, "run-survivor", run.UUID)
+
+	// Verify task rows for the deleted run are gone.
+	var taskCount int
+	row := db.QueryRow("SELECT COUNT(*) FROM tasks WHERE RunUUID = ?", "run-to-delete")
+	err = row.Scan(&taskCount)
+	assert.Nil(t, err)
+	assert.Equal(t, 0, taskCount)
+
+	// Verify run_metrics rows for the deleted run are gone.
+	var metricCount int
+	row = db.QueryRow("SELECT COUNT(*) FROM run_metrics WHERE RunUUID = ?", "run-to-delete")
+	err = row.Scan(&metricCount)
+	assert.Nil(t, err)
+	assert.Equal(t, 0, metricCount)
+}
+
+func TestDeleteExpiredArchivedRuns_NoCandidates(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	// Create an available (non-archived) run — should not be deleted.
+	runStore.CreateRun(&model.Run{
+		UUID:         "run-available",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-available",
+		DisplayName:  "run-available",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:  1,
+			FinishedAtInSec: 100,
+			State:           model.RuntimeStateSucceeded,
+			Conditions:      "Succeeded",
+		},
+	})
+
+	deleted, err := runStore.DeleteExpiredArchivedRuns(300, 100)
+	assert.Nil(t, err)
+	assert.Equal(t, int64(0), deleted)
+
+	// Verify run still exists.
+	run, err := runStore.GetRun("run-available")
+	assert.Nil(t, err)
+	assert.Equal(t, "run-available", run.UUID)
+}
+
+func TestDeleteExpiredArchivedRuns_DoesNotDeleteRecentArchived(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	// Archived run that finished AFTER the cutoff.
+	runStore.CreateRun(&model.Run{
+		UUID:         "run-recent-archived",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-recent-archived",
+		DisplayName:  "run-recent-archived",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateArchived,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:  1,
+			FinishedAtInSec: 500,
+			State:           model.RuntimeStateSucceeded,
+			Conditions:      "Succeeded",
+		},
+	})
+
+	// Cutoff at 300 — run finished at 500, so it's not expired yet.
+	deleted, err := runStore.DeleteExpiredArchivedRuns(300, 100)
+	assert.Nil(t, err)
+	assert.Equal(t, int64(0), deleted)
+
+	run, err := runStore.GetRun("run-recent-archived")
+	assert.Nil(t, err)
+	assert.Equal(t, model.StorageStateArchived, run.StorageState)
+}
+
+func TestDeleteExpiredArchivedRuns_IncludesLegacyDisabledState(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	// Create with a valid state first (CreateRun validates StorageState).
+	runStore.CreateRun(&model.Run{
+		UUID:         "run-legacy-disabled",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-legacy-disabled",
+		DisplayName:  "run-legacy-disabled",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateArchived,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:  1,
+			FinishedAtInSec: 100,
+			State:           model.RuntimeStateSucceeded,
+			Conditions:      "Succeeded",
+		},
+	})
+
+	// Simulate legacy v1 row by raw-updating StorageState to "DISABLED".
+	_, err := db.Exec(`UPDATE run_details SET StorageState = ? WHERE UUID = ?`, model.LegacyStateDisabled, "run-legacy-disabled")
+	require.Nil(t, err)
+
+	// Cutoff at 200 — run finished at 100, so it is expired.
+	deleted, err := runStore.DeleteExpiredArchivedRuns(200, 100)
+	assert.Nil(t, err)
+	assert.Equal(t, int64(1), deleted)
+
+	_, err = runStore.GetRun("run-legacy-disabled")
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+// Regression test for B1: RetryGeneration must be read back from the database
+// by GetRun so that UpdateRun's WHERE clause matches the bumped value.
+// Without this fix, GetRun always returns RetryGeneration=0 and UpdateRun
+// silently matches zero rows, permanently sticking the run.
+func TestClaimRunForRetry_GetRunReadsRetryGeneration(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	// Create a terminal run.
+	_, err := runStore.CreateRun(&model.Run{
+		UUID:         "run-retry-gen",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-retry-gen",
+		DisplayName:  "run-retry-gen",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          1,
+			FinishedAtInSec:         100,
+			State:                   model.RuntimeStateSucceeded,
+			Conditions:              "Succeeded",
+			WorkflowRuntimeManifest: "wf1",
+		},
+	})
+	require.Nil(t, err)
+
+	// Claim the run for retry. This bumps RetryGeneration to 1 in the DB.
+	_, _, _, claimGeneration, claimErr := runStore.ClaimRunForRetry("run-retry-gen", false)
+	require.Nil(t, claimErr)
+	assert.Equal(t, int64(1), claimGeneration)
+
+	// GetRun must read back the bumped RetryGeneration from the DB.
+	run, getErr := runStore.GetRun("run-retry-gen")
+	require.Nil(t, getErr)
+	assert.Equal(t, int64(1), run.RetryGeneration)
+	assert.True(t, run.RetryClaimedAtInSec > 0, "RetryClaimedAtInSec should be set by ClaimRunForRetry")
+
+	// UpdateRun with the correct generation must succeed (not ResourceNotFoundError).
+	run.State = model.RuntimeStateRunning
+	run.Conditions = "Running"
+	run.WorkflowRuntimeManifest = "wf2"
+	updateErr := runStore.UpdateRun(run)
+	assert.Nil(t, updateErr, "UpdateRun should succeed when RetryGeneration matches the DB value")
+
+	// Verify the update was persisted.
+	updated, getErr2 := runStore.GetRun("run-retry-gen")
+	require.Nil(t, getErr2)
+	assert.Equal(t, model.RuntimeStateRunning, updated.State)
+	assert.Equal(t, "wf2", string(updated.WorkflowRuntimeManifest))
+}
+
+// Regression: terminal-state matching must use raw legacy strings. ToString()
+// normalizes to v2 ("Failed" -> "FAILED"), which made the Conditions fallback
+// dead code and broke retry for legacy v1 rows with State NULL.
+func TestClaimRunForRetry_LegacyConditionsRow(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	_, err := runStore.CreateRun(&model.Run{
+		UUID:         "run-legacy-conditions",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-legacy-conditions",
+		DisplayName:  "run-legacy-conditions",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          1,
+			FinishedAtInSec:         100,
+			State:                   model.RuntimeStateFailed,
+			Conditions:              string(model.RuntimeStateFailedV1),
+			WorkflowRuntimeManifest: "wf1",
+		},
+	})
+	require.Nil(t, err)
+
+	// Simulate a legacy v1 row: State NULL, terminal status only in Conditions.
+	_, err = db.Exec(`UPDATE run_details SET State = NULL WHERE UUID = ?`, "run-legacy-conditions")
+	require.Nil(t, err)
+
+	originalState, originalConditions, originalFinishedAt, claimGeneration, claimErr := runStore.ClaimRunForRetry("run-legacy-conditions", false)
+	require.Nil(t, claimErr, "legacy v1 terminal rows must be claimable for retry")
+	assert.Equal(t, "", originalState)
+	assert.Equal(t, string(model.RuntimeStateFailedV1), originalConditions)
+	assert.Equal(t, int64(100), originalFinishedAt)
+	assert.Equal(t, int64(1), claimGeneration)
+}
+
+// Regression: RollbackRetryClaim must clear RetryClaimedAtInSec. Leaving it
+// set made the reporter's orphaned-claim handling treat the restored terminal
+// row as a live claim.
+func TestRollbackRetryClaim_ClearsClaimTimestamp(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	_, err := runStore.CreateRun(&model.Run{
+		UUID:         "run-rollback-claim",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-rollback-claim",
+		DisplayName:  "run-rollback-claim",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          1,
+			FinishedAtInSec:         100,
+			State:                   model.RuntimeStateFailed,
+			Conditions:              string(model.RuntimeStateFailedV1),
+			WorkflowRuntimeManifest: "wf1",
+		},
+	})
+	require.Nil(t, err)
+
+	originalState, originalConditions, originalFinishedAt, claimGeneration, claimErr := runStore.ClaimRunForRetry("run-rollback-claim", false)
+	require.Nil(t, claimErr)
+
+	claimed, err := runStore.GetRun("run-rollback-claim")
+	require.Nil(t, err)
+	require.True(t, claimed.RetryClaimedAtInSec > 0)
+
+	require.Nil(t, runStore.RollbackRetryClaim("run-rollback-claim", originalState, originalConditions, originalFinishedAt, claimGeneration))
+
+	restored, err := runStore.GetRun("run-rollback-claim")
+	require.Nil(t, err)
+	assert.Equal(t, model.RuntimeStateFailed, restored.State)
+	assert.Equal(t, int64(100), restored.FinishedAtInSec)
+	assert.Equal(t, int64(0), restored.RetryClaimedAtInSec, "rollback must clear the claim timestamp")
+	assert.Equal(t, claimGeneration, restored.RetryGeneration, "generation must stay monotonic across rollback")
+}
+
+// Regression: ArchiveExpiredRuns can commit ARCHIVED between RetryRun's
+// pre-check and this claim taking its row lock. The locked read must catch it,
+// otherwise the claim leaves the row PENDING and ARCHIVED at the same time.
+func TestClaimRunForRetry_RejectsArchivedRun(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	_, err := runStore.CreateRun(&model.Run{
+		UUID:         "run-archived-claim",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-archived-claim",
+		DisplayName:  "run-archived-claim",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          1,
+			FinishedAtInSec:         100,
+			State:                   model.RuntimeStateFailed,
+			Conditions:              string(model.RuntimeStateFailedV1),
+			WorkflowRuntimeManifest: "wf1",
+		},
+	})
+	require.Nil(t, err)
+	require.Nil(t, runStore.ArchiveRun("run-archived-claim"))
+
+	_, _, _, _, claimErr := runStore.ClaimRunForRetry("run-archived-claim", false)
+	require.NotNil(t, claimErr)
+	userError := claimErr.(*util.UserError)
+	assert.Equal(t, codes.FailedPrecondition, userError.ExternalStatusCode())
+	assert.Equal(t,
+		"Failed to retry run run-archived-claim as it is archived. Unarchive the run first to allow it to be retried",
+		userError.ExternalMessage())
+
+	unchanged, err := runStore.GetRun("run-archived-claim")
+	require.Nil(t, err)
+	assert.Equal(t, model.RuntimeStateFailed, unchanged.State)
+	assert.Equal(t, int64(100), unchanged.FinishedAtInSec)
+	assert.Equal(t, int64(0), unchanged.RetryGeneration)
+	assert.Equal(t, int64(0), unchanged.RetryClaimedAtInSec)
+}
+
+func TestClaimRunForRetry_RunNotFound(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	_, _, _, _, err := runStore.ClaimRunForRetry("no-such-run", false)
+	require.NotNil(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+// The delete pass measures the observation window from ArchivedAtInSec: a run
+// archived recently must survive even when it finished long before the cutoff.
+// Rows archived before the column existed (ArchivedAtInSec=0) fall back to the
+// FinishedAtInSec bound.
+func TestDeleteExpiredArchivedRuns_HonorsArchivalWindow(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	_, err := runStore.CreateRun(&model.Run{
+		UUID:         "run-recently-archived",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-recently-archived",
+		DisplayName:  "run-recently-archived",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateArchived,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:  1,
+			FinishedAtInSec: 100,
+			State:           model.RuntimeStateSucceeded,
+			Conditions:      string(model.RuntimeStateSucceededV1),
+		},
+	})
+	require.Nil(t, err)
+
+	// Archived after the cutoff: must not be deleted despite the old finish time.
+	_, err = db.Exec(`UPDATE run_details SET ArchivedAtInSec = ? WHERE UUID = ?`, 1000, "run-recently-archived")
+	require.Nil(t, err)
+
+	deleted, err := runStore.DeleteExpiredArchivedRuns(200, 100)
+	assert.Nil(t, err)
+	assert.Equal(t, int64(0), deleted, "run archived after the cutoff must be kept for its observation window")
+
+	// Archived before the cutoff: now eligible.
+	_, err = db.Exec(`UPDATE run_details SET ArchivedAtInSec = ? WHERE UUID = ?`, 150, "run-recently-archived")
+	require.Nil(t, err)
+
+	deleted, err = runStore.DeleteExpiredArchivedRuns(200, 100)
+	assert.Nil(t, err)
+	assert.Equal(t, int64(1), deleted)
+}
+
+// The archive pass must stamp ArchivedAtInSec so the delete pass can measure
+// the observation window from archival time.
+func TestArchiveExpiredRuns_SetsArchivedAt(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	_, err := runStore.CreateRun(&model.Run{
+		UUID:         "run-archive-stamp",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-archive-stamp",
+		DisplayName:  "run-archive-stamp",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:  1,
+			FinishedAtInSec: 100,
+			State:           model.RuntimeStateSucceeded,
+			Conditions:      string(model.RuntimeStateSucceededV1),
+		},
+	})
+	require.Nil(t, err)
+
+	archived, err := runStore.ArchiveExpiredRuns(200, 100)
+	assert.Nil(t, err)
+	require.Equal(t, int64(1), archived)
+
+	run, err := runStore.GetRun("run-archive-stamp")
+	require.Nil(t, err)
+	assert.Equal(t, model.StorageStateArchived, run.StorageState)
+	assert.True(t, run.ArchivedAtInSec > 0, "archive pass must stamp ArchivedAtInSec")
+}
+
+// Regression: a retry that crashes after committing its claim but before
+// creating the workflow leaves the row PENDING with no workflow to report it.
+// A later claim must be able to take over once the claim has aged out (or its
+// timestamp was cleared); a fresh claim must still be protected.
+func TestClaimRunForRetry_TakesOverAbandonedClaim(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	_, err := runStore.CreateRun(&model.Run{
+		UUID:         "run-abandoned-claim",
+		ExperimentId: defaultFakeExpId,
+		K8SName:      "run-abandoned-claim",
+		DisplayName:  "run-abandoned-claim",
+		Namespace:    "ns1",
+		StorageState: model.StorageStateAvailable,
+		RunDetails: model.RunDetails{
+			CreatedAtInSec:          1,
+			FinishedAtInSec:         100,
+			State:                   model.RuntimeStateFailed,
+			Conditions:              string(model.RuntimeStateFailedV1),
+			WorkflowRuntimeManifest: "wf1",
+		},
+	})
+	require.Nil(t, err)
+
+	_, _, _, firstGeneration, claimErr := runStore.ClaimRunForRetry("run-abandoned-claim", false)
+	require.Nil(t, claimErr)
+	require.Equal(t, int64(1), firstGeneration)
+
+	// A fresh claim is protected: the row is PENDING with a recent timestamp.
+	// Even with takeover authorized, a fresh claim is protected.
+	_, _, _, _, secondErr := runStore.ClaimRunForRetry("run-abandoned-claim", true)
+	require.NotNil(t, secondErr, "a fresh claim must not be taken over")
+	assert.Contains(t, secondErr.Error(), "not in a terminal state")
+
+	// Simulate the crash aftermath: claim timestamp gone (or aged out).
+	_, err = db.Exec(`UPDATE run_details SET RetryClaimedAtInSec = 0 WHERE UUID = ?`, "run-abandoned-claim")
+	require.Nil(t, err)
+
+	// Without caller authorization the expired claim still cannot be taken.
+	_, _, _, _, unauthorizedErr := runStore.ClaimRunForRetry("run-abandoned-claim", false)
+	require.NotNil(t, unauthorizedErr, "takeover must require explicit caller authorization")
+
+	_, _, _, takeoverGeneration, takeoverErr := runStore.ClaimRunForRetry("run-abandoned-claim", true)
+	require.Nil(t, takeoverErr, "an abandoned claim must be recoverable by a new retry")
+	assert.Equal(t, int64(2), takeoverGeneration, "takeover must advance the generation")
+}
+
+// Regression: the delete pass selects candidates with two index-aligned
+// queries (archival-time-driven and legacy finish-time-driven) and must pick
+// up both kinds in one call while respecting the batch cap.
+func TestDeleteExpiredArchivedRuns_LegacyAndCurrentCandidates(t *testing.T) {
+	db := NewFakeDBOrFatal()
+	defer db.Close()
+	expStore := NewExperimentStore(db, util.NewFakeTimeForEpoch(), util.NewFakeUUIDGeneratorOrFatal(defaultFakeExpId, nil))
+	expStore.CreateExperiment(&model.Experiment{Name: "exp1"})
+	runStore := NewRunStore(db, util.NewFakeTimeForEpoch())
+
+	for _, id := range []string{"run-legacy-archived", "run-current-archived", "run-fresh-archived"} {
+		_, err := runStore.CreateRun(&model.Run{
+			UUID:         id,
+			ExperimentId: defaultFakeExpId,
+			K8SName:      id,
+			DisplayName:  id,
+			Namespace:    "ns1",
+			StorageState: model.StorageStateArchived,
+			RunDetails: model.RunDetails{
+				CreatedAtInSec:  1,
+				FinishedAtInSec: 100,
+				State:           model.RuntimeStateSucceeded,
+				Conditions:      string(model.RuntimeStateSucceededV1),
+			},
+		})
+		require.Nil(t, err)
+	}
+	// Legacy: ArchivedAtInSec stays 0. Current: archived before the cutoff.
+	// Fresh: archived after the cutoff, must survive.
+	_, err := db.Exec(`UPDATE run_details SET ArchivedAtInSec = 150 WHERE UUID = ?`, "run-current-archived")
+	require.Nil(t, err)
+	_, err = db.Exec(`UPDATE run_details SET ArchivedAtInSec = 1000 WHERE UUID = ?`, "run-fresh-archived")
+	require.Nil(t, err)
+
+	deleted, err := runStore.DeleteExpiredArchivedRuns(200, 100)
+	assert.Nil(t, err)
+	assert.Equal(t, int64(2), deleted, "one legacy and one current candidate must both be deleted")
+
+	_, err = runStore.GetRun("run-fresh-archived")
+	assert.Nil(t, err, "recently archived run must survive its observation window")
+}

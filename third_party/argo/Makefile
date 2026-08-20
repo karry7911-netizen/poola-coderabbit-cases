@@ -1,0 +1,50 @@
+REPO_ROOT=../..
+ARGO_DIR=$(REPO_ROOT)/third_party/argo
+MANIFESTS_DIR=$(REPO_ROOT)/manifests/kustomize/third-party/argo
+DOCS_DIR=$(ARGO_DIR)
+SYNC_SCRIPT=$(REPO_ROOT)/.github/resources/scripts/sync_argo_versions.py
+
+update: update_ci update_manifests update_backend update_docs
+
+update_ci:
+	@echo "Updating Argo Workflows versions in CI and project documentation..."
+	@python3 $(SYNC_SCRIPT)
+
+# Update all remote Git references to use the version specified in third_party/argo/VERSION file
+update_manifests:
+	@echo "Updating Argo Workflows version references in manifests..."
+	@set -e; VERSION=$$(cat $(ARGO_DIR)/VERSION); \
+	echo "Using Argo Workflows version: $$VERSION"; \
+	echo "Updating Manifests..."; \
+	sed -i.bak -E "s|ref=v[0-9]+\.[0-9]+\.[0-9]+|ref=$$VERSION|g" $(MANIFESTS_DIR)/base/kustomization.yaml && \
+	sed -i.bak -E "s|quay.io/argoproj/argoexec:v[0-9]+\.[0-9]+\.[0-9]+|quay.io/argoproj/argoexec:$$VERSION|g"  $(MANIFESTS_DIR)/base/workflow-controller-deployment-patch.yaml && \
+	sed -i.bak -E "s|quay.io/argoproj/workflow-controller:v[0-9]+\.[0-9]+\.[0-9]+|quay.io/argoproj/workflow-controller:$$VERSION|g"  $(MANIFESTS_DIR)/base/workflow-controller-deployment-patch.yaml && \
+	sed -i.bak -E "s|https://github.com/argoproj/argo-workflows/blob/v[0-9]+\.[0-9]+\.[0-9]+|https://github.com/argoproj/argo-workflows/blob/$$VERSION|g"  $(MANIFESTS_DIR)/base/workflow-controller-configmap-patch.yaml && \
+	sed -i.bak -E "s|ref=v[0-9]+\.[0-9]+\.[0-9]+|ref=$$VERSION|g" $(MANIFESTS_DIR)/installs/namespace/kustomization.yaml && \
+	sed -i.bak -E "s|ref=v[0-9]+\.[0-9]+\.[0-9]+|ref=$$VERSION|g" $(MANIFESTS_DIR)/installs/namespace/cluster-scoped/kustomization.yaml && \
+	sed -i.bak -E "s|ref=v[0-9]+\.[0-9]+\.[0-9]+|ref=$$VERSION|g" $(MANIFESTS_DIR)/installs/cluster/kustomization.yaml && \
+	echo "Cleaning up temp backups..."; \
+	rm -f $(MANIFESTS_DIR)/base/kustomization.yaml.bak $(MANIFESTS_DIR)/base/workflow-controller-deployment-patch.yaml.bak $(MANIFESTS_DIR)/base/workflow-controller-configmap-patch.yaml.bak $(MANIFESTS_DIR)/installs/namespace/kustomization.yaml.bak $(MANIFESTS_DIR)/installs/namespace/cluster-scoped/kustomization.yaml.bak $(MANIFESTS_DIR)/installs/cluster/kustomization.yaml.bak; \
+	echo "Successfully updated all manifest files to use $$VERSION"
+
+update_backend:
+	@echo "Updating Argo Workflows version references in backend..."
+	@set -e; VERSION=$$(cat $(ARGO_DIR)/VERSION); \
+	MAJOR=$$(echo "$$VERSION" | sed -E 's/^v([0-9]+)\..*/\1/'); \
+	echo "Using Argo Workflows version: $$VERSION"; \
+	echo "Updating go dependency..."; \
+	sed -i.bak -E "s|github.com/argoproj/argo-workflows/v[0-9]+ v[0-9]+\.[0-9]+\.[0-9]+|github.com/argoproj/argo-workflows/v$$MAJOR $$VERSION|g" $(REPO_ROOT)/go.mod && \
+	(cd $(REPO_ROOT) && go mod tidy) && \
+	echo "Cleaning up temp backups..."; \
+	rm -f $(REPO_ROOT)/go.mod.bak; \
+	echo "Successfully updated backend dependency to use $$VERSION"
+
+update_docs:
+	@echo "Updating Argo Workflows version references in docs..."
+	@set -e; VERSION=$$(cat $(ARGO_DIR)/VERSION); \
+	echo "Using Argo Workflows version: $$VERSION"; \
+	echo "Updating docs..."; \
+	sed -i.bak -E "s|ARGO_TAG=v[0-9]+\.[0-9]+\.[0-9]+|ARGO_TAG=$$VERSION|g" $(DOCS_DIR)/UPGRADE.md && \
+	echo "Cleaning up temp backups..."; \
+	rm -f $(DOCS_DIR)/UPGRADE.md.bak; \
+	echo "Successfully updated docs to use $$VERSION"

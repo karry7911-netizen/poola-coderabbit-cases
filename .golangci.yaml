@@ -1,0 +1,34 @@
+version: "2"
+
+run:
+  timeout: 30m
+
+issues:
+  max-same-issues: 0
+
+linters:
+  default: none
+  enable:
+    - gocritic
+    - govet
+    - ineffassign
+    - misspell
+    - staticcheck
+    - unused
+  
+  exclusions:
+    paths:
+      - "api/*.go"
+      - "backend/api/*.go"
+  
+  settings:
+    misspell:
+      locale: US
+    staticcheck:
+      checks:
+        - "all"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

@@ -1,0 +1,186 @@
+/*
+ * Copyright 2021 The Kubeflow Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
+import { MockInstance } from 'vitest';
+import { Api } from 'src/mlmd/library';
+import {
+  Artifact,
+  ArtifactType,
+  GetArtifactsRequest,
+  GetArtifactsResponse,
+  GetArtifactTypesResponse,
+  Value,
+} from 'src/third_party/mlmd';
+import * as metadataStorePb from 'src/third_party/mlmd/generated/ml_metadata/proto/metadata_store_pb';
+import { RoutePage } from 'src/components/Router';
+import TestUtils from 'src/TestUtils';
+import { ArtifactList } from 'src/pages/ArtifactList';
+import { PageProps } from 'src/pages/Page';
+import { testBestPractices } from 'src/TestUtils';
+
+testBestPractices();
+
+describe('ArtifactList', () => {
+  let updateBannerSpy: MockInstance;
+  let updateDialogSpy: MockInstance;
+  let updateSnackbarSpy: MockInstance;
+  let updateToolbarSpy: MockInstance;
+  let historyPushSpy: MockInstance;
+  let getArtifactsSpy: MockInstance;
+  let getArtifactTypesSpy: MockInstance;
+
+  const listOperationOpts = new metadataStorePb.ListOperationOptions();
+  listOperationOpts.setMaxResultSize(10);
+  const getArtifactsRequest = new GetArtifactsRequest();
+  getArtifactsRequest.setOptions(listOperationOpts);
+  beforeEach(() => {
+    updateBannerSpy = vi.fn();
+    updateDialogSpy = vi.fn();
+    updateSnackbarSpy = vi.fn();
+    updateToolbarSpy = vi.fn();
+    historyPushSpy = vi.fn();
+    getArtifactsSpy = vi.spyOn(Api.getInstance().metadataStoreService, 'getArtifacts');
+    getArtifactTypesSpy = vi.spyOn(Api.getInstance().metadataStoreService, 'getArtifactTypes');
+
+    getArtifactTypesSpy.mockImplementation(() => {
+      const artifactType = new ArtifactType();
+      artifactType.setId(6);
+      artifactType.setName('String');
+      const response = new GetArtifactTypesResponse();
+      response.setArtifactTypesList([artifactType]);
+      return Promise.resolve(response);
+    });
+    getArtifactsSpy.mockImplementation(() => {
+      const artifacts = generateNArtifacts(5);
+      const response = new GetArtifactsResponse();
+      response.setArtifactsList(artifacts);
+      return Promise.resolve(response);
+    });
+  });
+
+  function generateNArtifacts(n: number) {
+    let artifacts: Artifact[] = [];
+    for (let i = 1; i <= n; i++) {
+      const artifact = new Artifact();
+      const pipelineValue = new Value();
+      const pipelineName = `pipeline ${i}`;
+      pipelineValue.setStringValue(pipelineName);
+      artifact.getPropertiesMap().set('pipeline_name', pipelineValue);
+      const artifactValue = new Value();
+      const artifactName = `test artifact ${i}`;
+      artifactValue.setStringValue(artifactName);
+      artifact.getPropertiesMap().set('name', artifactValue);
+      artifact.setName(artifactName);
+      artifacts.push(artifact);
+    }
+    return artifacts;
+  }
+
+  function generateProps(): PageProps {
+    return TestUtils.generatePageProps(
+      ArtifactList,
+      { pathname: RoutePage.ARTIFACTS } as any,
+      '' as any,
+      historyPushSpy,
+      updateBannerSpy,
+      updateDialogSpy,
+      updateToolbarSpy,
+      updateSnackbarSpy,
+    );
+  }
+
+  it('renders one artifact', async () => {
+    getArtifactsSpy.mockImplementation(() => {
+      const artifacts = generateNArtifacts(1);
+      const response = new GetArtifactsResponse();
+      response.setArtifactsList(artifacts);
+      return Promise.resolve(response);
+    });
+    render(
+      <MemoryRouter>
+        <ArtifactList {...generateProps()} isGroupView={false} />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText('pipeline 1');
+    screen.getByText('test artifact 1');
+  });
+
+  it('displays footer with "10" as default value', async () => {
+    render(
+      <MemoryRouter>
+        <ArtifactList {...generateProps()} isGroupView={false} />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText('Rows per page:');
+    screen.getByText('10');
+  });
+
+  it('shows 20th artifact if page size is 20', async () => {
+    render(
+      <MemoryRouter>
+        <ArtifactList {...generateProps()} isGroupView={false} />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText('Rows per page:');
+    expect(screen.queryByText('test artifact 20')).toBeNull(); // Can not see the 20th artifact initially
+
+    getArtifactTypesSpy.mockClear();
+    getArtifactsSpy.mockClear();
+
+    getArtifactsSpy.mockImplementation(() => {
+      const artifacts = generateNArtifacts(20);
+      const response = new GetArtifactsResponse();
+      response.setArtifactsList(artifacts);
+      return Promise.resolve(response);
+    });
+
+    const rowsPerPageButton = screen.getByRole('combobox');
+    fireEvent.mouseDown(rowsPerPageButton);
+    const newRowsPerPage = await screen.findByRole('option', { name: '20' });
+    fireEvent.click(newRowsPerPage);
+
+    listOperationOpts.setMaxResultSize(20);
+    getArtifactsRequest.setOptions(listOperationOpts);
+    await waitFor(() => {
+      expect(getArtifactsSpy).toHaveBeenLastCalledWith(getArtifactsRequest);
+    });
+    expect(getArtifactTypesSpy).not.toHaveBeenCalled();
+
+    screen.getByText('test artifact 20'); // The 20th artifacts appears.
+  });
+
+  it('finds no artifact', async () => {
+    getArtifactsSpy.mockClear();
+    getArtifactsSpy.mockImplementation(() => {
+      const response = new GetArtifactsResponse();
+      response.setArtifactsList([]);
+      return Promise.resolve(response);
+    });
+    render(
+      <MemoryRouter>
+        <ArtifactList {...generateProps()} isGroupView={false} />
+      </MemoryRouter>,
+    );
+    await TestUtils.flushPromises();
+
+    screen.getByText('No artifacts found.');
+  });
+});
