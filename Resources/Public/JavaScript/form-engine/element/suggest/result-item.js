@@ -1,0 +1,13 @@
+/*
+ * This file is part of the TYPO3 CMS project.
+ *
+ * It is free software; you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License, either version 2
+ * of the License, or any later version.
+ *
+ * For the full copyright and license information, please read the
+ * LICENSE.txt file that was distributed with this source code.
+ *
+ * The TYPO3 project - inspiring people to share!
+ */
+import{property as l,customElement as u}from"lit/decorators.js";import{LitElement as d,html as m}from"lit";import"@typo3/backend/element/icon-element.js";var r=function(c,e,t,n){var s=arguments.length,i=s<3?e:n===null?n=Object.getOwnPropertyDescriptor(e,t):n,a;if(typeof Reflect=="object"&&typeof Reflect.decorate=="function")i=Reflect.decorate(c,e,t,n);else for(var p=c.length-1;p>=0;p--)(a=c[p])&&(i=(s<3?a(i):s>3?a(e,t,i):a(e,t))||i);return s>3&&i&&Object.defineProperty(e,t,i),i};let o=class extends d{connectedCallback(){super.connectedCallback(),this.addEventListener("blur",this.onBlur),this.addEventListener("click",this.onClick),this.addEventListener("keyup",this.onKeyUp)}disconnectedCallback(){this.removeEventListener("blur",this.onBlur),this.removeEventListener("click",this.onClick),this.removeEventListener("keyup",this.onKeyUp),super.disconnectedCallback()}createRenderRoot(){return this}render(){return m`<div class=formengine-suggest-result-item-icon><typo3-backend-icon title=${this.icon.title} identifier=${this.icon.identifier} overlay=${this.icon.overlay} size=small></typo3-backend-icon></div><div class=formengine-suggest-result-item-label>${this.label} <small>[${this.uid}] ${this.path}</small></div>`}onBlur(e){let t=!0;const n=e.relatedTarget,s=this.closest("typo3-backend-formengine-suggest-result-container");n?.tagName.toLowerCase()==="typo3-backend-formengine-suggest-result-item"&&(t=!1),n?.matches('input[type="search"]')&&s.contains(n)&&(t=!1),s.hidden=t}onClick(e){e.preventDefault(),this.dispatchItemChosenEvent(e.currentTarget)}onKeyUp(e){e.preventDefault(),["Enter"," "].includes(e.key)&&this.dispatchItemChosenEvent(document.activeElement)}dispatchItemChosenEvent(e){e.closest("typo3-backend-formengine-suggest-result-container").dispatchEvent(new CustomEvent("typo3:formengine:suggest-item-chosen",{detail:{element:e}}))}};r([l({type:Object})],o.prototype,"icon",void 0),r([l({type:Number})],o.prototype,"uid",void 0),r([l({type:String})],o.prototype,"table",void 0),r([l({type:String})],o.prototype,"label",void 0),r([l({type:String})],o.prototype,"path",void 0),o=r([u("typo3-backend-formengine-suggest-result-item")],o);export{o as ResultItem};

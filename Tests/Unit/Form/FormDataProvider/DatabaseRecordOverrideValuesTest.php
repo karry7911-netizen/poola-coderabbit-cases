@@ -1,0 +1,101 @@
+<?php
+
+declare(strict_types=1);
+
+/*
+ * This file is part of the TYPO3 CMS project.
+ *
+ * It is free software; you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License, either version 2
+ * of the License, or any later version.
+ *
+ * For the full copyright and license information, please read the
+ * LICENSE.txt file that was distributed with this source code.
+ *
+ * The TYPO3 project - inspiring people to share!
+ */
+
+namespace TYPO3\CMS\Backend\Tests\Unit\Form\FormDataProvider;
+
+use PHPUnit\Framework\Attributes\Test;
+use TYPO3\CMS\Backend\Form\FormDataProvider\DatabaseRecordOverrideValues;
+use TYPO3\TestingFramework\Core\Unit\UnitTestCase;
+
+final class DatabaseRecordOverrideValuesTest extends UnitTestCase
+{
+    protected DatabaseRecordOverrideValues $subject;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->subject = new DatabaseRecordOverrideValues();
+    }
+
+    #[Test]
+    public function addDataReturnSameDataIfNoOverrideValuesSet(): void
+    {
+        $input = [
+            'tableName' => 'aTable',
+            'processedTca' => [
+                'columns' => [
+                    'aField' => [
+                        'config' => [
+                            'type' => 'input',
+                        ],
+                    ],
+                ],
+            ],
+            'databaseRow' => [
+                'uid' => 42,
+            ],
+            'overrideValues' => [
+                'anotherField' => 13,
+            ],
+        ];
+
+        self::assertSame($input, $this->subject->addData($input));
+    }
+
+    #[Test]
+    public function addDataSetsDatabaseRowAndTcaType(): void
+    {
+        $input = [
+            'tableName' => 'aTable',
+            'processedTca' => [
+                'columns' => [
+                    'aField' => [
+                        'config' => [
+                            'type' => 'input',
+                        ],
+                    ],
+                    'anotherField' => [
+                        'config' => [
+                            'type' => 'input',
+                        ],
+                    ],
+                ],
+            ],
+            'databaseRow' => [
+                'uid' => 42,
+            ],
+            'overrideValues' => [
+                'aField' => 256,
+                'anotherField' => 13,
+            ],
+        ];
+
+        $expected = $input;
+        $expected['databaseRow']['aField'] = 256;
+        $expected['databaseRow']['anotherField'] = 13;
+        $expected['processedTca']['columns']['aField']['config'] = [
+            'type' => 'hidden',
+            'renderType' => 'hidden',
+        ];
+        $expected['processedTca']['columns']['anotherField']['config'] = [
+            'type' => 'hidden',
+            'renderType' => 'hidden',
+        ];
+
+        self::assertSame($expected, $this->subject->addData($input));
+    }
+}

@@ -1,0 +1,96 @@
+<?php
+
+declare(strict_types=1);
+
+/*
+ * This file is part of the TYPO3 CMS project.
+ *
+ * It is free software; you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License, either version 2
+ * of the License, or any later version.
+ *
+ * For the full copyright and license information, please read the
+ * LICENSE.txt file that was distributed with this source code.
+ *
+ * The TYPO3 project - inspiring people to share!
+ */
+
+namespace TYPO3\CMS\Backend\Tests\Functional\ViewHelpers\Mfa;
+
+use PHPUnit\Framework\Attributes\Test;
+use TYPO3\CMS\Core\Authentication\BackendUserAuthentication;
+use TYPO3\CMS\Core\Authentication\Mfa\MfaProviderRegistry;
+use TYPO3\CMS\Fluid\Core\Rendering\RenderingContextFactory;
+use TYPO3\TestingFramework\Core\Functional\FunctionalTestCase;
+use TYPO3Fluid\Fluid\View\TemplateView;
+
+final class IfHasStateViewHelperTest extends FunctionalTestCase
+{
+    protected bool $initializeDatabase = false;
+
+    protected TemplateView $view;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $renderingContext = $this->get(RenderingContextFactory::class)->create();
+        $renderingContext->getViewHelperResolver()->addNamespace('be', 'TYPO3\\CMS\\Backend\\ViewHelpers');
+        $renderingContext->getTemplatePaths()->setTemplatePathAndFilename('EXT:backend/Tests/Functional/ViewHelpers/Fixtures/Mfa/IfHasStateViewHelper.html');
+        $this->view = new TemplateView($renderingContext);
+        $this->view->assign('provider', $this->get(MfaProviderRegistry::class)->getProvider('totp'));
+    }
+
+    #[Test]
+    public function renderReturnsInactive(): void
+    {
+        $GLOBALS['BE_USER'] = $this->getBackendUser();
+        $result = $this->view->render();
+
+        self::assertStringNotContainsString('isActive', $result);
+        self::assertStringContainsString('isInactive', $result);
+        self::assertStringNotContainsString('isLocked', $result);
+        self::assertStringNotContainsString('isUnlocked', $result);
+    }
+    #[Test]
+    public function renderReturnsActive(): void
+    {
+        $GLOBALS['BE_USER'] = $this->getBackendUser(true);
+        $result = $this->view->render();
+
+        self::assertStringContainsString('isActive', $result);
+        self::assertStringNotContainsString('isInactive', $result);
+        self::assertStringNotContainsString('isLocked', $result);
+        self::assertStringContainsString('isUnlocked', $result);
+    }
+    #[Test]
+    public function renderReturnsLocked(): void
+    {
+        $GLOBALS['BE_USER'] = $this->getBackendUser(true, true);
+        $result = $this->view->render();
+
+        self::assertStringContainsString('isActive', $result);
+        self::assertStringNotContainsString('isInactive', $result);
+        self::assertStringContainsString('isLocked', $result);
+        self::assertStringNotContainsString('isUnlocked', $result);
+    }
+
+    protected function getBackendUser(bool $activeProvider = false, bool $lockedProvider = false): BackendUserAuthentication
+    {
+        $backendUser = new BackendUserAuthentication();
+        $mfa = [
+            'totp' => [
+                'secret' => 'KRMVATZTJFZUC53FONXW2ZJB',
+            ],
+        ];
+
+        if ($activeProvider) {
+            $mfa['totp']['active'] = true;
+        }
+        if ($lockedProvider) {
+            $mfa['totp']['attempts'] = 3;
+        }
+
+        $backendUser->user['mfa'] = json_encode($mfa);
+        return $backendUser;
+    }
+}
