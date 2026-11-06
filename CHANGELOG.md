@@ -1,3 +1,7 @@
+### v4.27 - 26-11-2025
+
+- `FIXED` - Fixed MOB-44067
+
 ### v4.26 - 15-07-2025
 
 - `FIXED` - Fixed MOB-38674 - Jenkins build hangs for Blazemeter tests that take over an hour to execute
