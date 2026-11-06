@@ -69,6 +69,9 @@ func (r *transcodingRepository) NewInstance() interface{} {
 }
 
 func (r *transcodingRepository) Save(entity interface{}) (string, error) {
+	if !isAdmin(r.ctx) {
+		return "", rest.ErrPermissionDenied
+	}
 	t := entity.(*model.Transcoding)
 	id, err := r.put(t.ID, t)
 	if errors.Is(err, model.ErrNotFound) {
@@ -78,6 +81,9 @@ func (r *transcodingRepository) Save(entity interface{}) (string, error) {
 }
 
 func (r *transcodingRepository) Update(id string, entity interface{}, cols ...string) error {
+	if !isAdmin(r.ctx) {
+		return rest.ErrPermissionDenied
+	}
 	t := entity.(*model.Transcoding)
 	t.ID = id
 	_, err := r.put(id, t)
@@ -88,6 +94,9 @@ func (r *transcodingRepository) Update(id string, entity interface{}, cols ...st
 }
 
 func (r *transcodingRepository) Delete(id string) error {
+	if !isAdmin(r.ctx) {
+		return rest.ErrPermissionDenied
+	}
 	err := r.delete(Eq{"id": id})
 	if errors.Is(err, model.ErrNotFound) {
 		return rest.ErrNotFound
