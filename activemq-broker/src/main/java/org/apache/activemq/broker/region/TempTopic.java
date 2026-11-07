@@ -30,8 +30,11 @@ import org.apache.activemq.thread.TaskRunnerFactory;
  * 
  * 
  */
-public class TempTopic  extends Topic  implements Task{
+public class TempTopic extends Topic implements Task, TempDestination {
+
     private final ActiveMQTempDestination tempDest;
+    private boolean allowTempDestinationStealing = false;
+
     /**
      * @param brokerService
      * @param destination
@@ -69,5 +72,15 @@ public class TempTopic  extends Topic  implements Task{
     } 
     
     public void initialize() {
+    }
+
+    @Override
+    public boolean isAllowTempDestinationStealing() {
+        return allowTempDestinationStealing;
+    }
+
+    @Override
+    public void setAllowTempDestinationStealing(boolean allowTempDestinationStealing) {
+        this.allowTempDestinationStealing = allowTempDestinationStealing;
     }
 }
