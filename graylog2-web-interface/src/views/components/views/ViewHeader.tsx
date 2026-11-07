@@ -1,0 +1,232 @@
+/*
+ * Copyright (C) 2020 Graylog, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the Server Side Public License, version 1,
+ * as published by MongoDB, Inc.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * Server Side Public License for more details.
+ *
+ * You should have received a copy of the Server Side Public License
+ * along with this program. If not, see
+ * <http://www.mongodb.com/licensing/server-side-public-license>.
+ */
+
+import React, { useCallback, useMemo, useState } from 'react';
+import styled, { css } from 'styled-components';
+
+import { Link } from 'components/common/router';
+import { Icon } from 'components/common';
+import { Row } from 'components/bootstrap';
+import ViewPropertiesModal from 'views/components/dashboard/DashboardPropertiesModal';
+import onSaveView from 'views/logic/views/OnSaveViewAction';
+import View from 'views/logic/views/View';
+import Routes from 'routing/Routes';
+import useViewTitle from 'views/hooks/useViewTitle';
+import useView from 'views/hooks/useView';
+import useViewsDispatch from 'views/stores/useViewsDispatch';
+import FavoriteIcon from 'views/components/FavoriteIcon';
+import { updateView } from 'views/logic/slices/viewSlice';
+import useIsNew from 'views/hooks/useIsNew';
+import { createGRN } from 'logic/permissions/GRN';
+import useAlertAndEventDefinitionData from 'components/event-definitions/replay-search/hooks/useAlertAndEventDefinitionData';
+import useReplaySearchContext from 'components/event-definitions/replay-search/hooks/useReplaySearchContext';
+import ViewsExecutionInfo from 'views/components/views/ViewsExecutionInto';
+
+const links = {
+  [View.Type.Dashboard]: ({ id, title }) => [
+    {
+      link: Routes.DASHBOARDS,
+      label: 'Dashboards',
+    },
+    {
+      label: title || id,
+      dataTestId: 'view-title',
+    },
+  ],
+  [View.Type.Search]: ({ id, title }) => [
+    {
+      link: Routes.SEARCH,
+      label: 'Search',
+    },
+    {
+      label: title || id,
+      dataTestId: 'view-title',
+    },
+  ],
+  alert: ({ id }) => [
+    {
+      link: Routes.ALERTS.LIST,
+      label: 'Alerts & Events',
+    },
+    {
+      label: id,
+      dataTestId: 'alert-id-title',
+    },
+  ],
+  eventDefinition: ({ id, title }) => [
+    {
+      link: Routes.ALERTS.DEFINITIONS.LIST,
+      label: 'Event definitions',
+    },
+    {
+      link: Routes.ALERTS.DEFINITIONS.show(id),
+      label: title || id,
+      dataTestId: 'event-definition-title',
+    },
+  ],
+};
+
+const Content = styled.div(
+  ({ theme }) => css`
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    margin-bottom: ${theme.spacings.xs};
+    gap: ${theme.spacings.sm};
+    justify-content: space-between;
+  `,
+);
+
+const Breadcrumb = styled.div(
+  ({ theme }) => css`
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: ${theme.spacings.xxs};
+  `,
+);
+
+const EditButton = styled.div(
+  ({ theme }) => css`
+    color: ${theme.colors.gray[60]};
+    font-size: ${theme.fonts.size.tiny};
+    cursor: pointer;
+  `,
+);
+
+const TitleWrapper = styled.span`
+  display: flex;
+  gap: 4px;
+  align-items: center;
+
+  & ${EditButton} {
+    display: none;
+  }
+
+  &:hover ${EditButton} {
+    display: block;
+  }
+`;
+
+const StyledIcon = styled(Icon)`
+  font-size: 0.5rem;
+`;
+
+const CrumbLink = ({
+  label,
+  link,
+  dataTestId = undefined,
+}: {
+  label: string;
+  link: string | undefined;
+  dataTestId?: string;
+}) =>
+  link ? (
+    <Link target="_blank" to={link} data-testid={dataTestId}>
+      {label}
+    </Link>
+  ) : (
+    <span data-testid={dataTestId}>{label}</span>
+  );
+
+const ViewHeader = () => {
+  const view = useView();
+  const isNew = useIsNew();
+  const isSavedView = view?.id && view?.title && !isNew;
+  const [showMetadataEdit, setShowMetadataEdit] = useState<boolean>(false);
+  const toggleMetadataEdit = useCallback(() => setShowMetadataEdit((cur) => !cur), [setShowMetadataEdit]);
+
+  const { alertId, definitionId, type } = useReplaySearchContext();
+  const { definitionTitle } = useAlertAndEventDefinitionData(alertId, definitionId);
+  const dispatch = useViewsDispatch();
+  const _onSaveView = useCallback(
+    async (updatedView: View) => {
+      await dispatch(onSaveView(updatedView));
+      await dispatch(updateView(updatedView));
+    },
+    [dispatch],
+  );
+
+  const typeText = view?.type?.toLocaleLowerCase();
+  const title = useViewTitle();
+  const onChangeFavorite = useCallback(
+    (newValue: boolean) => dispatch(updateView(view.toBuilder().favorite(newValue).build())),
+    [dispatch, view],
+  );
+
+  const breadcrumbs = useMemo(() => {
+    switch (type) {
+      case 'alert':
+      case 'event':
+        return links.alert({ id: alertId });
+      case 'event_definition':
+        return links.eventDefinition({ id: definitionId, title: definitionTitle });
+      default:
+        return links[view.type]({ id: view.id, title });
+    }
+  }, [type, alertId, definitionId, definitionTitle, view.type, view.id, title]);
+
+  const showExecutionInfo = view.type === 'SEARCH';
+
+  return (
+    <Row>
+      <Content>
+        <Breadcrumb>
+          {breadcrumbs.map(({ label, link, dataTestId }, index) => {
+            const theLast = index === breadcrumbs.length - 1;
+
+            return (
+              <TitleWrapper key={`${label}_${link}`}>
+                <CrumbLink link={link} label={label} dataTestId={dataTestId} />
+                {!theLast && <StyledIcon name="chevron_right" />}
+                {isSavedView && theLast && (
+                  <>
+                    <FavoriteIcon
+                      isFavorite={view.favorite}
+                      grn={createGRN(view.type, view.id)}
+                      onChange={onChangeFavorite}
+                    />
+                    <EditButton
+                      onClick={toggleMetadataEdit}
+                      role="button"
+                      title={`Edit ${typeText} ${view.title} metadata`}
+                      tabIndex={0}>
+                      <Icon name="edit_square" />
+                    </EditButton>
+                  </>
+                )}
+              </TitleWrapper>
+            );
+          })}
+          {showMetadataEdit && (
+            <ViewPropertiesModal
+              show
+              view={view}
+              title={`Editing saved ${typeText}`}
+              onClose={toggleMetadataEdit}
+              onSave={_onSaveView}
+              submitButtonText={`Save ${typeText}`}
+            />
+          )}
+        </Breadcrumb>
+        {showExecutionInfo && <ViewsExecutionInfo />}
+      </Content>
+    </Row>
+  );
+};
+
+export default ViewHeader;
