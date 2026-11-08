@@ -1,0 +1,728 @@
+// Copyright 2021-2024 The Kubeflow Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package driver
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/kubeflow/pipelines/api/v2alpha1/go/pipelinespec"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	structpb "google.golang.org/protobuf/types/known/structpb"
+)
+
+func Test_isInputParameterChannel(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		isValid bool
+	}{
+		{
+			name:    "wellformed pipeline channel should produce no errors",
+			input:   "{{$.inputs.parameters['pipelinechannel--someParameterName']}}",
+			isValid: true,
+		},
+		{
+			name:    "pipeline channel index should have quotes",
+			input:   "{{$.inputs.parameters[pipelinechannel--someParameterName]}}",
+			isValid: false,
+		},
+		{
+			name:    "plain text as pipelinechannel of parameter type is invalid",
+			input:   "randomtext",
+			isValid: false,
+		},
+		{
+			name:    "inputs should be prefixed with $.",
+			input:   "{{inputs.parameters['pipelinechannel--someParameterName']}}",
+			isValid: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, isInputParameterChannel(test.input), test.isValid)
+		})
+	}
+}
+
+func Test_isAlreadyExistsErr(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "grpc already exists",
+			err:  status.Error(codes.AlreadyExists, "duplicate execution"),
+			want: true,
+		},
+		{
+			name: "wrapped grpc already exists",
+			err:  fmt.Errorf("wrapped: %w", status.Error(codes.AlreadyExists, "duplicate execution")),
+			want: true,
+		},
+		{
+			name: "already exists in message",
+			err:  fmt.Errorf("rpc error: code = Internal desc = AlreadyExists: execution exists"),
+			want: true,
+		},
+		{
+			name: "duplicate entry in message",
+			err:  fmt.Errorf("sql failure: Duplicate entry 'run/abc'"),
+			want: true,
+		},
+		{
+			name: "other error",
+			err:  status.Error(codes.Internal, "some other failure"),
+			want: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, isAlreadyExistsErr(test.err))
+		})
+	}
+}
+
+func Test_extractInputParameterFromChannel(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+		wantErr  bool
+	}{
+		{
+			name:     "standard parameter pipeline channel input",
+			input:    "{{$.inputs.parameters['pipelinechannel--someParameterName']}}",
+			expected: "pipelinechannel--someParameterName",
+			wantErr:  false,
+		},
+		{
+			name:     "a more complex parameter pipeline channel input",
+			input:    "{{$.inputs.parameters['pipelinechannel--somePara-me_terName']}}",
+			expected: "pipelinechannel--somePara-me_terName",
+			wantErr:  false,
+		},
+		{
+			name:    "invalid input should return err",
+			input:   "invalidvalue",
+			wantErr: true,
+		},
+		{
+			name:    "invalid input should return err 2",
+			input:   "pipelinechannel--somePara-me_terName",
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actual, err := extractInputParameterFromChannel(test.input)
+			if test.wantErr {
+				assert.NotNil(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, actual, test.expected)
+			}
+		})
+	}
+}
+
+func Test_inputParamConstant(t *testing.T) {
+	tests := []struct {
+		name       string
+		inputValue string
+	}{
+		{
+			name:       "simple string value",
+			inputValue: "hello",
+		},
+		{
+			name:       "empty string value",
+			inputValue: "",
+		},
+		{
+			name:       "numeric string value",
+			inputValue: "42",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			paramSpec := inputParamConstant(test.inputValue)
+			assert.NotNil(t, paramSpec)
+			runtimeValue := paramSpec.GetRuntimeValue()
+			assert.NotNil(t, runtimeValue)
+			assert.Equal(t, test.inputValue, runtimeValue.GetConstant().GetStringValue())
+		})
+	}
+}
+
+func Test_inputParamComponent(t *testing.T) {
+	tests := []struct {
+		name       string
+		inputValue string
+	}{
+		{
+			name:       "standard component input parameter",
+			inputValue: "my_param",
+		},
+		{
+			name:       "empty string",
+			inputValue: "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			paramSpec := inputParamComponent(test.inputValue)
+			assert.NotNil(t, paramSpec)
+			assert.Equal(t, test.inputValue, paramSpec.GetComponentInputParameter())
+		})
+	}
+}
+
+func Test_inputParamTaskOutput(t *testing.T) {
+	tests := []struct {
+		name         string
+		producerTask string
+		outputParam  string
+	}{
+		{
+			name:         "standard task output parameter",
+			producerTask: "task-1",
+			outputParam:  "output_key",
+		},
+		{
+			name:         "empty producer task",
+			producerTask: "",
+			outputParam:  "output_key",
+		},
+		{
+			name:         "empty output param",
+			producerTask: "task-1",
+			outputParam:  "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			paramSpec := inputParamTaskOutput(test.producerTask, test.outputParam)
+			assert.NotNil(t, paramSpec)
+			taskOutputSpec := paramSpec.GetTaskOutputParameter()
+			assert.NotNil(t, taskOutputSpec)
+			assert.Equal(t, test.producerTask, taskOutputSpec.GetProducerTask())
+			assert.Equal(t, test.outputParam, taskOutputSpec.GetOutputParameterKey())
+		})
+	}
+}
+
+func Test_getItems(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     *structpb.Value
+		wantCount int
+		wantErr   bool
+	}{
+		{
+			name: "list value returns items directly",
+			value: structpb.NewListValue(&structpb.ListValue{
+				Values: []*structpb.Value{
+					structpb.NewStringValue("a"),
+					structpb.NewStringValue("b"),
+					structpb.NewStringValue("c"),
+				},
+			}),
+			wantCount: 3,
+			wantErr:   false,
+		},
+		{
+			name:      "string value with valid JSON array",
+			value:     structpb.NewStringValue(`["x","y"]`),
+			wantCount: 2,
+			wantErr:   false,
+		},
+		{
+			name:      "string value with empty JSON array",
+			value:     structpb.NewStringValue(`[]`),
+			wantCount: 0,
+			wantErr:   false,
+		},
+		{
+			name:    "string value with invalid JSON",
+			value:   structpb.NewStringValue(`not-json`),
+			wantErr: true,
+		},
+		{
+			name:    "number value returns error",
+			value:   structpb.NewNumberValue(42),
+			wantErr: true,
+		},
+		{
+			name:    "bool value returns error",
+			value:   structpb.NewBoolValue(true),
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			items, err := getItems(test.value)
+			if test.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, test.wantCount, len(items))
+			}
+		})
+	}
+}
+
+func Test_resolvePodSpecRuntimeParameter(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         string
+		expected      string
+		executorInput *pipelinespec.ExecutorInput
+		wantErr       bool
+	}{
+		{
+			name:     "should retrieve correct parameter value",
+			input:    "{{$.inputs.parameters['pipelinechannel--someParameterName']}}",
+			expected: "test2",
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"pipelinechannel--":                  structpb.NewStringValue("test1"),
+						"pipelinechannel--someParameterName": structpb.NewStringValue("test2"),
+						"someParameterName":                  structpb.NewStringValue("test3"),
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:     "return err when no match is found",
+			input:    "{{$.inputs.parameters['pipelinechannel--someParameterName']}}",
+			expected: "test1",
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"doesNotMatch": structpb.NewStringValue("test2"),
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name:          "return const val when input is not a pipeline channel",
+			input:         "not-pipeline-channel",
+			expected:      "not-pipeline-channel",
+			executorInput: &pipelinespec.ExecutorInput{},
+			wantErr:       false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actual, err := resolvePodSpecInputRuntimeParameter(test.input, test.executorInput)
+			if test.wantErr {
+				assert.NotNil(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, actual, test.expected)
+			}
+		})
+	}
+}
+
+func Test_resolveContainerArgs(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          []string
+		executorInput *pipelinespec.ExecutorInput
+		expected      []string
+		wantErr       bool
+	}{
+		{
+			name: "IfPresent with parameter present",
+			args: []string{
+				"{{$.inputs.parameters['file']}}",
+				`{"IfPresent": {"InputName": "line_number", "Then": ["-n"]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"file":        structpb.NewStringValue("/etc/hosts"),
+						"line_number": structpb.NewBoolValue(true),
+					},
+				},
+			},
+			expected: []string{"/etc/hosts", "-n"},
+			wantErr:  false,
+		},
+		{
+			name: "IfPresent with parameter absent",
+			args: []string{
+				"{{$.inputs.parameters['file']}}",
+				`{"IfPresent": {"InputName": "line_number", "Then": ["-n"]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"file": structpb.NewStringValue("/etc/hosts"),
+					},
+				},
+			},
+			expected: []string{"/etc/hosts"},
+			wantErr:  false,
+		},
+		{
+			name: "IfPresent with else clause",
+			args: []string{
+				"{{$.inputs.parameters['file']}}",
+				`{"IfPresent": {"InputName": "line_number", "Then": ["-n"], "Else": ["--no-line-numbers"]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"file": structpb.NewStringValue("/etc/hosts"),
+					},
+				},
+			},
+			expected: []string{"/etc/hosts", "--no-line-numbers"},
+			wantErr:  false,
+		},
+		{
+			name: "IfPresent with multiple values",
+			args: []string{
+				`{"IfPresent": {"InputName": "verbose", "Then": ["--verbose", "--debug"]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"verbose": structpb.NewBoolValue(true),
+					},
+				},
+			},
+			expected: []string{"--verbose", "--debug"},
+			wantErr:  false,
+		},
+		{
+			name: "IfPresent with artifact present",
+			args: []string{
+				`{"IfPresent": {"InputName": "model", "Then": ["--model", "{{$.inputs.artifacts['model'].uri}}"], "Else": ["--no-model"]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					Artifacts: map[string]*pipelinespec.ArtifactList{
+						"model": {
+							Artifacts: []*pipelinespec.RuntimeArtifact{{Uri: "s3://bucket/model"}},
+						},
+					},
+				},
+			},
+			expected: []string{"--model", "{{$.inputs.artifacts['model'].uri}}"},
+			wantErr:  false,
+		},
+		{
+			name: "IfPresent with empty artifact list",
+			args: []string{
+				`{"IfPresent": {"InputName": "model", "Then": ["--model"], "Else": ["--no-model"]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					Artifacts: map[string]*pipelinespec.ArtifactList{
+						"model": {},
+					},
+				},
+			},
+			expected: []string{"--no-model"},
+			wantErr:  false,
+		},
+		{
+			name: "input parameter channel",
+			args: []string{
+				"{{$.inputs.parameters['pipelinechannel--someParameterName']}}",
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"pipelinechannel--someParameterName": structpb.NewStringValue("resolved-value"),
+					},
+				},
+			},
+			expected: []string{"resolved-value"},
+			wantErr:  false,
+		},
+		{
+			name: "regular arg",
+			args: []string{
+				"regular-arg",
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{},
+				},
+			},
+			expected: []string{"regular-arg"},
+			wantErr:  false,
+		},
+		{
+			name: "IfPresent with non-string in array",
+			args: []string{
+				`{"IfPresent": {"InputName": "flag", "Then": ["--flag", 123]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"flag": structpb.NewBoolValue(true),
+					},
+				},
+			},
+			expected: nil,
+			wantErr:  true,
+		},
+		{
+			name: "IfPresent with embedded parameter channel - input absent",
+			args: []string{
+				"--arg0",
+				"{{$.inputs.parameters['required_input']}}",
+				`{"IfPresent": {"InputName": "optional_input_1", "Then": ["--arg1", "{{$.inputs.parameters['optional_input_1']}}"]}}`,
+				`{"IfPresent": {"InputName": "optional_input_2", "Then": ["--arg2", "{{$.inputs.parameters['optional_input_2']}}"], "Else": ["--arg2", "default value"]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"required_input": structpb.NewStringValue("input0"),
+					},
+				},
+			},
+			expected: []string{"--arg0", "input0", "--arg2", "default value"},
+			wantErr:  false,
+		},
+		{
+			name: "IfPresent with embedded parameter channel - input present",
+			args: []string{
+				"--arg0",
+				"{{$.inputs.parameters['required_input']}}",
+				`{"IfPresent": {"InputName": "optional_input_1", "Then": ["--arg1", "{{$.inputs.parameters['optional_input_1']}}"]}}`,
+				`{"IfPresent": {"InputName": "optional_input_2", "Then": ["--arg2", "{{$.inputs.parameters['optional_input_2']}}"], "Else": ["--arg2", "default value"]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"required_input":   structpb.NewStringValue("input0"),
+						"optional_input_1": structpb.NewStringValue("opt1_value"),
+						"optional_input_2": structpb.NewStringValue("opt2_value"),
+					},
+				},
+			},
+			expected: []string{"--arg0", "input0", "--arg1", "opt1_value", "--arg2", "opt2_value"},
+			wantErr:  false,
+		},
+		{
+			name: "output parameter placeholder should be preserved",
+			args: []string{
+				"sh",
+				"-c",
+				"mkdir -p /tmp/kfp/outputs && echo {{$.inputs.parameters['result']}} > {{$.outputs.parameters['sum'].output_file}}",
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"result": structpb.NewStringValue("12"),
+					},
+				},
+			},
+			expected: []string{
+				"sh",
+				"-c",
+				"mkdir -p /tmp/kfp/outputs && echo {{$.inputs.parameters['result']}} > {{$.outputs.parameters['sum'].output_file}}",
+			},
+			wantErr: false,
+		},
+		{
+			name: "output placeholder in selected IfPresent branch should be preserved",
+			args: []string{
+				`{"IfPresent": {"InputName": "write_output", "Then": ["{{$.outputs.parameters['result'].output_file}}"], "Else": ["--skip-output"]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"write_output": structpb.NewBoolValue(true),
+					},
+				},
+			},
+			expected: []string{"{{$.outputs.parameters['result'].output_file}}"},
+			wantErr:  false,
+		},
+		{
+			name: "structured placeholders in selected IfPresent branch",
+			args: []string{
+				`{"IfPresent": {"InputName": "write_output", "Then": {"Concat": ["--out=", {"IfPresent": {"InputName": "use_uri", "Then": "{{$.outputs.artifacts['result'].uri}}", "Else": "disabled"}}]}}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"write_output": structpb.NewBoolValue(true),
+						"use_uri":      structpb.NewBoolValue(true),
+					},
+				},
+			},
+			expected: []string{"--out={{$.outputs.artifacts['result'].uri}}"},
+			wantErr:  false,
+		},
+		{
+			name: "embedded placeholder in fstring should be template-substituted",
+			args: []string{
+				"my_program",
+				"prefix-{{$.inputs.parameters['text1']}}",
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"text1": structpb.NewStringValue("hello"),
+					},
+				},
+			},
+			expected: []string{"my_program", "prefix-hello"},
+			wantErr:  false,
+		},
+		{
+			name: "multiple embedded placeholders in single arg",
+			args: []string{
+				"{{$.inputs.parameters['p1']}}-{{$.inputs.parameters['p2']}}",
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"p1": structpb.NewStringValue("val1"),
+						"p2": structpb.NewStringValue("val2"),
+					},
+				},
+			},
+			expected: []string{"val1-val2"},
+			wantErr:  false,
+		},
+		{
+			name: "NUMBER_INTEGER parameter should be stringified correctly",
+			args: []string{
+				"{{$.inputs.parameters['num_iterations']}}",
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"num_iterations": structpb.NewNumberValue(42),
+					},
+				},
+			},
+			expected: []string{"42"},
+			wantErr:  false,
+		},
+		{
+			name: "NUMBER_DOUBLE parameter should be stringified correctly",
+			args: []string{
+				"{{$.inputs.parameters['learning_rate']}}",
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"learning_rate": structpb.NewNumberValue(0.001),
+					},
+				},
+			},
+			expected: []string{"0.001"},
+			wantErr:  false,
+		},
+		{
+			name: "BOOLEAN parameter should be stringified correctly",
+			args: []string{
+				"{{$.inputs.parameters['verbose']}}",
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"verbose": structpb.NewBoolValue(true),
+					},
+				},
+			},
+			expected: []string{"true"},
+			wantErr:  false,
+		},
+		{
+			name: "IfPresent with null value should be treated as absent",
+			args: []string{
+				`{"IfPresent": {"InputName": "optional_param", "Then": ["--opt", "{{$.inputs.parameters['optional_param']}}"], "Else": ["--default"]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"optional_param": structpb.NewNullValue(),
+					},
+				},
+			},
+			expected: []string{"--default"},
+			wantErr:  false,
+		},
+		{
+			name: "IfPresent with null value and no Else should return empty",
+			args: []string{
+				`{"IfPresent": {"InputName": "optional_param", "Then": ["--opt"]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"optional_param": structpb.NewNullValue(),
+					},
+				},
+			},
+			expected: nil,
+			wantErr:  false,
+		},
+		{
+			name: "IfPresent with NUMBER parameter in Then clause",
+			args: []string{
+				`{"IfPresent": {"InputName": "num_iterations", "Then": ["--iterations", "{{$.inputs.parameters['num_iterations']}}"]}}`,
+			},
+			executorInput: &pipelinespec.ExecutorInput{
+				Inputs: &pipelinespec.ExecutorInput_Inputs{
+					ParameterValues: map[string]*structpb.Value{
+						"num_iterations": structpb.NewNumberValue(100),
+					},
+				},
+			},
+			expected: []string{"--iterations", "100"},
+			wantErr:  false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actual, err := resolveContainerArgs(test.args, test.executorInput)
+			if test.wantErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, test.expected, actual)
+			}
+		})
+	}
+}

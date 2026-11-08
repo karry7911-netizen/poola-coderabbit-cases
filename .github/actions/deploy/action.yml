@@ -1,0 +1,198 @@
+name: "Set up KFP on KinD"
+description: "Step to start and configure KFP on Kind"
+
+inputs:
+  cluster_name:
+    description: "Kind cluster name"
+    default: 'kfp'
+    required: false
+  pipeline_store:
+    description: "Flag to deploy KFP with K8s Native API"
+    default: 'database'
+    required: false
+  proxy:
+    description: "If KFP should be deployed with proxy configuration"
+    required: false
+    default: 'false'
+  cache_enabled:
+    description: "If KFP should be deployed with cache enabled globally"
+    required: false
+    default: 'true'
+  image_tag:
+    required: true
+    description: "Provide the image tag your image was tagged with"
+  image_path:
+    required: true
+    description: "Path within github artifacts where your image tarball is stored"
+  image_registry:
+    required: true
+    description: "Image Registry address of the images"
+  multi_user:
+    description: "If KFP should be deployed in multi-user mode"
+    required: false
+    default: 'false'
+  artifact_proxy:
+    description: "Enables artifact proxy"
+    required: false
+    default: 'false'
+  argo_version:
+    required: false
+    description: "Argo version to use for the cluster"
+  forward_port:
+    required: false
+    default: 'true'
+    description: "If you want to forward API server port to localhost:8888"
+  pod_to_pod_tls_enabled:
+    description: "If KFP should be deployed with TLS pod-to-pod communication."
+    required: false
+    default: 'false'
+  load_modelcar_fixture:
+    description: "Load the prebuilt Modelcar test fixture image into Kind."
+    required: false
+    default: 'false'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Wait for branch image artifacts
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: ./.github/resources/scripts/wait-for-image-artifacts.sh
+
+    - name: Download Docker Images
+      uses: ./.github/actions/download-artifact-with-retry
+      with:
+        path: "images_${{ github.run_id }}"
+        pattern: "!*.dockerbuild"
+
+    - name: Load Control Plane Images Into Kind
+      shell: bash
+      run: |
+        # These images are deployed directly by the CI manifests and use
+        # IfNotPresent in the CI install path, so loading the image archive
+        # into the Kind node is sufficient. Import two at a time: this overlaps
+        # decompression without flooding the single Kind node's containerd.
+        source .github/resources/scripts/ci-image-artifacts.sh
+        ARCHIVES=()
+        for app in "${CONTROL_PLANE_IMAGE_ARTIFACTS[@]}"; do
+          ARCHIVES+=("${{ inputs.image_path }}/$app/$app.tar")
+        done
+        ./.github/resources/scripts/load-kind-image-archives.sh \
+          "${{ inputs.cluster_name }}" 2 "${ARCHIVES[@]}"
+
+    - name: Load Driver and Launcher Images Into Kind
+      shell: bash
+      run: |
+        # Runtime-generated workflow pods inherit these refs from the API server
+        # environment. Tagging them away from `latest` makes Kubernetes default
+        # them to IfNotPresent, so they can also be loaded directly into Kind.
+        source .github/resources/scripts/ci-image-artifacts.sh
+        for app in "${RUNTIME_IMAGE_ARTIFACTS[@]}"; do
+          docker image load -i "${{ inputs.image_path }}/$app/$app.tar"
+          docker tag "${{ inputs.image_registry }}/$app:${{ inputs.image_tag }}" "${{ inputs.image_registry }}/$app:ci"
+          kind --name "${{ inputs.cluster_name }}" load docker-image "${{ inputs.image_registry }}/$app:ci"
+          rm "${{ inputs.image_path }}/$app/$app.tar"
+          docker image rm "${{ inputs.image_registry }}/$app:${{ inputs.image_tag }}"
+          docker image rm "${{ inputs.image_registry }}/$app:ci"
+        done
+
+    - name: Load Runtime Base Images Into Kind
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        RUNTIME_BASE_IMAGE_ARCHIVE="${{ inputs.image_path }}/runtime-base-images/runtime-base-images.tar"
+
+        if [[ -f "${RUNTIME_BASE_IMAGE_ARCHIVE}" ]]; then
+          if kind --name "${{ inputs.cluster_name }}" load image-archive "${RUNTIME_BASE_IMAGE_ARCHIVE}"; then
+            rm "${RUNTIME_BASE_IMAGE_ARCHIVE}"
+            exit 0
+          fi
+
+          echo "::warning::Failed to load runtime base image archive at ${RUNTIME_BASE_IMAGE_ARCHIVE}; pulling images directly."
+        else
+          echo "::warning::Runtime base image archive not found at ${RUNTIME_BASE_IMAGE_ARCHIVE}; pulling images directly."
+        fi
+        source .github/resources/scripts/helper-functions.sh
+        load_runtime_base_images_into_kind .github/resources/runtime-base-images.txt "${{ inputs.cluster_name }}"
+
+    - name: Load Modelcar Fixture Into Kind
+      if: ${{ inputs.load_modelcar_fixture == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        MODELCAR_IMAGE_ARCHIVE="${{ inputs.image_path }}/runtime-base-images/modelcar.tar"
+        if [[ ! -f "${MODELCAR_IMAGE_ARCHIVE}" ]]; then
+          echo "::error::Modelcar fixture archive not found at ${MODELCAR_IMAGE_ARCHIVE}"
+          exit 1
+        fi
+
+        source .github/resources/scripts/helper-functions.sh
+        retry 3 10 kind --name "${{ inputs.cluster_name }}" \
+          load image-archive "${MODELCAR_IMAGE_ARCHIVE}"
+        rm "${MODELCAR_IMAGE_ARCHIVE}"
+
+    - name: Deploy Tinyproxy
+      id: deploy-tinyproxy
+      if: ${{ inputs.proxy == 'true' }}
+      shell: bash
+      env:
+        CLUSTER_NAME: ${{ inputs.cluster_name }}
+      run: ./.github/resources/tinyproxy/deploy-tinyproxy.sh
+
+    - name: Configure Args
+      shell: bash
+      id: configure
+      run: |
+        ARGS=""
+
+        if [ "${{ inputs.proxy }}" = "true" ]; then
+          echo "Enabling Proxy"
+          ARGS="${ARGS} --proxy"
+        fi
+
+        if [ "${{inputs.cache_enabled }}" = "false" ]; then
+          echo "Disabling Cache"
+          ARGS="${ARGS} --cache-disabled"
+        fi
+
+        if [ "${{inputs.pipeline_store }}" = "kubernetes" ]; then
+          echo "Deploying in native K8s API Mode"
+          ARGS="${ARGS} --deploy-k8s-native"
+        fi
+
+        if [ "${{ inputs.multi_user }}" = "true" ]; then
+          echo "Deploying in Multi User Mode"
+          ARGS="${ARGS} --multi-user"
+        fi
+
+        if [ "${{ inputs.artifact_proxy }}" = "true" ]; then
+          echo "Enabling artifact proxy"
+          ARGS="${ARGS} --artifact-proxy"
+        fi
+
+        if [ -n "${{ inputs.argo_version }}" ]; then
+          echo "Deploying with argo version ${{ inputs.argo_version }}"
+          ARGS="${ARGS} --argo-version ${{ inputs.argo_version }}"
+        fi
+
+        if [ "${{inputs.pod_to_pod_tls_enabled }}" = "true" ]; then
+          ARGS="${ARGS} --tls-enabled"
+        fi
+        echo "ARGS=$ARGS" >> "$GITHUB_OUTPUT"
+
+    - name: Deploy KFP
+      id: deploy-kfp
+      if: ${{ steps.configure.outcome == 'success' }}
+      uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60
+      with:
+        max_attempts: 2
+        timeout_minutes: 15
+        command: ./.github/resources/scripts/deploy-kfp.sh ${{ steps.configure.outputs.ARGS }}
+
+    - name: Forward API port
+      id: forward-api-port
+      shell: bash
+      if: ${{ steps.deploy-kfp.outcome == 'success' && inputs.forward_port == 'true'}}
+      run: ./.github/resources/scripts/forward-port.sh "kubeflow" "ml-pipeline" 8888 8888

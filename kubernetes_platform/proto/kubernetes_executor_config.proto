@@ -1,0 +1,367 @@
+// Copyright 2023 The Kubeflow Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package kfp_kubernetes;
+
+import "google/protobuf/struct.proto";
+import "pipeline_spec.proto";
+
+option go_package = "github.com/kubeflow/pipelines/kubernetes_platform/go/kubernetesplatform";
+
+message KubernetesExecutorConfig {
+    repeated SecretAsVolume secret_as_volume = 1;
+    repeated SecretAsEnv secret_as_env = 2;
+    repeated PvcMount pvc_mount = 3;
+    NodeSelector node_selector = 4;
+    PodMetadata pod_metadata = 5;
+    repeated ImagePullSecret image_pull_secret = 6;
+    // One of Always, Never, IfNotPresent.
+    string image_pull_policy = 7;
+    repeated ConfigMapAsVolume config_map_as_volume = 8;
+    repeated ConfigMapAsEnv config_map_as_env = 9;
+    int64 active_deadline_seconds = 10;
+    repeated FieldPathAsEnv field_path_as_env = 11;
+    repeated Toleration tolerations = 12;
+    repeated GenericEphemeralVolume generic_ephemeral_volume = 13;
+    repeated NodeAffinityTerm node_affinity = 14;
+    repeated PodAffinityTerm pod_affinity = 15;
+    EnabledSharedMemory enabled_shared_memory = 16;
+    repeated EmptyDirMount empty_dir_mounts = 17;
+    SecurityContext security_context = 18;
+    repeated InitContainer init_containers = 19;
+}
+
+message EnabledSharedMemory {
+    // Name of the Shared Memory Volume.
+    string volume_name = 1;
+    // Size of the Shared Memory.
+    string size = 2;
+}
+
+message SecretAsVolume {
+    // Deprecated, use secret_name_parameter instead.
+    string secret_name = 1 [deprecated = true];
+    // Container path to mount the Secret data.
+    string mount_path = 2;
+    // An optional boolean value indicating whether the Secret must be defined.
+    optional bool optional = 3;
+
+    // Name of the Secret.
+    ml_pipelines.TaskInputsSpec.InputParameterSpec secret_name_parameter = 4;
+}
+
+message SecretAsEnv {
+    // Deprecated, use secret_name_parameter instead.
+    string secret_name = 1 [deprecated = true];
+
+    message SecretKeyToEnvMap {
+        // Corresponds to a key of the Secret.data field.
+        string secret_key = 1;
+        // Env var to which secret_key's data should be set.
+        string env_var = 2;
+    }
+
+    repeated SecretKeyToEnvMap key_to_env = 2;
+    // An optional boolean value indicating whether the Secret must be defined.
+    optional bool optional = 3;
+
+    // Name of the Secret.
+    ml_pipelines.TaskInputsSpec.InputParameterSpec secret_name_parameter = 4;
+}
+
+message PvcMount {
+    // Deprecated, use pvc_name_parameter instead.
+    oneof pvc_reference {
+        // Output parameter from an upstream task.
+        ml_pipelines.TaskInputsSpec.InputParameterSpec.TaskOutputParameterSpec task_output_parameter = 1  [deprecated = true];
+        // A constant value.
+        string constant = 2 [deprecated = true];
+        // Pass the input parameter from parent component input parameter.
+        string component_input_parameter = 3 [deprecated = true];
+    }
+    // Container path to which the PVC should be mounted.
+    string mount_path = 4;
+
+    // Name of the PVC.
+    ml_pipelines.TaskInputsSpec.InputParameterSpec pvc_name_parameter = 5;
+
+    // Path within the volume from which the container's volume should be mounted.
+    // Defaults to "" (volume's root).
+    // Cannot be used with CreatePvc which creates an empty volume.
+    string sub_path = 6;
+}
+
+// TypedLocalObjectReference contains enough information to let you locate the
+// typed referenced object inside the same namespace.
+// Corresponds to Kubernetes TypedLocalObjectReference.
+message TypedLocalObjectReference {
+    // APIGroup is the group for the resource being referenced.
+    // If APIGroup is not specified, the specified Kind must be in the core API group.
+    // For any other third-party types, APIGroup is required.
+    optional string api_group = 1;
+    // Kind is the type of resource being referenced.
+    string kind = 2;
+    // Name is the name of resource being referenced.
+    string name = 3;
+}
+
+message CreatePvc {
+    oneof name {
+        // Name of the PVC, if not dynamically generated.
+        string pvc_name = 1;
+        // Suffix for a dynamically generated PVC name of the form
+        // {{workflow.name}}-<pvc_name_suffix>.
+        string pvc_name_suffix = 2;
+    }
+    // Corresponds to PersistentVolumeClaim.spec.accessMode field.
+    repeated string access_modes = 3;
+    // Corresponds to PersistentVolumeClaim.spec.resources.requests.storage field.
+    string size = 4;
+    // If true, corresponds to omitted PersistentVolumeClaim.spec.storageClassName.
+    bool default_storage_class = 5;
+    // Corresponds to PersistentVolumeClaim.spec.storageClassName string field.
+    // Should only be used if default_storage_class is false.
+    string storage_class_name = 6;
+    // Corresponds to PersistentVolumeClaim.spec.volumeName field.
+    string volume_name = 7;
+    // Corresponds to PersistentVolumeClaim.metadata.annotations field.
+    google.protobuf.Struct annotations = 8;
+    // Corresponds to PersistentVolumeClaim.spec.dataSource field.
+    // This can be used to create a PVC from a VolumeSnapshot or clone from an existing PVC.
+    TypedLocalObjectReference data_source = 9;
+}
+
+message DeletePvc {
+    // Identifier for the PVC.
+    // Used like TaskInputsSpec.ml_pipelines.TaskInputsSpec.InputParameterSpec.kind.
+    oneof pvc_reference {
+        // Output parameter from an upstream task.
+        ml_pipelines.TaskInputsSpec.InputParameterSpec.TaskOutputParameterSpec task_output_parameter = 1;
+        // A constant value.
+        string constant = 2;
+        // Pass the input parameter from parent component input parameter.
+        string component_input_parameter = 3;
+    }
+}
+
+message NodeSelector {
+    // map of label key to label value
+    // corresponds to Pod.spec.nodeSelector field https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#scheduling
+    map<string, string> labels = 1;
+
+    // Provide a JSON struct of node selector
+    // Takes precedence over labels.
+    // Example: {"disk-type": "ssd", "region": "us-west"}
+    ml_pipelines.TaskInputsSpec.InputParameterSpec node_selector_json = 2;
+}
+
+message PodMetadata {
+    // values of metadata spec such as labels and annotations for the pod object
+    // corresponds to Pod.metadata field https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#Pod
+    map<string, string> labels = 1;
+    map<string, string> annotations = 2;
+}
+
+message ConfigMapAsVolume {
+    // Deprecated, use config_name_parameter instead.
+    string config_map_name = 1 [deprecated = true];
+    // Container path to mount the ConfigMap data.
+    string mount_path = 2;
+    // An optional boolean value indicating whether the ConfigMap must be defined.
+    optional bool optional = 3;
+
+    // Name of the ConfigMap.
+    ml_pipelines.TaskInputsSpec.InputParameterSpec config_map_name_parameter = 4;
+}
+
+message ConfigMapAsEnv {
+    // Deprecated, use config_name_parameter instead.
+    string config_map_name = 1 [deprecated = true];
+
+    message ConfigMapKeyToEnvMap {
+        // Corresponds to a key of the ConfigMap.
+        string config_map_key = 1;
+        // Env var to which configmap_key's data should be set.
+        string env_var = 2;
+    }
+
+    repeated ConfigMapKeyToEnvMap key_to_env = 2;
+
+    // Name of the ConfigMap.
+    ml_pipelines.TaskInputsSpec.InputParameterSpec config_map_name_parameter = 3;
+    // An optional boolean value indicating whether the ConfigMap must be defined.
+    optional bool optional = 4;
+}
+
+message GenericEphemeralVolume {
+    // more details in https://kubernetes.io/docs/concepts/storage/ephemeral-volumes/#generic-ephemeral-volumes
+    // Name of the ephemeral volume.
+    string volume_name = 1;
+    // Container path to mount the volume
+    string mount_path = 2;
+    // Corresponds to ephemeral.volumeClaimTemplate.spec.accessModes field.
+    repeated string access_modes = 3;
+    // Corresponds to ephemeral.volumeClaimTemplate.spec.resources.requests.storage field.
+    string size = 4;
+    // If true, corresponds to omitted ephemeral.volumeClaimTemplate.spec.storageClassName.
+    bool default_storage_class = 5;
+    // Corresponds to ephemeral.volumeClaimTemplate.spec.storageClassName string field.
+    // Should only be used if default_storage_class is false.
+    string storage_class_name = 6;
+    // Corresponds to ephemeral.volumeClaimTemplate.metadata.
+    // This is not exactly a pod metadata but the fields are the same
+    PodMetadata metadata = 7;
+}
+
+message ImagePullSecret {
+    // Name of the image pull secret.
+    string secret_name = 1 [deprecated = true];
+
+    ml_pipelines.TaskInputsSpec.InputParameterSpec secret_name_parameter = 2;
+}
+
+message FieldPathAsEnv {
+    // Name of the environment variable
+    string name = 1;
+
+    // Value of the field path string
+    string field_path = 2;
+}
+
+message Toleration {
+    string key = 1;
+    string operator = 2;
+    string value = 3;
+    string effect = 4;
+    optional int64 toleration_seconds = 5;
+
+    // Provide a json struct of the toleration
+    // Takes precedence over key, operator, value, effect.
+    // Example: {"key": "key1", "operator": "Equal", "value": "value1", "effect": "NoSchedule"}
+    // The JSON must follow Kubernetes
+    // Toleration structure:
+    // https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#toleration-v1-core
+    ml_pipelines.TaskInputsSpec.InputParameterSpec toleration_json = 6;
+}
+
+// Matches https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.25/#labelselectorrequirement-v1-meta and
+// https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.25/#nodeselectorrequirement-v1-core
+message SelectorRequirement {
+    string key = 1;
+    string operator = 2;
+    repeated string values = 3;
+}
+
+message NodeAffinityTerm {
+    repeated SelectorRequirement match_expressions = 1;
+    repeated SelectorRequirement match_fields = 2;
+    //Setting the weight makes it use PreferredDuringSchedulingIgnoredDuringExecution rules instead of RequiredDuringSchedulingIgnoredDuringExecution rules
+    optional int32 weight = 3;    
+    // Provide a JSON struct of node affinity. Takes precedence over PreferredDuringSchedulingIgnoredDuringExecution rules/RequiredDuringSchedulingIgnoredDuringExecution rules.
+    // The JSON must follow Kubernetes
+    // NodeAffinity structure:
+    // https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#nodeaffinity-v1-core
+    // Example:
+    // { "requiredDuringSchedulingIgnoredDuringExecution": { "nodeSelectorTerms": [ ... ] } }
+    ml_pipelines.TaskInputsSpec.InputParameterSpec node_affinity_json = 4;
+} 
+
+message PodAffinityTerm {
+    repeated SelectorRequirement match_pod_expressions = 1;
+    map<string,string> match_pod_labels = 2;
+    string topology_key = 3;
+    repeated string namespaces = 4;
+    repeated SelectorRequirement match_namespace_expressions = 5;
+    map<string,string> match_namespace_labels = 6;
+    //Setting a weight makes it use PreferredDuringSchedulingIgnoredDuringExecution rules instead of RequiredDuringSchedulingIgnoredDuringExecution rules
+    optional int32 weight = 7;
+    //Flag indicating if it is a podaffinity or podantiaffinity
+    optional bool anti = 8;
+}
+
+message SecurityContext {
+    // UID to run the container process as.
+    // Uses the container runtime default if not specified.
+    optional int64 run_as_user = 1;
+    // GID to run the container process as.
+    // Uses the container runtime default if not specified.
+    optional int64 run_as_group = 2;
+    // Fields 3-5 removed: privileged, add_capabilities, drop_capabilities
+    // violate Pod Security Standards (PSS) baseline.
+    // All capabilities are always dropped by the backend.
+    reserved 3, 4, 5;
+    // Whether the container must run as a non-root user.
+    // Uses the container runtime default if not specified.
+    optional bool run_as_non_root = 6;
+}
+
+message EmptyDirMount {
+    // https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.25/#emptydirvolumesource-v1-core
+    string volume_name = 1;
+    string mount_path = 2;
+    optional string medium = 3;
+    optional string size_limit = 4;
+}
+
+// Init container that runs to completion before the main container starts.
+// https://kubernetes.io/docs/concepts/workloads/pods/init-containers/
+message InitContainer {
+    // Name of the init container. Must be unique within the pod. The name
+    // "kfp-launcher" is reserved for the launcher init container injected
+    // by the compiler.
+    string name = 1;
+    // Container image of the init container.
+    string image = 2;
+    // Entrypoint array. Corresponds to Container.command.
+    repeated string command = 3;
+    // Arguments to the entrypoint. Corresponds to Container.args.
+    repeated string args = 4;
+
+    message EnvVar {
+        // Name of the environment variable.
+        string name = 1;
+        // Value of the environment variable.
+        string value = 2;
+    }
+    // Environment variables to set in the init container.
+    repeated EnvVar env = 5;
+
+    message VolumeMount {
+        // Name of a volume defined on the pod, for example via
+        // empty_dir_mounts, pvc_mount or generic_ephemeral_volume.
+        string volume_name = 1;
+        // Path within the init container at which the volume should be mounted.
+        string mount_path = 2;
+    }
+    // Volumes to mount into the init container. Each referenced volume must
+    // be defined on the pod through other fields of this config.
+    repeated VolumeMount volume_mounts = 6;
+
+    // Restart policy for the init container. The only supported value is
+    // "Always", which turns the init container into a Kubernetes native
+    // sidecar that keeps running alongside the main container.
+    // https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/
+    optional string restart_policy = 7;
+
+    message ResourceRequirements {
+        // Resource name to Kubernetes quantity, for example cpu: "500m".
+        map<string, string> requests = 1;
+        map<string, string> limits = 2;
+    }
+    // Compute resource requests and limits for the init container.
+    // Corresponds to Container.resources.
+    ResourceRequirements resources = 8;
+}

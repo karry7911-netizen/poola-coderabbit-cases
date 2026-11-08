@@ -1,0 +1,467 @@
+// Copyright 2019 The Kubeflow Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+import path from 'path';
+import { fileURLToPath } from 'url';
+import express, { Application, static as StaticHandler } from 'express';
+import { createProxyMiddleware } from 'http-proxy-middleware';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+import { UIConfigs } from './configs.js';
+import { getAddress } from './utils.js';
+import { getBuildMetadata, getHealthzEndpoint, getHealthzHandler } from './handlers/healthz.js';
+import {
+  getArtifactsHandler,
+  getArtifactsProxyHandler,
+  getArtifactServiceGetter,
+  getArtifactsAuthMiddleware,
+} from './handlers/artifacts.js';
+import { getTensorboardHandlers } from './handlers/tensorboard.js';
+import { getAuthorizeFn } from './helpers/auth.js';
+import { getPodLogsHandler } from './handlers/pod-logs.js';
+import { getPodInfoHandlers } from './handlers/pod-info.js';
+import { getClusterNameHandler, getProjectIdHandler } from './handlers/gke-metadata.js';
+import { getAllowCustomVisualizationsHandler } from './handlers/vis.js';
+import { getIndexHTMLHandler } from './handlers/index-html.js';
+
+import { IncomingMessage, Server } from 'http';
+import { HACK_FIX_HPM_PARTIAL_RESPONSE_HEADERS } from './consts.js';
+import registerTensorboardProxy from './handlers/tensorboard-proxy.js';
+
+function hardenPodLogsProxyResponse(proxyRes: IncomingMessage): void {
+  proxyRes.headers['x-content-type-options'] = 'nosniff';
+  proxyRes.headers['content-disposition'] = 'attachment';
+  proxyRes.headers['content-type'] = 'text/plain; charset=utf-8';
+}
+
+const hardenPodLogsProxyRequest: express.Handler = (_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Disposition', 'attachment');
+  res.type('text/plain');
+  next();
+};
+
+function getRegisterHandler(app: Application, basePath: string) {
+  return (
+    func: (name: string | string[], handler: express.Handler) => express.Application,
+    route: string | string[],
+    handler: express.Handler,
+  ) => {
+    func.call(app, route, handler);
+    return func.call(app, `${basePath}${route}`, handler);
+  };
+}
+
+/**
+ * UIServer wraps around a express application to:
+ * - proxy requests to ml-pipeline api server
+ * - retrieve artifacts from the various backend
+ * - create and retrieve new viewer instances
+ * - serve static front-end resources (i.e. react app)
+ */
+export class UIServer {
+  app: Application;
+  httpServer?: Server;
+  private closePromise?: Promise<void>;
+
+  constructor(public readonly options: UIConfigs) {
+    this.app = createUIServer(options);
+  }
+
+  /**
+   * Starts the http server.
+   * @param port optionally overwrite the provided port to listen to.
+   */
+  start(port?: number | string) {
+    if (this.closePromise) {
+      throw new Error('UIServer is closing.');
+    }
+    if (this.httpServer) {
+      throw new Error('UIServer already started.');
+    }
+    port = port ?? this.options.server.port;
+    this.httpServer = this.app.listen(port, () => {
+      console.log('Server listening at http://localhost:' + port);
+    });
+    return this.httpServer;
+  }
+
+  /**
+   * Stops the http server.
+   */
+  async close() {
+    if (this.closePromise) {
+      await this.closePromise;
+      return this;
+    }
+
+    const server = this.httpServer;
+    if (!server) {
+      return this;
+    }
+
+    this.closePromise = new Promise<void>((resolve, reject) => {
+      server.close((err) => {
+        const errorCode = (err as NodeJS.ErrnoException | undefined)?.code;
+        if (err && errorCode !== 'ERR_SERVER_NOT_RUNNING') {
+          reject(err);
+          return;
+        }
+        if (this.httpServer === server) {
+          this.httpServer = undefined;
+        }
+        resolve();
+      });
+    }).finally(() => {
+      this.closePromise = undefined;
+    });
+
+    await this.closePromise;
+    return this;
+  }
+}
+
+function createUIServer(options: UIConfigs) {
+  const currDir = path.resolve(__dirname);
+  const basePath = options.server.basePath;
+  const apiVersion1Prefix = options.server.apiVersion1Prefix;
+  const apiVersion2Prefix = options.server.apiVersion2Prefix;
+  const apiServerAddress = getAddress(options.pipeline);
+  const envoyServiceAddress = getAddress(options.metadata.envoyService);
+
+  const app: Application = express();
+  const registerHandler = getRegisterHandler(app, basePath);
+
+  /** log to stdout */
+  app.use((req, res, next) => {
+    console.info(req.method + ' ' + req.originalUrl);
+    next();
+  });
+
+  /** Healthz */
+  registerHandler(
+    app.get,
+    `/${apiVersion1Prefix}/healthz`,
+    getHealthzHandler({
+      healthzEndpoint: getHealthzEndpoint(apiServerAddress, apiVersion1Prefix),
+      healthzStats: getBuildMetadata(currDir),
+    }),
+  );
+
+  registerHandler(
+    app.get,
+    `/${apiVersion2Prefix}/healthz`,
+    getHealthzHandler({
+      healthzEndpoint: getHealthzEndpoint(apiServerAddress, apiVersion2Prefix),
+      healthzStats: getBuildMetadata(currDir),
+    }),
+  );
+
+  /** Authorize function - created early so it can be used by artifact handlers */
+  const authorizeFn = getAuthorizeFn(options.auth, { apiServerAddress });
+
+  /**
+   * Artifact Authorization Middleware
+   * Security fix for https://github.com/kubeflow/pipelines/issues/9889
+   * This middleware validates namespace access before allowing artifact retrieval,
+   * preventing unauthorized cross-namespace artifact access.
+   */
+  const artifactsAuthMiddleware = getArtifactsAuthMiddleware(
+    authorizeFn,
+    options.auth.enabled,
+    options.auth.kubeflowUserIdHeader,
+    envoyServiceAddress,
+  );
+
+  /** Artifact */
+  // Authorization middleware runs once on the catch-all /artifacts/* route,
+  // protecting all artifact endpoints. When proxy is disabled, the proxy
+  // handler calls next() and falls through to the specific handler below.
+  // Security fix for https://github.com/kubeflow/pipelines/issues/9889
+
+  // Proxy handler (checked first — if enabled, proxies to namespaced artifact service)
+  app.get(
+    '/artifacts/*',
+    artifactsAuthMiddleware,
+    getArtifactsProxyHandler({
+      enabled: options.artifacts.proxy.enabled,
+      allowedDomain: options.artifacts.allowedDomain,
+      namespacedServiceGetter: getArtifactServiceGetter(options.artifacts.proxy),
+    }),
+  );
+  app.get(
+    `${basePath}/artifacts/*`,
+    artifactsAuthMiddleware,
+    getArtifactsProxyHandler({
+      enabled: options.artifacts.proxy.enabled,
+      allowedDomain: options.artifacts.allowedDomain,
+      namespacedServiceGetter: getArtifactServiceGetter(options.artifacts.proxy),
+    }),
+  );
+
+  // /artifacts/get endpoint tries to extract the artifact to return pure text content
+  app.get(
+    '/artifacts/get',
+    getArtifactsHandler({
+      artifactsConfigs: options.artifacts,
+      useParameter: false,
+      tryExtract: true,
+      options: options,
+    }),
+  );
+  app.get(
+    `${basePath}/artifacts/get`,
+    getArtifactsHandler({
+      artifactsConfigs: options.artifacts,
+      useParameter: false,
+      tryExtract: true,
+      options: options,
+    }),
+  );
+
+  // /artifacts/:source/:bucket/* endpoint downloads the artifact as is
+  app.get(
+    '/artifacts/:source/:bucket/*',
+    getArtifactsHandler({
+      artifactsConfigs: options.artifacts,
+      useParameter: true,
+      tryExtract: false,
+      options: options,
+    }),
+  );
+  app.get(
+    `${basePath}/artifacts/:source/:bucket/*`,
+    getArtifactsHandler({
+      artifactsConfigs: options.artifacts,
+      useParameter: true,
+      tryExtract: false,
+      options: options,
+    }),
+  );
+
+  /** Tensorboard viewer */
+  const {
+    get: tensorboardGetHandler,
+    create: tensorboardCreateHandler,
+    delete: tensorboardDeleteHandler,
+  } = getTensorboardHandlers(options.viewer.tensorboard, authorizeFn);
+  registerHandler(app.get, '/apps/tensorboard', tensorboardGetHandler);
+  registerHandler(app.delete, '/apps/tensorboard', tensorboardDeleteHandler);
+  registerHandler(app.post, '/apps/tensorboard', tensorboardCreateHandler);
+  registerTensorboardProxy(app, basePath, options.viewer.tensorboard, authorizeFn);
+
+  /** Pod logs - conditionally stream through API server, otherwise directly from k8s and archive */
+  if (options.artifacts.streamLogsFromServerApi) {
+    app.all(
+      '/k8s/pod/logs',
+      hardenPodLogsProxyRequest,
+      createProxyMiddleware({
+        changeOrigin: true,
+        on: {
+          proxyReq: (proxyReq) => {
+            console.log('Proxied log request: ', proxyReq.path);
+          },
+          proxyRes: hardenPodLogsProxyResponse,
+        },
+        headers: HACK_FIX_HPM_PARTIAL_RESPONSE_HEADERS,
+        pathRewrite: (pathStr: string, req: any) => {
+          /** Argo nodeId is just POD name */
+          const nodeId = req.query.podname;
+          const runId = req.query.runid;
+          return `/${apiVersion1Prefix}/runs/${runId}/nodes/${nodeId}/log`;
+        },
+        target: apiServerAddress,
+      }),
+    );
+  } else {
+    registerHandler(
+      app.get,
+      '/k8s/pod/logs',
+      getPodLogsHandler(
+        options.argo,
+        options.artifacts,
+        options.pod.logContainerName,
+        authorizeFn,
+        options.auth.enabled,
+      ),
+    );
+  }
+
+  if (options.artifacts.streamLogsFromServerApi) {
+    app.all(
+      '/k8s/pod/logs',
+      hardenPodLogsProxyRequest,
+      createProxyMiddleware({
+        changeOrigin: true,
+        on: {
+          proxyReq: (proxyReq) => {
+            console.log('Proxied log request: ', proxyReq.path);
+          },
+          proxyRes: hardenPodLogsProxyResponse,
+        },
+        headers: HACK_FIX_HPM_PARTIAL_RESPONSE_HEADERS,
+        pathRewrite: (pathStr: string, req: any) => {
+          /** Argo nodeId is just POD name */
+          const nodeId = req.query.podname;
+          const runId = req.query.runid;
+          return `/${apiVersion2Prefix}/runs/${runId}/nodes/${nodeId}/log`;
+        },
+        target: apiServerAddress,
+      }),
+    );
+  } else {
+    registerHandler(
+      app.get,
+      '/k8s/pod/logs',
+      getPodLogsHandler(
+        options.argo,
+        options.artifacts,
+        options.pod.logContainerName,
+        authorizeFn,
+        options.auth.enabled,
+      ),
+    );
+  }
+
+  /** Pod info */
+  const { podInfoHandler, podEventsHandler } = getPodInfoHandlers(authorizeFn);
+  registerHandler(app.get, '/k8s/pod', podInfoHandler);
+  registerHandler(app.get, '/k8s/pod/events', podEventsHandler);
+
+  /** Cluster metadata (GKE only) */
+  registerHandler(app.get, '/system/cluster-name', getClusterNameHandler(options.gkeMetadata));
+  registerHandler(app.get, '/system/project-id', getProjectIdHandler(options.gkeMetadata));
+
+  /** Visualization */
+  registerHandler(
+    app.get,
+    '/visualizations/allowed',
+    getAllowCustomVisualizationsHandler(options.visualizations.allowCustomVisualizations),
+  );
+
+  /** Proxy metadata requests to the Envoy instance which will handle routing to the metadata gRPC server */
+  app.all(
+    '/ml_metadata.*',
+    createProxyMiddleware({
+      changeOrigin: true,
+      on: {
+        proxyReq: (proxyReq) => {
+          console.log('Metadata proxied request: ', (proxyReq as any).path);
+        },
+      },
+      headers: HACK_FIX_HPM_PARTIAL_RESPONSE_HEADERS,
+      target: envoyServiceAddress,
+    }),
+  );
+
+  registerHandler(
+    app.use,
+    [
+      // Original API endpoint is /runs/{run_id}:reportMetrics, but ':reportMetrics' means a url parameter, so we don't use : here.
+      `/${apiVersion1Prefix}/runs/*reportMetrics`,
+      `/${apiVersion1Prefix}/workflows`,
+      `/${apiVersion1Prefix}/scheduledworkflows`,
+      `/${apiVersion2Prefix}/workflows`,
+      `/${apiVersion2Prefix}/scheduledworkflows`,
+    ],
+    (req, res) => {
+      res.status(403).send(`${req.originalUrl} endpoint is not meant for external usage.`);
+    },
+  );
+
+  const deprecatedProxyRoutes = [
+    `/${apiVersion1Prefix}/_proxy/*`,
+    `/${apiVersion2Prefix}/_proxy/*`,
+    `${basePath}/${apiVersion1Prefix}/_proxy/*`,
+    `${basePath}/${apiVersion2Prefix}/_proxy/*`,
+  ];
+
+  app.all(deprecatedProxyRoutes, (_req, res) => {
+    res.status(410).send('The generic /_proxy/ endpoint is deprecated and no longer supported.');
+  });
+
+  /** Proxy to ml-pipeline api server */
+  app.all(
+    `/${apiVersion1Prefix}/*`,
+    createProxyMiddleware({
+      changeOrigin: true,
+      on: {
+        proxyReq: (proxyReq) => {
+          console.log('Proxied request: ', proxyReq.path);
+        },
+      },
+      headers: HACK_FIX_HPM_PARTIAL_RESPONSE_HEADERS,
+      target: apiServerAddress,
+    }),
+  );
+  app.all(
+    `/${apiVersion2Prefix}/*`,
+    createProxyMiddleware({
+      changeOrigin: true,
+      on: {
+        proxyReq: (proxyReq) => {
+          console.log('Proxied request: ', proxyReq.path);
+        },
+      },
+      headers: HACK_FIX_HPM_PARTIAL_RESPONSE_HEADERS,
+      target: apiServerAddress,
+    }),
+  );
+
+  app.all(
+    `${basePath}/${apiVersion1Prefix}/*`,
+    createProxyMiddleware({
+      changeOrigin: true,
+      on: {
+        proxyReq: (proxyReq) => {
+          console.log('Proxied request: ', proxyReq.path);
+        },
+      },
+      headers: HACK_FIX_HPM_PARTIAL_RESPONSE_HEADERS,
+      pathRewrite: (pathStr) =>
+        pathStr.startsWith(basePath) ? pathStr.substr(basePath.length, pathStr.length) : pathStr,
+      target: apiServerAddress,
+    }),
+  );
+  app.all(
+    `${basePath}/${apiVersion2Prefix}/*`,
+    createProxyMiddleware({
+      changeOrigin: true,
+      on: {
+        proxyReq: (proxyReq) => {
+          console.log('Proxied request: ', proxyReq.path);
+        },
+      },
+      headers: HACK_FIX_HPM_PARTIAL_RESPONSE_HEADERS,
+      pathRewrite: (pathStr) =>
+        pathStr.startsWith(basePath) ? pathStr.substr(basePath.length, pathStr.length) : pathStr,
+      target: apiServerAddress,
+    }),
+  );
+
+  /**
+   * Modify index.html.
+   * These pathes can be matched by static handler. Putting them before it to
+   * override behavior for index html.
+   */
+  const indexHtmlHandler = getIndexHTMLHandler(options.server);
+  registerHandler(app.get, '/', indexHtmlHandler);
+  registerHandler(app.get, '/index.html', indexHtmlHandler);
+
+  /** Static resource (i.e. react app) */
+  app.use(basePath, StaticHandler(options.server.staticDir));
+  app.use(StaticHandler(options.server.staticDir));
+
+  return app;
+}

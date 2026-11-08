@@ -1,0 +1,41 @@
+name: KFP SDK YAPF Tests
+
+on:
+  push:
+    branches: [master]
+
+  pull_request:
+    paths:
+      - 'api/**'
+      - 'sdk/python/**'
+      - 'test/presubmit-yapf-sdk.sh'
+      - '.github/workflows/sdk-yapf.yml'
+      - '.github/actions/setup-python-pip-cache/**'
+      - '!**/*.md'
+      - '!**/OWNERS'
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  yapf-sdk:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: ./.github/actions/setup-python-pip-cache
+      with:
+        python-version: '3.9'
+        cache-scope: sdk-yapf
+        cache-dependency-hash: ${{ hashFiles('sdk/python/requirements-dev.txt') }}
+
+    - name: Install dependencies
+      run: pip install yapf
+
+    - name: Run YAPF SDK Tests
+      run: ./test/presubmit-yapf-sdk.sh

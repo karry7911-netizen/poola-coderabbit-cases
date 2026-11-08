@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "en-US"
+early_access: false
+
+reviews:
+  profile: "assertive"
+  review_details: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: false
+    base_branches:
+      - ".*"
+
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        Review only security vulnerabilities introduced by this pull request.
+        Report a finding only when there is a concrete attacker-controlled
+        input or security-sensitive state, a reachable attack path, a violated
+        security property, and supporting code evidence.
+        Ignore style, maintainability, and non-security quality issues.
+
+knowledge_base:
+  opt_out: true
+  web_search:
+    enabled: false
+  code_guidelines:
+    enabled: false

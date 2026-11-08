@@ -1,0 +1,390 @@
+// Copyright 2021 The Kubeflow Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import { MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { V2beta1Experiment } from 'src/apisv2beta1/experiment';
+import { queryKeys } from 'src/hooks/queryKeys';
+import { useKeyedState } from 'src/hooks/useKeyedState';
+import { V2beta1Run, V2beta1RuntimeState, V2beta1RunStorageState } from 'src/apisv2beta1/run';
+import MD2Tabs from 'src/atoms/MD2Tabs';
+import DetailsTable from 'src/components/DetailsTable';
+import { PipelineSpecTabContent } from 'src/components/PipelineSpecTabContent';
+import { RoutePage, RouteParams } from 'src/components/Router';
+import SidePanel from 'src/components/SidePanel';
+import { RuntimeNodeDetailsV2 } from 'src/components/tabs/RuntimeNodeDetailsV2';
+import { ToolbarProps } from 'src/components/Toolbar';
+import { commonCss, padding } from 'src/Css';
+import { Apis } from 'src/lib/Apis';
+import Buttons, { ButtonKeys } from 'src/lib/Buttons';
+import { KeyValue } from 'src/lib/StaticGraphParser';
+import { hasFinishedV2, statusProtoMap } from 'src/lib/StatusUtils';
+import { formatDateString, getRunDurationV2 } from 'src/lib/Utils';
+import {
+  convertSubDagToRuntimeFlowElements,
+  getNodeMlmdInfo,
+  updateFlowElementsState,
+} from 'src/lib/v2/DynamicFlow';
+import { convertFlowElements, getNodeName, PipelineFlowElement } from 'src/lib/v2/StaticFlow';
+import * as WorkflowUtils from 'src/lib/v2/WorkflowUtils';
+import {
+  getArtifactsFromContext,
+  getEventsByExecutions,
+  getExecutionsFromContext,
+  getKfpV2RunContext,
+  LinkedArtifact,
+} from 'src/mlmd/MlmdUtils';
+import { Artifact, Event, Execution } from 'src/third_party/mlmd';
+import { classes } from 'typestyle';
+import { RouteComponentProps } from 'react-router-dom';
+import { RunDetailsProps } from './RunDetails';
+import { statusToIcon } from './StatusV2';
+import DagCanvas from './v2/DagCanvas';
+
+const QUERY_STALE_TIME = 10000; // 10000 milliseconds == 10 seconds.
+const QUERY_REFETCH_INTERVAL = 10000; // 10000 milliseconds == 10 seconds.
+const TAB_NAMES = ['Graph', 'Detail', 'Pipeline Spec'];
+
+interface MlmdPackage {
+  executions: Execution[];
+  artifacts: Artifact[];
+  events: Event[];
+}
+
+export interface NodeMlmdInfo {
+  execution?: Execution;
+  linkedArtifact?: LinkedArtifact;
+}
+
+interface RunDetailsV2Info {
+  pipeline_job: string;
+  run: V2beta1Run;
+}
+
+export interface RunDetailsV2Params {
+  [RouteParams.runId]: string;
+}
+
+export type RunDetailsV2Props = RunDetailsV2Info &
+  RunDetailsProps &
+  RouteComponentProps<RunDetailsV2Params>;
+
+export function RunDetailsV2(props: RunDetailsV2Props) {
+  const { updateBanner } = props;
+  const runId = props.match.params[RouteParams.runId];
+  const run = props.run;
+  const pipelineJobStr = props.pipeline_job;
+  const pipelineSpec = useMemo(
+    () => WorkflowUtils.convertYamlToV2PipelineSpec(pipelineJobStr),
+    [pipelineJobStr],
+  );
+  const initialElements = useMemo(() => convertFlowElements(pipelineSpec), [pipelineSpec]);
+
+  const [flowElements, setFlowElements] = useState(initialElements);
+  const [layers, setLayers] = useState(['root']);
+  const [selectedTab, setSelectedTab] = useState(0);
+  const [selectedNode, setSelectedNode] = useState<PipelineFlowElement | null>(null);
+  const [selectedNodeMlmdInfo, setSelectedNodeMlmdInfo] = useState<NodeMlmdInfo | null>(null);
+  const [, forceUpdate] = useState();
+  const runStateKey = `${run.run_id || runId}:${run.state || ''}`;
+  const [retriedCurrentRunState, setRetriedCurrentRunState] = useKeyedState(runStateKey, false);
+  const runFinished = hasFinishedV2(run.state) && !retriedCurrentRunState;
+
+  // Retrieves MLMD states from the MLMD store.
+  const { isSuccess, isError, error, data } = useQuery<MlmdPackage, Error>({
+    queryKey: queryKeys.mlmdPackage(runId),
+    queryFn: async () => {
+      const context = await getKfpV2RunContext(runId);
+      const executions = await getExecutionsFromContext(context);
+      const artifacts = await getArtifactsFromContext(context);
+      const events = await getEventsByExecutions(executions);
+
+      return { executions, artifacts, events };
+    },
+    staleTime: QUERY_STALE_TIME,
+    refetchInterval: QUERY_REFETCH_INTERVAL,
+  });
+
+  // Retrieves experiment detail.
+  const experimentId = run.experiment_id || null;
+  const {
+    data: experiment,
+    isError: experimentIsError,
+    error: experimentError,
+  } = useQuery<V2beta1Experiment, Error>({
+    queryKey: queryKeys.runDetailsV2Experiment(runId, experimentId),
+    queryFn: () => getExperiment(experimentId),
+  });
+  const namespace = experiment?.namespace;
+
+  // Single banner effect with clear precedence: MLMD error > experiment error > clear on success.
+  useEffect(() => {
+    if (isError && error) {
+      updateBanner({
+        message: 'Cannot get MLMD objects from Metadata store.',
+        additionalInfo: error.message,
+        mode: 'error',
+      });
+    } else if (experimentIsError && experimentError) {
+      updateBanner({
+        message: 'Error: failed to retrieve experiment details.',
+        additionalInfo: experimentError.message,
+        mode: 'warning',
+      });
+    } else if (isSuccess) {
+      updateBanner({});
+    }
+  }, [isError, isSuccess, error, experimentIsError, experimentError, updateBanner]);
+
+  const layerChange = useCallback(
+    (layers: string[]) => {
+      setSelectedNode(null);
+      setLayers(layers);
+      setFlowElements(
+        convertSubDagToRuntimeFlowElements(pipelineSpec, layers, data ? data.executions : []),
+      ); // render elements in the sub-layer.
+    },
+    [data, pipelineSpec],
+  );
+
+  const dynamicFlowElements = useMemo(() => {
+    if (!isSuccess || !data) {
+      return flowElements;
+    }
+
+    // Keep React Flow node references stable between unrelated rerenders after MLMD data arrives.
+    return updateFlowElementsState(
+      layers,
+      flowElements,
+      data.executions,
+      data.events,
+      data.artifacts,
+    );
+  }, [data, flowElements, isSuccess, layers]);
+
+  const onElementSelection = (event: ReactMouseEvent, element: PipelineFlowElement) => {
+    setSelectedNode(element);
+    if (data) {
+      setSelectedNodeMlmdInfo(
+        getNodeMlmdInfo(element, data.executions, data.events, data.artifacts),
+      );
+    }
+  };
+
+  // Update page title and experiment information.
+  useEffect(() => {
+    updateToolBar(run, experiment, props.updateToolbar);
+  }, [run, experiment, props.updateToolbar]);
+
+  // Update buttons for managing runs.
+  const [buttons] = useState(new Buttons(props, () => forceUpdate));
+  const [runIdFromParams] = useState(props.match.params[RouteParams.runId]);
+  useEffect(() => {
+    updateToolBarActions(
+      buttons,
+      runIdFromParams,
+      run,
+      runFinished,
+      props.updateToolbar,
+      () => forceUpdate,
+      (_selectedIds, success) => {
+        if (success) {
+          setRetriedCurrentRunState(true);
+        }
+      },
+    );
+  }, [buttons, runIdFromParams, run, runFinished, props.updateToolbar, setRetriedCurrentRunState]);
+
+  return (
+    <>
+      <div className={classes(commonCss.page, padding(20, 't'))}>
+        <MD2Tabs selectedTab={selectedTab} tabs={TAB_NAMES} onSwitch={setSelectedTab} />
+        {/* DAG tab */}
+        {selectedTab === 0 && (
+          <div className={commonCss.page} style={{ position: 'relative', overflow: 'hidden' }}>
+            <DagCanvas
+              layers={layers}
+              onLayersUpdate={layerChange}
+              elements={dynamicFlowElements}
+              onElementClick={onElementSelection}
+              setFlowElements={(elems) => setFlowElements(elems)}
+            ></DagCanvas>
+
+            {/* Side panel for Execution, Artifact, Sub-DAG. */}
+            <div className='z-20'>
+              <SidePanel
+                isOpen={!!selectedNode}
+                title={getNodeName(selectedNode)}
+                onClose={() => setSelectedNode(null)}
+                defaultWidth={'50%'}
+              >
+                <RuntimeNodeDetailsV2
+                  layers={layers}
+                  onLayerChange={layerChange}
+                  pipelineJobString={pipelineJobStr}
+                  runId={runId}
+                  element={selectedNode}
+                  elementMlmdInfo={selectedNodeMlmdInfo}
+                  namespace={namespace}
+                ></RuntimeNodeDetailsV2>
+              </SidePanel>
+            </div>
+          </div>
+        )}
+
+        {/* Run details tab */}
+        {selectedTab === 1 && (
+          <div className={padding()}>
+            <DetailsTable title='Run details' fields={getDetailsFields(run)} />
+
+            {!!run.runtime_config?.parameters && (
+              <DetailsTable
+                title='Run parameters'
+                fields={Object.entries(run.runtime_config?.parameters).map((param) => [
+                  param[0],
+                  param[1],
+                ])}
+              />
+            )}
+          </div>
+        )}
+
+        {/* Pipeline Spec tab */}
+        {selectedTab === 2 && (
+          <div className={commonCss.codeEditor} data-testid={'spec-ir'}>
+            <PipelineSpecTabContent templateString={pipelineJobStr || ''} />
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+async function getExperiment(experimentId: string | null): Promise<V2beta1Experiment> {
+  if (experimentId) {
+    return Apis.experimentServiceApiV2.getExperiment(experimentId);
+  }
+  return Promise.resolve({});
+}
+
+function updateToolBar(
+  run: V2beta1Run | undefined,
+  experiment: V2beta1Experiment | undefined,
+  updateToolBarCallback: (toolbarProps: Partial<ToolbarProps>) => void,
+) {
+  const runMetadata = run;
+  if (runMetadata) {
+    const pageTitle = (
+      <div className={commonCss.flex}>
+        {statusToIcon(runMetadata.state, runMetadata.created_at)}
+        <span style={{ marginLeft: 10 }}>{runMetadata.display_name || 'Run name unknown'}</span>
+      </div>
+    );
+
+    updateToolBarCallback({ pageTitle, pageTitleTooltip: runMetadata.display_name });
+  }
+
+  const breadcrumbs: Array<{ displayName: string; href: string }> = [];
+  if (experiment && experiment.experiment_id && experiment.display_name) {
+    breadcrumbs.push(
+      { displayName: 'Experiments', href: RoutePage.EXPERIMENTS },
+      {
+        displayName: experiment.display_name,
+        href: RoutePage.EXPERIMENT_DETAILS.replace(
+          ':' + RouteParams.experimentId,
+          experiment.experiment_id,
+        ),
+      },
+    );
+  } else {
+    breadcrumbs.push({ displayName: 'All runs', href: RoutePage.RUNS });
+  }
+  updateToolBarCallback({ breadcrumbs });
+}
+
+function updateToolBarActions(
+  buttons: Buttons,
+  runIdFromParams: string,
+  run: V2beta1Run | undefined,
+  runFinished: boolean,
+  updateToolbar: (toolbarProps: Partial<ToolbarProps>) => void,
+  refresh: () => void,
+  retry: (selectedIds: string[], success: boolean) => void,
+) {
+  const runMetadata = run;
+  const getRunIdList = () =>
+    runMetadata && runMetadata.run_id
+      ? [runMetadata.run_id]
+      : runIdFromParams
+        ? [runIdFromParams]
+        : [];
+
+  buttons
+    .retryRun(getRunIdList, true, retry)
+    .cloneRun(getRunIdList, true)
+    .terminateRun(getRunIdList, true, () => refresh());
+  !runMetadata || runMetadata.storage_state === V2beta1RunStorageState.ARCHIVED
+    ? buttons.restore('run', getRunIdList, true, () => refresh())
+    : buttons.archive('run', getRunIdList, true, () => refresh());
+
+  const actions = buttons.getToolbarActionMap();
+  actions[ButtonKeys.TERMINATE_RUN].disabled =
+    (runMetadata && runMetadata.state === V2beta1RuntimeState.CANCELING) || runFinished;
+  actions[ButtonKeys.RETRY].disabled =
+    !runMetadata || runMetadata.state !== V2beta1RuntimeState.FAILED;
+
+  updateToolbar({ actions });
+}
+
+function getActualStartTime(run?: V2beta1Run): Date | undefined {
+  if (run?.state_history) {
+    for (let i = run.state_history.length - 1; i >= 0; i--) {
+      const entry = run.state_history[i];
+      if (entry.state === V2beta1RuntimeState.RUNNING && entry.update_time !== undefined) {
+        return entry.update_time;
+      }
+    }
+  }
+  return run?.scheduled_at;
+}
+
+function getDetailsFields(run?: V2beta1Run): Array<KeyValue<string>> {
+  const actualStart = getActualStartTime(run);
+  const scheduledAt = run?.scheduled_at;
+  const startDiffers =
+    actualStart && scheduledAt && actualStart.getTime() !== scheduledAt.getTime();
+
+  const fields: Array<KeyValue<string>> = [
+    ['Run ID', run?.run_id || '-'],
+    ['Workflow name', run?.display_name || '-'],
+    ['Status', run?.state ? statusProtoMap.get(run?.state) : '-'],
+    ['Description', run?.description || ''],
+    ['Created at', run?.created_at ? formatDateString(run.created_at) : '-'],
+    ['Started at', formatDateString(actualStart)],
+    ['Finished at', hasFinishedV2(run?.state) ? formatDateString(run?.finished_at) : '-'],
+    ['Duration', hasFinishedV2(run?.state) ? getRunDurationV2(run) : '-'],
+  ];
+
+  if (startDiffers) {
+    const startedAtIndex = fields.findIndex((field) => field[0] === 'Started at');
+    const scheduledAtField: KeyValue<string> = ['Scheduled at', formatDateString(scheduledAt)];
+    if (startedAtIndex >= 0) {
+      fields.splice(startedAtIndex, 0, scheduledAtField);
+    } else {
+      fields.push(scheduledAtField);
+    }
+  }
+
+  return fields;
+}
