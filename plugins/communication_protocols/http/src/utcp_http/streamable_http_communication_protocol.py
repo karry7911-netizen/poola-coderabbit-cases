@@ -15,7 +15,7 @@ from utcp.data.auth_implementations import BasicAuth
 from utcp.data.auth_implementations import OAuth2Auth
 from utcp_http.streamable_http_call_template import StreamableHttpCallTemplate
 from aiohttp import ClientSession, BasicAuth as AiohttpBasicAuth, ClientResponse
-from utcp_http._security import ensure_secure_url
+from utcp_http._security import ensure_secure_url, safe_request_with_redirects
 import logging
 
 logging.basicConfig(
@@ -119,19 +119,19 @@ class StreamableHttpCommunicationProtocol(CommunicationProtocol):
                     else:
                         data = body_content
                 
-                # Make the request with the template's HTTP method
-                method = manual_call_template.http_method.lower()
-                request_method = getattr(session, method)
-                
-                async with request_method(
+                method = manual_call_template.http_method.upper()
+                async with safe_request_with_redirects(
+                    session,
+                    method,
                     url,
+                    context="manual discovery",
                     headers=request_headers,
                     auth=auth,
                     params=query_params,
                     cookies=cookies,
                     json=json_data,
                     data=data,
-                    timeout=aiohttp.ClientTimeout(total=10.0)
+                    timeout=aiohttp.ClientTimeout(total=10.0),
                 ) as response:
                     response.raise_for_status()
                     response_data = await response.json()
@@ -257,8 +257,17 @@ class StreamableHttpCommunicationProtocol(CommunicationProtocol):
                 cookies=cookies,
                 json=json_data,
                 data=data,
-                timeout=timeout
+                timeout=timeout,
+                allow_redirects=False,
             )
+            if 300 <= response.status < 400:
+                response.release()
+                raise RuntimeError(
+                    f"Streamable HTTP endpoint at {url!r} returned a "
+                    f"{response.status} redirect. Redirects are not "
+                    f"followed during streaming handshakes; update the "
+                    f"call template to point at the final URL directly."
+                )
             response.raise_for_status()
 
             async for chunk in self._process_http_stream(response, tool_call_template.chunk_size, tool_call_template.name):
@@ -314,16 +323,30 @@ class StreamableHttpCommunicationProtocol(CommunicationProtocol):
             pass
 
     async def _handle_oauth2(self, auth_details: OAuth2Auth) -> str:
-        """Handles OAuth2 client credentials flow, trying both body and auth header methods."""
         client_id = auth_details.client_id
         if client_id in self._oauth_tokens:
             return self._oauth_tokens[client_id]["access_token"]
+
+        # Reject obviously-internal or plain-HTTP non-loopback token
+        # endpoints before any credential bytes leave the process.
+        ensure_secure_url(auth_details.token_url, context="OAuth2 token URL")
 
         async with aiohttp.ClientSession() as session:
             # Method 1: Credentials in body
             try:
                 logger.info(f"Attempting OAuth2 token fetch for '{client_id}' with credentials in body.")
-                async with session.post(auth_details.token_url, data={'grant_type': 'client_credentials', 'client_id': client_id, 'client_secret': auth_details.client_secret, 'scope': auth_details.scope}) as response:
+                async with safe_request_with_redirects(
+                    session,
+                    "POST",
+                    auth_details.token_url,
+                    context="OAuth2 token fetch",
+                    data={
+                        'grant_type': 'client_credentials',
+                        'client_id': client_id,
+                        'client_secret': auth_details.client_secret,
+                        'scope': auth_details.scope,
+                    },
+                ) as response:
                     response.raise_for_status()
                     token_data = await response.json()
                     self._oauth_tokens[client_id] = token_data
@@ -335,7 +358,17 @@ class StreamableHttpCommunicationProtocol(CommunicationProtocol):
             try:
                 logger.info(f"Attempting OAuth2 token fetch for '{client_id}' with Basic Auth header.")
                 auth = AiohttpBasicAuth(client_id, auth_details.client_secret)
-                async with session.post(auth_details.token_url, data={'grant_type': 'client_credentials', 'scope': auth_details.scope}, auth=auth) as response:
+                async with safe_request_with_redirects(
+                    session,
+                    "POST",
+                    auth_details.token_url,
+                    context="OAuth2 token fetch",
+                    data={
+                        'grant_type': 'client_credentials',
+                        'scope': auth_details.scope,
+                    },
+                    auth=auth,
+                ) as response:
                     response.raise_for_status()
                     token_data = await response.json()
                     self._oauth_tokens[client_id] = token_data

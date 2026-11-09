@@ -29,6 +29,11 @@ from utcp.data.auth_implementations.api_key_auth import ApiKeyAuth
 from utcp.data.auth_implementations.basic_auth import BasicAuth
 from utcp.data.auth_implementations.oauth2_auth import OAuth2Auth
 from utcp_websocket.websocket_call_template import WebSocketCallTemplate
+from utcp_websocket._security import (
+    ensure_secure_url,
+    ensure_secure_ws_url,
+    safe_request_with_redirects,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,10 +141,11 @@ class WebSocketCommunicationProtocol(CommunicationProtocol):
         return json.dumps(arguments)
 
     async def _handle_oauth2(self, auth: OAuth2Auth) -> str:
-        """Handle OAuth2 authentication and token management."""
         client_id = auth.client_id
         if client_id in self._oauth_tokens:
             return self._oauth_tokens[client_id]["access_token"]
+
+        ensure_secure_url(auth.token_url, context="OAuth2 token URL")
 
         async with aiohttp.ClientSession() as session:
             data = {
@@ -148,7 +154,13 @@ class WebSocketCommunicationProtocol(CommunicationProtocol):
                 'client_secret': auth.client_secret,
                 'scope': auth.scope
             }
-            async with session.post(auth.token_url, data=data) as resp:
+            async with safe_request_with_redirects(
+                session,
+                "POST",
+                auth.token_url,
+                context="OAuth2 token fetch",
+                data=data,
+            ) as resp:
                 resp.raise_for_status()
                 token_response = await resp.json()
                 self._oauth_tokens[client_id] = token_response
@@ -175,7 +187,8 @@ class WebSocketCommunicationProtocol(CommunicationProtocol):
         return headers
 
     async def _get_connection(self, call_template: WebSocketCallTemplate) -> ClientWebSocketResponse:
-        """Get or create a WebSocket connection for the call template."""
+        ensure_secure_ws_url(call_template.url, context="WebSocket connection")
+
         provider_key = f"{call_template.name}_{call_template.url}"
 
         # Check if we have an active connection
@@ -198,7 +211,11 @@ class WebSocketCommunicationProtocol(CommunicationProtocol):
                 call_template.url,
                 headers=headers,
                 protocols=[call_template.protocol] if call_template.protocol else None,
-                heartbeat=30 if call_template.keep_alive else None
+                heartbeat=30 if call_template.keep_alive else None,
+                # aiohttp's ws_connect defaults to following HTTP
+                # redirects on the upgrade handshake; refuse so a
+                # 3xx response cannot land us on a different host.
+                allow_redirects=False,
             )
             self._connections[provider_key] = ws
             logger.info(f"WebSocket connected to {call_template.url}")

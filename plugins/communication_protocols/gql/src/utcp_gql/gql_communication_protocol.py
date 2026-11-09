@@ -15,6 +15,7 @@ from utcp.data.auth_implementations.basic_auth import BasicAuth
 from utcp.data.auth_implementations.oauth2_auth import OAuth2Auth
 
 from utcp_gql.gql_call_template import GraphQLCallTemplate
+from utcp_gql._security import ensure_secure_url, safe_request_with_redirects
 
 if TYPE_CHECKING:
     from utcp.utcp_client import UtcpClient
@@ -39,18 +40,6 @@ class GraphQLCommunicationProtocol(CommunicationProtocol):
 
     def __init__(self) -> None:
         self._oauth_tokens: Dict[str, Dict[str, Any]] = {}
-
-    def _enforce_https_or_localhost(self, url: str) -> None:
-        if not (
-            url.startswith("https://")
-            or url.startswith("http://localhost")
-            or url.startswith("http://127.0.0.1")
-        ):
-            raise ValueError(
-                "Security error: URL must use HTTPS or start with 'http://localhost' or 'http://127.0.0.1'. "
-                "Non-secure URLs are vulnerable to man-in-the-middle attacks. "
-                f"Got: {url}."
-            )
 
     async def _handle_oauth2(self, auth: OAuth2Auth) -> str:
         client_id = auth.client_id
@@ -94,17 +83,33 @@ class GraphQLCommunicationProtocol(CommunicationProtocol):
 
         return headers
 
+    @staticmethod
+    def _disable_transport_redirects(transport: AIOHTTPTransport) -> None:
+        aio_session = getattr(transport, "session", None)
+        if aio_session is None:
+            return
+        original_post = aio_session.post
+
+        def _no_redirect_post(*args: Any, **kwargs: Any):
+            kwargs["allow_redirects"] = False
+            return original_post(*args, **kwargs)
+
+        aio_session.post = _no_redirect_post  # type: ignore[method-assign]
+
     async def register_manual(
         self, caller: "UtcpClient", manual_call_template: CallTemplate
     ) -> RegisterManualResult:
         if not isinstance(manual_call_template, GraphQLCallTemplate):
             raise ValueError("GraphQLCommunicationProtocol requires a GraphQLCallTemplate call template")
-        self._enforce_https_or_localhost(manual_call_template.url)
+        ensure_secure_url(
+            manual_call_template.url, context="GraphQL manual discovery"
+        )
 
         try:
             headers = await self._prepare_headers(manual_call_template)
             transport = AIOHTTPTransport(url=manual_call_template.url, headers=headers)
             async with GqlClient(transport=transport, fetch_schema_from_transport=True) as session:
+                self._disable_transport_redirects(transport)
                 schema = session.client.schema
                 tools: List[Tool] = []
 
@@ -178,11 +183,14 @@ class GraphQLCommunicationProtocol(CommunicationProtocol):
     ) -> Any:
         if not isinstance(tool_call_template, GraphQLCallTemplate):
             raise ValueError("GraphQLCommunicationProtocol requires a GraphQLCallTemplate call template")
-        self._enforce_https_or_localhost(tool_call_template.url)
+        ensure_secure_url(
+            tool_call_template.url, context="GraphQL tool invocation"
+        )
 
         headers = await self._prepare_headers(tool_call_template, tool_args)
         transport = AIOHTTPTransport(url=tool_call_template.url, headers=headers)
         async with GqlClient(transport=transport, fetch_schema_from_transport=True) as session:
+            self._disable_transport_redirects(transport)
             # Filter out header fields from GraphQL variables; these are sent via HTTP headers
             header_fields = tool_call_template.header_fields or []
             filtered_args = {k: v for k, v in tool_args.items() if k not in header_fields}
